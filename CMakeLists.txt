@@ -72,6 +72,14 @@ target_include_directories(packmule_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+# Expose POSIX.1-2008 APIs (clock_gettime, realpath, fileno, PATH_MAX, …)
+# under strict -std=c11 on glibc systems.
+target_compile_definitions(packmule_core PUBLIC _POSIX_C_SOURCE=200809L)
+# On macOS, _POSIX_C_SOURCE hides Darwin extensions (mkdtemp, etc.) unless
+# _DARWIN_C_SOURCE is also defined to re-enable them.
+target_compile_definitions(packmule_core PUBLIC
+    $<$<PLATFORM_ID:Darwin>:_DARWIN_C_SOURCE>)
+
 target_link_libraries(packmule_core PUBLIC
     packmule_warnings       # strict warning flags for all our sources
     CURL::libcurl
