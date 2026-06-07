@@ -1,9 +1,8 @@
 /*
  * test_registry_npm.c — unit tests for the npm registry backend.
  *
- * All tests exercise parse_manifest only (no network calls).
- * Resolve is tested via live dry-runs; unit testing it would require mocking
- * the network layer, which is out of scope here.
+ * parse_manifest tests: no network calls required.
+ * get_deps tests: exercise dep enqueuing and dedup logic.
  */
 #include "registry.h"
 #include "package.h"
@@ -179,6 +178,59 @@ static void test_fixture_file(void)
     package_list_destroy(list);
 }
 
+/* ── get_deps ────────────────────────────────────────────────────────────── */
+
+/* Build a Package with dep_specs set to plain names (as npm_resolve produces). */
+static Package *make_npm_resolved(const char *name, const char **dep_names, int n)
+{
+    Package *pkg = package_create(name, "1.0.0");
+    if (n > 0) {
+        pkg->dep_specs = malloc(((size_t)n + 1) * sizeof(char *));
+        for (int i = 0; i < n; i++)
+            pkg->dep_specs[i] = strdup(dep_names[i]);
+        pkg->dep_specs[n] = NULL;
+    }
+    return pkg;
+}
+
+static void test_npm_get_deps_enqueues_new(void)
+{
+    const char *deps[] = { "body-parser", "path-to-regexp" };
+    Package     *pkg   = make_npm_resolved("express", deps, 2);
+    const Registry *npm  = registry_find("npm");
+    PackageList *seen = package_list_create();
+    PackageList *out  = package_list_create();
+
+    int added = npm->get_deps(npm, pkg, seen, out);
+
+    assert(added == 2);
+    assert(out->count == 2);
+    assert(strcmp(out->items[0]->name, "body-parser")    == 0);
+    assert(strcmp(out->items[1]->name, "path-to-regexp") == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(seen);
+    package_list_destroy(out);
+}
+
+static void test_npm_get_deps_dedup(void)
+{
+    const char *deps[] = { "body-parser", "path-to-regexp" };
+    Package     *pkg   = make_npm_resolved("express", deps, 2);
+    const Registry *npm = registry_find("npm");
+    PackageList *queue = package_list_create();
+    package_list_add(queue, package_create("body-parser", "1.20.2"));
+
+    int added = npm->get_deps(npm, pkg, queue, queue);
+
+    assert(added == 1);
+    assert(queue->count == 2); /* 1 pre-existing + 1 new */
+    assert(strcmp(queue->items[1]->name, "path-to-regexp") == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(queue);
+}
+
 int main(void)
 {
     test_basic_dependencies();
@@ -189,5 +241,7 @@ int main(void)
     test_invalid_json();
     test_missing_file();
     test_fixture_file();
+    test_npm_get_deps_enqueues_new();
+    test_npm_get_deps_dedup();
     return 0;
 }

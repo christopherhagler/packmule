@@ -15,8 +15,8 @@
  * back to the weaker dist.shasum (SHA-1).
  *
  * Transitive dependencies are read from the "dependencies" object in the
- * resolved version document and stored in pkg->requires_dist so that main.c
- * can enqueue them breadth-first.
+ * resolved version document and stored in pkg->dep_specs for npm_get_deps()
+ * to enqueue breadth-first.
  */
 
 #include "registry.h"
@@ -191,20 +191,20 @@ static int npm_parse_response(const char *json, Package *pkg)
     cJSON *deps = cJSON_GetObjectItemCaseSensitive(root, "dependencies");
     if (cJSON_IsObject(deps)) {
         int n = cJSON_GetArraySize(deps);
-        if (pkg->requires_dist) {
-            for (char **p = pkg->requires_dist; *p; p++)
+        if (pkg->dep_specs) {
+            for (char **p = pkg->dep_specs; *p; p++)
                 pm_free(*p);
-            pm_free(pkg->requires_dist);
+            pm_free(pkg->dep_specs);
         }
-        pkg->requires_dist    = pm_malloc(((size_t)n + 1) * sizeof(char *));
+        pkg->dep_specs    = pm_malloc(((size_t)n + 1) * sizeof(char *));
         int    k              = 0;
         cJSON *entry          = NULL;
         cJSON_ArrayForEach(entry, deps) {
             if (!entry->string)
                 continue;
-            pkg->requires_dist[k++] = pm_strdup(entry->string);
+            pkg->dep_specs[k++] = pm_strdup(entry->string);
         }
-        pkg->requires_dist[k] = NULL;
+        pkg->dep_specs[k] = NULL;
     }
 
     ret = 0;
@@ -227,14 +227,33 @@ static int npm_resolve(const Registry *self, Package *pkg)
     return ret;
 }
 
+/* ── Transitive dependency resolver ─────────────────────────────────────── */
+
+static int npm_get_deps(const Registry *self, const Package *pkg,
+                         const PackageList *seen, PackageList *out)
+{
+    (void)self;
+    if (!pkg->dep_specs)
+        return 0;
+    int added = 0;
+    for (char **dep = pkg->dep_specs; *dep; dep++) {
+        if (!package_list_contains_name(seen, *dep)) {
+            package_list_add(out, package_create(*dep, NULL));
+            added++;
+        }
+    }
+    return added;
+}
+
 /* ── Registry instance ───────────────────────────────────────────────────── */
 
 const Registry npm_registry = {
-    "npm",
-    "package.json",
-    npm_parse_manifest,
-    npm_resolve,
-    NULL, /* ctx      — arch (npm tarballs are platform-neutral) */
-    NULL, /* repo_url — optional; defaults to https://registry.npmjs.org */
-    NULL  /* destroy */
+    .name           = "npm",
+    .manifest_name  = "package.json",
+    .parse_manifest = npm_parse_manifest,
+    .resolve        = npm_resolve,
+    .get_deps       = npm_get_deps,
+    .ctx            = NULL, /* arch — npm tarballs are platform-neutral */
+    .repo_url       = NULL, /* optional; defaults to https://registry.npmjs.org */
+    .destroy        = NULL,
 };

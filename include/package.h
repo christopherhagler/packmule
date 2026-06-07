@@ -1,5 +1,5 @@
 /*
- * package.h — Core data structures for a resolved Python package.
+ * package.h — Core data structures for a resolved package.
  *
  * Ownership: all string fields inside Package are heap-allocated and owned
  * by the Package itself.  Always use package_destroy() to free a Package —
@@ -12,21 +12,23 @@
 #include <stddef.h>
 
 /*
- * Package — a single Python distribution to be downloaded.
+ * Package — a single distribution to be downloaded.
  *
  * Fields are populated in stages:
- *   1. name + version are set at parse time (from requirements.txt).
- *   2. url, sha256, filename are filled in after querying the PyPI JSON API.
- *   3. requires_dist is populated from info.requires_dist for transitive resolution.
+ *   1. name + version are set at parse time (from the manifest file).
+ *   2. url, sha256, filename are filled in by the registry's resolve().
+ *   3. dep_specs is populated by resolve() for registries that support
+ *      transitive resolution; format is registry-specific.
  */
 typedef struct {
-    char *name;            /* Normalised distribution name, e.g. "requests" */
-    char *version;         /* Resolved version string, e.g. "2.31.0".  May be NULL
-                              until dependency resolution completes. */
-    char *url;             /* Download URL for the chosen wheel or sdist. */
-    char *sha256;          /* Expected SHA-256 hex digest (64 chars + NUL). */
-    char *filename;        /* Basename of the downloaded file. */
-    char **requires_dist;  /* NULL-terminated array of PEP 508 dep strings, or NULL. */
+    char *name;        /* Package name, e.g. "requests" */
+    char *version;     /* Resolved version string, e.g. "2.31.0".  May be NULL
+                          until dependency resolution completes. */
+    char *url;         /* Download URL for the chosen artifact. */
+    char *sha256;      /* Expected SHA-256 hex digest (64 chars + NUL). */
+    char *filename;    /* Basename of the downloaded file. */
+    char **dep_specs;  /* NULL-terminated array of registry dep specifiers, or NULL.
+                          Populated by resolve(); consumed by get_deps(). */
 } Package;
 
 /*

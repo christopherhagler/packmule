@@ -70,11 +70,21 @@ static void test_manifest_names_set(void)
     assert(strcmp(registry_find("rpm")->manifest_name,  "packages.txt")      == 0);
 }
 
+static void test_get_deps_vtable(void)
+{
+    /* pypi and npm implement transitive resolution via get_deps. */
+    assert(registry_find("pypi")->get_deps != NULL);
+    assert(registry_find("npm")->get_deps  != NULL);
+    /* rpm does not follow transitive dependencies automatically. */
+    assert(registry_find("rpm")->get_deps  == NULL);
+}
+
 int main(void)
 {
     test_find_known();
     test_find_unknown();
     test_names_list();
     test_manifest_names_set();
+    test_get_deps_vtable();
     return 0;
 }

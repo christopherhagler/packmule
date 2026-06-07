@@ -24,33 +24,24 @@ packmule: arch      : x86_64
 packmule: manifest  : requirements.txt (3 package(s))
 packmule: output dir: ./vendor
 
-  [1/3] requests==2.31.0
-         -> ./vendor/requests-2.31.0-py3-none-any.whl
-  [====================] 100%  61.1 KB / 61.1 KB  489.0 KB/s
-            sha256: OK
-
-  [2/8] click==8.1.7
-         -> ./vendor/click-8.1.7-py3-none-any.whl
-  [====================] 100%  95.6 KB / 95.6 KB  716.9 KB/s
-            sha256: OK
-
-  [3/10] certifi (resolved: 2026.5.20)
-         -> ./vendor/certifi-2026.5.20-py3-none-any.whl
-  [====================] 100%  131.0 KB / 131.0 KB  859.5 KB/s
-            sha256: OK
-
+  [1/53] resolving requests...
+  [1/53] downloading requests-2.31.0-py3-none-any.whl
+  [2/53] resolving click...
+  [2/53] downloading click-8.1.7-py3-none-any.whl
   ...
+  [53/53] downloading pycparser-3.0-py3-none-any.whl
 
-packmule: 10/10 package(s) downloaded to ./vendor
+packmule: 53/53 package(s) downloaded to ./vendor
 ```
 
-The progress bar updates in-place on a terminal (TTY). When stdout is piped or
-redirected the bar is suppressed automatically, keeping log output clean.
+Each status line updates in-place using `\r` — the terminal does not scroll
+during a download run. Dry-run mode (`-n`) prints all resolved packages in
+full without overwriting.
 
-The counter grows as transitive dependencies are discovered — `[2/8]` means
-8 packages are now queued after resolving the first. Each file is verified
-against its registry-published digest before being kept; mismatches are
-removed and reported on standard error.
+The counter grows as transitive dependencies are discovered — the total shown
+in brackets increases as each package's dependencies are queued. Each file is
+verified against its registry-published digest before being kept; mismatches
+are removed and reported on standard error.
 
 ---
 
@@ -262,8 +253,10 @@ Transitive dependencies are resolved automatically by following
 breadth-first and deduplicates by name (case-insensitive, with `-`, `_`, and
 `.` treated as equivalent per PEP 503).
 
-Environment markers (e.g. `; python_version > "3.8"`) are stripped without
-evaluation — all declared dependencies are queued regardless of conditions.
+Extras-gated dependencies (e.g. `; extra == 'security'`) are filtered out —
+optional extras are never followed automatically. Other environment markers
+(e.g. `; python_version > "3.8"`) are not evaluated; all such non-extras
+dependencies are queued regardless of their marker conditions.
 
 Wheel selection priority: architecture-specific wheel → universal wheel
 (`none-any`) → sdist.
@@ -334,9 +327,9 @@ All seven test suites are fully offline — no network access required:
 | Suite | Coverage |
 |---|---|
 | `test_package` | Package lifecycle, PackageList grow/contains/dedup, PEP 503 name normalisation |
-| `test_registry` | Registry dispatch table, name lookup, vtable integrity |
-| `test_registry_pypi` | PyPI manifest parsing: pins, extras, markers, broader specifiers, error paths |
-| `test_registry_npm` | npm manifest parsing: deps, scoped packages, dev/peer dep exclusion |
+| `test_registry` | Registry dispatch table, name lookup, vtable integrity, `get_deps` slot |
+| `test_registry_pypi` | PyPI manifest parsing and `get_deps`: extras filtering, name extraction, dedup |
+| `test_registry_npm` | npm manifest parsing and `get_deps`: dep enqueuing and dedup |
 | `test_registry_rpm` | RPM manifest parsing: name-only, name-version, hyphenated names |
 | `test_hash` | `sha256_file`, `verify_file` — SHA-256 hex and SHA-512 SRI paths |
 | `test_bundle` | Bundle creation for all three backends; skips packages missing from disk |
@@ -380,7 +373,7 @@ include/
   network.h
   hash.h
   registry.h          Registry vtable (name, manifest_name, parse_manifest,
-                      resolve, ctx, repo_url, destroy)
+                      resolve, get_deps, ctx, repo_url, destroy)
   package.h           Package / PackageList types
   bundle.h            BundleOptions struct and bundle_create()
   version.h           PACKMULE_VERSION constant
@@ -408,6 +401,8 @@ struct Registry {
     const char  *manifest_name;  /* shown in --help */
     PackageList *(*parse_manifest)(const Registry *self, const char *path);
     int          (*resolve)       (const Registry *self, Package *pkg);
+    int          (*get_deps)      (const Registry *self, const Package *pkg,
+                                   const PackageList *seen, PackageList *out);
     void        *ctx;            /* arch string, injected by main.c */
     const char  *repo_url;       /* base URL, set from -u flag by main.c */
     void        (*destroy)        (Registry *self);
@@ -415,8 +410,10 @@ struct Registry {
 ```
 
 1. Create `src/registry_<name>.c` with a `const Registry <name>_registry` instance.
-2. Add an `extern` declaration and pointer entry in `src/registry.c`.
-3. The new backend appears automatically in `--help` and `--type`.
+2. Implement `parse_manifest` and `resolve`. Optionally implement `get_deps` for
+   transitive dependency resolution; set it to `NULL` if not needed.
+3. Add an `extern` declaration and pointer entry in `src/registry.c`.
+4. The new backend appears automatically in `--help` and `--type`.
 
 ### Memory convention
 

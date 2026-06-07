@@ -15,9 +15,10 @@ static void test_package_create_with_version(void)
     assert(pkg != NULL);
     assert(strcmp(pkg->name,    "requests") == 0);
     assert(strcmp(pkg->version, "2.31.0")   == 0);
-    assert(pkg->url      == NULL);
-    assert(pkg->sha256   == NULL);
-    assert(pkg->filename == NULL);
+    assert(pkg->url       == NULL);
+    assert(pkg->sha256    == NULL);
+    assert(pkg->filename  == NULL);
+    assert(pkg->dep_specs == NULL);
     package_destroy(pkg);
 }
 
@@ -26,10 +27,11 @@ static void test_package_create_no_version(void)
     Package *pkg = package_create("flask", NULL);
     assert(pkg != NULL);
     assert(strcmp(pkg->name, "flask") == 0);
-    assert(pkg->version  == NULL);
-    assert(pkg->url      == NULL);
-    assert(pkg->sha256   == NULL);
-    assert(pkg->filename == NULL);
+    assert(pkg->version   == NULL);
+    assert(pkg->url       == NULL);
+    assert(pkg->sha256    == NULL);
+    assert(pkg->filename  == NULL);
+    assert(pkg->dep_specs == NULL);
     package_destroy(pkg);
 }
 

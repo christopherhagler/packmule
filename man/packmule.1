@@ -264,10 +264,14 @@ Broader specifiers
 .RB ( >= ", " <= ", " ~= ", " != )
 cause the version to be treated as unpinned and resolved to the latest
 release.
-Environment markers
+Extras-gated transitive dependencies
+.RI ( "; extra == 'security'" )
+are filtered out during transitive resolution \(em optional extras are never
+followed automatically.
+Other environment markers
 .RI ( "; python_version > '3.8'" )
-are stripped without evaluation; all declared dependencies are downloaded
-regardless of marker conditions.
+are not evaluated; all non-extras transitive dependencies are queued
+regardless of their marker conditions.
 .PP
 For the
 .B npm

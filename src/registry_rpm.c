@@ -490,11 +490,12 @@ static int rpm_resolve(const Registry *self, Package *pkg)
 /* ── Registry instance ───────────────────────────────────────────────────── */
 
 const Registry rpm_registry = {
-    "rpm",
-    "packages.txt",
-    rpm_parse_manifest,
-    rpm_resolve,
-    NULL, /* ctx      — arch string, injected by main.c */
-    NULL, /* repo_url — set by main.c from -u flag */
-    NULL  /* destroy */
+    .name           = "rpm",
+    .manifest_name  = "packages.txt",
+    .parse_manifest = rpm_parse_manifest,
+    .resolve        = rpm_resolve,
+    .get_deps       = NULL, /* rpm does not support transitive resolution */
+    .ctx            = NULL, /* arch string, injected by main.c */
+    .repo_url       = NULL, /* set by main.c from -u flag */
+    .destroy        = NULL,
 };

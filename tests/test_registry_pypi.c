@@ -1,7 +1,8 @@
 /*
  * test_registry_pypi.c — unit tests for the PyPI registry backend.
  *
- * All tests exercise parse_manifest only (no network calls).
+ * parse_manifest tests: no network calls required.
+ * get_deps tests: exercise extras filtering, name parsing, and dedup logic.
  */
 #include "registry.h"
 #include "package.h"
@@ -229,6 +230,114 @@ static void test_fixture_file(void)
     package_list_destroy(list);
 }
 
+/* ── get_deps ────────────────────────────────────────────────────────────── */
+
+/* Build a Package with dep_specs populated, as if resolve() had been called. */
+static Package *make_resolved(const char *name, const char **specs, int n)
+{
+    Package *pkg = package_create(name, "1.0.0");
+    if (n > 0) {
+        pkg->dep_specs = malloc(((size_t)n + 1) * sizeof(char *));
+        for (int i = 0; i < n; i++)
+            pkg->dep_specs[i] = strdup(specs[i]);
+        pkg->dep_specs[n] = NULL;
+    }
+    return pkg;
+}
+
+static void test_get_deps_filters_extras(void)
+{
+    /* Extras-gated entries must be silently skipped. */
+    const char *specs[] = {
+        "certifi>=2017.4.17",
+        "cryptography>=1.3.4; extra == 'security'",
+        "idna>=2.0.0; extra == 'security'",
+        "charset-normalizer<4,>=2",
+    };
+    Package     *pkg  = make_resolved("requests", specs, 4);
+    const Registry *pypi = registry_find("pypi");
+    PackageList *seen = package_list_create();
+    PackageList *out  = package_list_create();
+
+    int added = pypi->get_deps(pypi, pkg, seen, out);
+
+    assert(added == 2);
+    assert(out->count == 2);
+    assert(strcmp(out->items[0]->name, "certifi")            == 0);
+    assert(strcmp(out->items[1]->name, "charset-normalizer") == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(seen);
+    package_list_destroy(out);
+}
+
+static void test_get_deps_name_parsing(void)
+{
+    /* PEP 508: version ranges, extras brackets, env markers all stripped;
+     * result is lowercased. */
+    const char *specs[] = {
+        "Django>=3.2",
+        "psycopg2-binary==2.9.9",
+        "typing_extensions>=4.0; python_version < '3.11'",
+    };
+    Package     *pkg  = make_resolved("myapp", specs, 3);
+    const Registry *pypi = registry_find("pypi");
+    PackageList *seen = package_list_create();
+    PackageList *out  = package_list_create();
+
+    pypi->get_deps(pypi, pkg, seen, out);
+
+    assert(out->count == 3);
+    assert(strcmp(out->items[0]->name, "django")             == 0);
+    assert(strcmp(out->items[1]->name, "psycopg2-binary")    == 0);
+    assert(strcmp(out->items[2]->name, "typing_extensions")  == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(seen);
+    package_list_destroy(out);
+}
+
+static void test_get_deps_dedup(void)
+{
+    /* Deps already present in seen must not be added again. */
+    const char *specs[] = {
+        "certifi>=2017.4.17",
+        "urllib3<3,>=1.21.1",
+    };
+    Package     *pkg  = make_resolved("requests", specs, 2);
+    const Registry *pypi = registry_find("pypi");
+    /* seen and out are the same list — the typical caller pattern. */
+    PackageList *queue = package_list_create();
+    package_list_add(queue, package_create("certifi", "2024.2.2"));
+
+    int added = pypi->get_deps(pypi, pkg, queue, queue);
+
+    assert(added == 1);
+    assert(queue->count == 2); /* 1 pre-existing + 1 new */
+    assert(strcmp(queue->items[1]->name, "urllib3") == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(queue);
+}
+
+static void test_get_deps_null_dep_specs(void)
+{
+    /* Package with no dep_specs set → 0 added, no crash. */
+    Package     *pkg  = package_create("flask", "3.0.0");
+    const Registry *pypi = registry_find("pypi");
+    PackageList *seen = package_list_create();
+    PackageList *out  = package_list_create();
+
+    int added = pypi->get_deps(pypi, pkg, seen, out);
+
+    assert(added == 0);
+    assert(out->count == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(seen);
+    package_list_destroy(out);
+}
+
 int main(void)
 {
     test_basic_parse();
@@ -240,5 +349,9 @@ int main(void)
     test_environment_markers_stripped();
     test_missing_file();
     test_fixture_file();
+    test_get_deps_filters_extras();
+    test_get_deps_name_parsing();
+    test_get_deps_dedup();
+    test_get_deps_null_dep_specs();
     return 0;
 }

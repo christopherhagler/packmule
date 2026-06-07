@@ -5,35 +5,12 @@
 #include "registry.h"
 #include "version.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
-
-/*
- * parse_dep_name — extract the bare package name from a PEP 508 specifier.
- *
- * Stops at the first '[', '(', ';', '>', '<', '!', '=', '~', or whitespace
- * and lowercases the result so case-insensitive dedup works correctly.
- */
-static void parse_dep_name(const char *spec, char *out, size_t out_size)
-{
-    size_t i = 0;
-    while (i < out_size - 1 && spec[i] &&
-           spec[i] != '[' && spec[i] != '(' &&
-           spec[i] != ';' && spec[i] != '>' &&
-           spec[i] != '<' && spec[i] != '!' &&
-           spec[i] != '=' && spec[i] != '~' &&
-           spec[i] != ' ' && spec[i] != '\t')
-    {
-        out[i] = (char)tolower((unsigned char)spec[i]);
-        i++;
-    }
-    out[i] = '\0';
-}
 
 static void print_registry_list(void)
 {
@@ -243,35 +220,41 @@ int main(int argc, char *argv[])
         Package *pkg    = reqs->items[i];
         int  was_pinned = (pkg->version != NULL);
 
-        printf("  [%zu/%zu] %s%s%s",
-               i + 1, reqs->count,
-               pkg->name,
-               pkg->version ? "==" : "",
-               pkg->version ? pkg->version : "");
-        fflush(stdout);
+        /* In download mode, overwrite the same status line using \r so the
+         * terminal does not scroll.  In dry-run mode, let output flow freely
+         * since the user is reviewing the full list. */
+        if (!dry_run) {
+            printf("\r  [%zu/%-4zu] resolving %-40.40s\033[K",
+                   i + 1, reqs->count, pkg->name);
+            fflush(stdout);
+        } else {
+            printf("  [%zu/%zu] %s%s%s",
+                   i + 1, reqs->count,
+                   pkg->name,
+                   pkg->version ? "==" : "",
+                   pkg->version ? pkg->version : "");
+            fflush(stdout);
+        }
 
         if (reg->resolve(reg, pkg) != 0) {
-            printf(" -- FAILED\n");
+            if (dry_run)
+                printf(" -- FAILED\n");
+            else
+                fprintf(stdout, "\n");
             fprintf(stderr, "  packmule: could not resolve %s\n", pkg->name);
             exit_code = EXIT_FAILURE;
             continue;
         }
 
-        if (!was_pinned && pkg->version)
-            printf(" (resolved: %s)", pkg->version);
-        putchar('\n');
-
-        /* Enqueue transitive deps discovered via requires_dist. */
-        if (pkg->requires_dist) {
-            for (char **rd = pkg->requires_dist; *rd; rd++) {
-                char dep[256];
-                parse_dep_name(*rd, dep, sizeof(dep));
-                if (dep[0] && !package_list_contains_name(reqs, dep))
-                    package_list_add(reqs, package_create(dep, NULL));
-            }
-        }
+        /* Enqueue transitive deps via the registry's own get_deps hook.
+         * All format-specific filtering is the registry's responsibility. */
+        if (reg->get_deps)
+            reg->get_deps(reg, pkg, reqs, reqs);
 
         if (dry_run) {
+            if (!was_pinned && pkg->version)
+                printf(" (resolved: %s)", pkg->version);
+            putchar('\n');
             printf("         file  : %s\n"
                    "         url   : %s\n"
                    "         sha256: %s\n\n",
@@ -281,18 +264,19 @@ int main(int argc, char *argv[])
             int nw = snprintf(dest, sizeof(dest), "%s/%s",
                               output_dir, pkg->filename);
             if (nw < 0 || nw >= (int)sizeof(dest)) {
-                fprintf(stderr, "  packmule: destination path too long for %s\n",
+                fprintf(stderr, "\n  packmule: destination path too long for %s\n",
                         pkg->filename);
                 exit_code = EXIT_FAILURE;
                 ++resolved;
                 continue;
             }
 
-            printf("         -> %s\n", dest);
+            printf("\r  [%zu/%-4zu] downloading %-38.38s\033[K",
+                   i + 1, reqs->count, pkg->filename);
             fflush(stdout);
 
             if (download_file(pkg->url, dest, 1) != 0) {
-                fprintf(stderr, "  packmule: download failed for %s\n", pkg->name);
+                fprintf(stderr, "\n  packmule: download failed for %s\n", pkg->name);
                 exit_code = EXIT_FAILURE;
                 ++resolved;
                 continue;
@@ -305,12 +289,15 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            printf("            sha256: OK\n\n");
             ++downloaded;
         }
 
         ++resolved;
     }
+
+    /* End the in-place status line with a newline before the summary. */
+    if (!dry_run)
+        putchar('\n');
 
     if (dry_run) {
         printf("packmule: dry run complete -- %zu/%zu package(s) resolved"

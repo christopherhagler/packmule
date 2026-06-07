@@ -222,24 +222,24 @@ static int pypi_parse_response(const char *json, Package *pkg, const char *arch)
             pkg->version = pm_strdup(ver_item->valuestring);
     }
 
-    /* Extract requires_dist for transitive resolution. */
+    /* Extract dep_specs for transitive resolution. */
     if (info) {
-        cJSON *req_dist = cJSON_GetObjectItemCaseSensitive(info, "requires_dist");
+        cJSON *req_dist = cJSON_GetObjectItemCaseSensitive(info, "dep_specs");
         if (cJSON_IsArray(req_dist)) {
             int n = cJSON_GetArraySize(req_dist);
-            if (pkg->requires_dist) {
-                for (char **p = pkg->requires_dist; *p; p++)
+            if (pkg->dep_specs) {
+                for (char **p = pkg->dep_specs; *p; p++)
                     pm_free(*p);
-                pm_free(pkg->requires_dist);
+                pm_free(pkg->dep_specs);
             }
-            pkg->requires_dist = pm_malloc(((size_t)n + 1) * sizeof(char *));
+            pkg->dep_specs = pm_malloc(((size_t)n + 1) * sizeof(char *));
             int k = 0;
             cJSON *item = NULL;
             cJSON_ArrayForEach(item, req_dist) {
                 if (cJSON_IsString(item))
-                    pkg->requires_dist[k++] = pm_strdup(item->valuestring);
+                    pkg->dep_specs[k++] = pm_strdup(item->valuestring);
             }
-            pkg->requires_dist[k] = NULL;
+            pkg->dep_specs[k] = NULL;
         }
     }
 
@@ -356,14 +356,73 @@ static int pypi_resolve(const Registry *self, Package *pkg)
     return ret;
 }
 
+/* ── Transitive dependency resolver ─────────────────────────────────────── */
+
+/*
+ * dep_is_extras_only — return 1 if the PEP 508 specifier is gated by an
+ * extras marker ("; extra == 'foo'").  Such deps are optional and must never
+ * be pulled in when no extra was explicitly requested.
+ */
+static int dep_is_extras_only(const char *spec)
+{
+    const char *marker = strchr(spec, ';');
+    if (!marker)
+        return 0;
+    return strstr(marker, "extra ==") != NULL ||
+           strstr(marker, "extra==")  != NULL;
+}
+
+/*
+ * parse_dep_name — extract the bare package name from a PEP 508 specifier,
+ * lowercased so case-insensitive dedup works correctly.
+ *
+ * Stops at the first '[', '(', ';', '>', '<', '!', '=', '~', or whitespace.
+ */
+static void parse_dep_name(const char *spec, char *out, size_t out_size)
+{
+    size_t i = 0;
+    while (i < out_size - 1 && spec[i] &&
+           spec[i] != '[' && spec[i] != '(' &&
+           spec[i] != ';' && spec[i] != '>' &&
+           spec[i] != '<' && spec[i] != '!' &&
+           spec[i] != '=' && spec[i] != '~' &&
+           spec[i] != ' ' && spec[i] != '\t')
+    {
+        out[i] = (char)tolower((unsigned char)spec[i]);
+        i++;
+    }
+    out[i] = '\0';
+}
+
+static int pypi_get_deps(const Registry *self, const Package *pkg,
+                          const PackageList *seen, PackageList *out)
+{
+    (void)self;
+    if (!pkg->dep_specs)
+        return 0;
+    int added = 0;
+    for (char **rd = pkg->dep_specs; *rd; rd++) {
+        if (dep_is_extras_only(*rd))
+            continue;
+        char name[256];
+        parse_dep_name(*rd, name, sizeof(name));
+        if (name[0] && !package_list_contains_name(seen, name)) {
+            package_list_add(out, package_create(name, NULL));
+            added++;
+        }
+    }
+    return added;
+}
+
 /* ── Registry instance ───────────────────────────────────────────────────── */
 
 const Registry pypi_registry = {
-    "pypi",
-    "requirements.txt",
-    pypi_parse_manifest,
-    pypi_resolve,
-    NULL, /* ctx      — arch string, injected by main.c */
-    NULL, /* repo_url — optional; defaults to https://pypi.org/pypi */
-    NULL  /* destroy */
+    .name          = "pypi",
+    .manifest_name = "requirements.txt",
+    .parse_manifest = pypi_parse_manifest,
+    .resolve       = pypi_resolve,
+    .get_deps      = pypi_get_deps,
+    .ctx           = NULL, /* arch string, injected by main.c */
+    .repo_url      = NULL, /* optional; defaults to https://pypi.org/pypi */
+    .destroy       = NULL,
 };

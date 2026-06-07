@@ -44,6 +44,20 @@ struct Registry {
     int (*resolve)(const Registry *self, Package *pkg);
 
     /*
+     * get_deps — enqueue transitive dependencies discovered after resolve().
+     *
+     * For each dependency implied by `pkg` that is not already present in
+     * `seen`, appends a new Package to `out`.  The registry is responsible
+     * for all format-specific filtering (e.g. extras-only entries for PyPI).
+     * `seen` and `out` may point to the same list.
+     *
+     * Returns the number of packages added, or -1 on internal error.
+     * May be NULL for registries that do not support transitive resolution.
+     */
+    int (*get_deps)(const Registry *self, const Package *pkg,
+                    const PackageList *seen, PackageList *out);
+
+    /*
      * ctx — optional opaque per-instance configuration injected by the caller.
      * main.c uses this to pass the target CPU architecture string to backends
      * that need it (e.g. pypi).  NULL for backends that don't use it.

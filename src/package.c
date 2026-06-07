@@ -27,10 +27,10 @@ void package_destroy(Package *pkg)
     pm_free(pkg->url);
     pm_free(pkg->sha256);
     pm_free(pkg->filename);
-    if (pkg->requires_dist) {
-        for (char **p = pkg->requires_dist; *p; p++)
+    if (pkg->dep_specs) {
+        for (char **p = pkg->dep_specs; *p; p++)
             pm_free(*p);
-        pm_free(pkg->requires_dist);
+        pm_free(pkg->dep_specs);
     }
     pm_free(pkg);
 }
