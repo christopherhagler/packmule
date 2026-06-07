@@ -1,0 +1,355 @@
+.TH PACKMULE 1 "June 2026" "packmule 0.1.0" "User Commands"
+.\"
+.\" packmule.1 \(em manual page for packmule(1)
+.\"
+.SH NAME
+packmule \- resolve, download, and bundle packages for air-gapped environments
+.\"
+.SH SYNOPSIS
+.B packmule
+.B \-r
+.I manifest
+.RB [ \-o
+.IR output_dir ]
+.RB [ \-t
+.IR type ]
+.RB [ \-a
+.IR arch ]
+.RB [ \-u
+.IR url ]
+.RB [ \-b ]
+.RB [ \-n ]
+.br
+.B packmule
+.BR \-V | \-\-version
+.br
+.B packmule
+.BR \-h | \-\-help
+.\"
+.SH DESCRIPTION
+.B packmule
+reads a package manifest file, queries the appropriate registry to resolve
+each package to a concrete version and download URL, downloads every required
+file, and verifies each file against its published SHA\-256 or SHA\-512 digest.
+.PP
+With
+.BR \-\-bundle ,
+.B packmule
+also writes a
+.I manifest.json
+index and a ready-to-run
+.I install.sh
+script into the output directory, then compresses the entire directory to a
+single
+.I .tar.gz
+archive.
+The archive can then be transported to a network-isolated machine and
+installed without any outbound internet access.
+.PP
+Packages that fail integrity verification are removed from the output
+directory and reported on standard error.
+The exit status reflects whether all packages were obtained successfully.
+.\"
+.SH OPTIONS
+.TP
+.BI \-r " manifest"
+Path to the input manifest file.
+This option is \fBrequired\fP.
+The expected format depends on the registry backend selected with
+.BR \-t :
+a
+.I requirements.txt
+for the
+.B pypi
+backend, a
+.I package.json
+for
+.BR npm ,
+and a plain package-per-line text file for
+.BR rpm .
+.TP
+.BI \-o " output_dir"
+Directory in which to write the downloaded package files.
+The directory is created if it does not exist.
+Defaults to the current working directory
+.RB ( . ).
+Ignored when
+.B \-n
+is given.
+.TP
+.BR \-t " type" ", " \-\-type " type"
+Select the registry backend.
+Defaults to
+.BR pypi .
+Run
+.B packmule \-\-help
+for the full list of available types.
+.TP
+.BR \-a " arch" ", " \-\-arch " arch"
+Target CPU architecture for platform-specific package selection.
+Defaults to the current machine architecture as reported by
+.BR uname (2)
+(e.g.\&
+.IR x86_64 ,
+.IR aarch64 ,
+.IR arm64 ).
+When set, an architecture-specific package is preferred over a universal one;
+both are preferred over a source archive.
+Specify
+.B any
+to disable architecture preference and download only universal or source
+packages.
+The values
+.B aarch64
+and
+.B arm64
+are treated as equivalent (same CPU, different OS naming conventions).
+.TP
+.BR \-u " url" ", " \-\-repo\-url " url"
+Base URL of the upstream package repository.
+Required when using the
+.B rpm
+backend.
+Optional for
+.B pypi
+and
+.B npm
+\(em when omitted those backends use their default public endpoints
+(pypi.org and registry.npmjs.org respectively).
+Use this flag to point any backend at a private mirror or corporate proxy
+such as JFrog Artifactory or Sonatype Nexus.
+.RS
+.PP
+Examples:
+.IP
+.I https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os
+.IP
+.I https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi
+.IP
+.I https://nexus.example.com/repository/npm-proxy
+.RE
+.TP
+.BR \-b ", " \-\-bundle
+After all packages are downloaded successfully, write a
+.I manifest.json
+and an
+.I install.sh
+into the output directory and then compress the entire directory to
+.IB output_dir .tar.gz\c
+\&.
+.RS
+.PP
+The manifest is a JSON file listing each downloaded package with its resolved
+version, filename, and SHA\-256 digest.
+.PP
+The install script is pre-configured for the active registry backend:
+.B pip install \-\-no\-index \-\-find\-links
+for
+.BR pypi ,
+a loop of
+.B npm install
+calls over each
+.I .tgz
+for
+.BR npm ,
+and
+.B dnf install \-\-disablerepo=\'*\'
+(falling back to
+.BR "rpm \-Uvh" )
+for
+.BR rpm .
+.PP
+Bundling is skipped in dry-run mode and skipped if any package failed to
+download.
+The output directory is left intact alongside the archive.
+.RE
+.TP
+.BR \-n ", " \-\-dry\-run
+Resolve every package in the manifest and print what would be downloaded,
+but do not write any files to disk.
+The registry is still queried, so the output reflects real resolved
+versions, download URLs, and digests.
+Useful for auditing a manifest before committing to a download.
+.TP
+.BR \-V ", " \-\-version
+Print the version banner and exit with status 0.
+.TP
+.BR \-h ", " \-\-help
+Print a brief usage summary to standard error and exit with status 0.
+.\"
+.SH EXIT STATUS
+.TP
+.B 0
+All packages were resolved and downloaded successfully.
+.TP
+.B 1
+One or more packages could not be resolved, downloaded, or verified.
+Successfully downloaded packages are still written to the output directory;
+consult standard error for a per-package diagnosis.
+.\"
+.SH EXAMPLES
+Preview what would be downloaded without writing any files:
+.PP
+.RS 4
+.EX
+packmule \-n \-r requirements.txt
+.EE
+.RE
+.PP
+Download all transitive dependencies for a Linux x86_64 target:
+.PP
+.RS 4
+.EX
+packmule \-r requirements.txt \-o ./vendor \-a x86_64
+.EE
+.RE
+.PP
+Download and produce a self-contained transport bundle (vendor.tar.gz):
+.PP
+.RS 4
+.EX
+packmule \-r requirements.txt \-o ./vendor \-a x86_64 \-\-bundle
+.EE
+.RE
+.PP
+Download Node.js dependencies and bundle them for transport:
+.PP
+.RS 4
+.EX
+packmule \-r package.json \-o ./vendor \-t npm \-\-bundle
+.EE
+.RE
+.PP
+Download RPM packages from a Fedora 40 repository:
+.PP
+.RS 4
+.EX
+packmule \-r packages.txt \-o ./rpms \-t rpm \-a x86_64 \e
+    \-u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os
+.EE
+.RE
+.PP
+Download Python packages from a private Artifactory mirror:
+.PP
+.RS 4
+.EX
+packmule \-r requirements.txt \-o ./vendor \e
+    \-u https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi
+.EE
+.RE
+.\"
+.SH NOTES
+.B packmule
+requires outbound HTTPS connectivity to the upstream registry on the machine
+where it is run.
+The output directory (and the bundle produced by
+.BR \-\-bundle )
+requires no registry access on the target machine.
+.PP
+Package name deduplication for the
+.B pypi
+backend follows PEP\~503: the characters
+.BR \- ,
+.BR _ ,
+and
+.B .
+are treated as equivalent, and comparisons are case-insensitive.
+.PP
+For the
+.B pypi
+backend, only
+.B ==
+version specifiers result in a pinned query.
+Broader specifiers
+.RB ( >= ", " <= ", " ~= ", " != )
+cause the version to be treated as unpinned and resolved to the latest
+release.
+Environment markers
+.RI ( "; python_version > '3.8'" )
+are stripped without evaluation; all declared dependencies are downloaded
+regardless of marker conditions.
+.PP
+For the
+.B npm
+backend, exact versions (digits and dots only) are queried directly; all
+range specifiers resolve to the
+.B latest
+tag.
+Packages published before approximately 2017 that lack a
+.B dist.integrity
+SHA\-512 field are refused rather than falling back to the weaker SHA\-1
+.B dist.shasum
+field.
+.PP
+For the
+.B rpm
+backend, dependencies are not followed automatically.
+Every package that must be present in the bundle should be listed explicitly
+in the manifest.
+When an architecture-specific package and a
+.B noarch
+package are both available,
+.B packmule
+prefers the architecture-specific one.
+.PP
+When an architecture-specific package and a universal or source package are
+both available for the
+.B pypi
+backend,
+.B packmule
+selects them in the following order: architecture-specific first, universal
+second, source archive third.
+This preference can be overridden with
+.BR "\-a any" .
+.\"
+.SH FILES
+.TP
+.I manifest
+Input file passed to
+.BR \-r .
+The format is determined by the active backend
+.RB ( \-t ).
+.TP
+.I output_dir/
+Destination for all downloaded package files.
+.TP
+.I output_dir/manifest.json
+Machine-readable JSON index of every downloaded package, including resolved
+version, filename, and SHA\-256 digest.
+Written when
+.B \-\-bundle
+is given.
+.TP
+.I output_dir/install.sh
+Shell script for installing the bundle on the target machine.
+Written when
+.B \-\-bundle
+is given; made executable (mode 0755).
+.TP
+.I output_dir/requirements.txt
+pip-compatible requirements file consumed by
+.IR install.sh .
+Written when
+.B \-\-bundle
+is given and the active backend is
+.BR pypi .
+.TP
+.IB output_dir .tar.gz
+Compressed archive of the output directory, created when
+.B \-\-bundle
+is given.
+.\"
+.SH SEE ALSO
+.BR curl (1),
+.BR openssl (1),
+.BR pip (1),
+.BR npm (1),
+.BR rpm (8),
+.BR dnf (8)
+.\"
+.SH AUTHORS
+Written by Christopher Hagler.
+.br
+Report bugs at
+.UR https://github.com/christopherhagler/packmule/issues
+.UE .
