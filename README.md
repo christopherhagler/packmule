@@ -10,8 +10,9 @@ file, verifies each one against its published digest, and optionally compresses
 everything into a single `.tar.gz` with a manifest and install script ready for
 transport to a network-isolated machine.
 
-Supported registries: **PyPI**, **npm**, **RPM** — all with transitive
-dependency resolution and SHA-256/SHA-512 integrity verification.
+Supported registries: **PyPI**, **npm**, **RPM** — with SHA-256/SHA-512
+integrity verification. PyPI and npm follow transitive dependencies
+automatically; RPM requires an explicit manifest.
 
 ---
 
@@ -24,19 +25,15 @@ packmule: arch      : x86_64
 packmule: manifest  : requirements.txt (3 package(s))
 packmule: output dir: ./vendor
 
-  [1/53] resolving requests...
-  [1/53] downloading requests-2.31.0-py3-none-any.whl
-  [2/53] resolving click...
-  [2/53] downloading click-8.1.7-py3-none-any.whl
-  ...
   [53/53] downloading pycparser-3.0-py3-none-any.whl
 
 packmule: 53/53 package(s) downloaded to ./vendor
 ```
 
-Each status line updates in-place using `\r` — the terminal does not scroll
-during a download run. Dry-run mode (`-n`) prints all resolved packages in
-full without overwriting.
+Each package passes through a "resolving…" then "downloading…" status
+that updates in-place on a single line using `\r` — the terminal does not
+scroll during a download run. Dry-run mode (`-n`) prints all resolved
+packages in full without overwriting.
 
 The counter grows as transitive dependencies are discovered — the total shown
 in brackets increases as each package's dependencies are queued. Each file is
@@ -368,7 +365,7 @@ src/
   registry_rpm.c      RPM backend — packages.txt parser, repomd/primary.xml resolve
   package.c           Package and PackageList data structures
   bundle.c            manifest.json, install.sh, and .tar.gz bundle creation
-  utils.c             Abort-on-OOM allocators (pm_malloc, pm_free, …)
+  utils.c             Abort-on-OOM allocators (pm_malloc, pm_free, …) and pm_strtrim
 include/
   network.h
   hash.h
@@ -377,7 +374,7 @@ include/
   package.h           Package / PackageList types
   bundle.h            BundleOptions struct and bundle_create()
   version.h           PACKMULE_VERSION constant
-  utils.h             Allocator wrappers
+  utils.h             Allocator wrappers and pm_strtrim
 tests/
   test_package.c
   test_registry.c
@@ -435,4 +432,4 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 - [x] RPM backend: manifest parsing, resolve via repomd.xml/primary.xml, SHA-256 verify
 - [x] Private/corporate registry support (`-u` for all backends)
 - [x] Bundle output — `manifest.json`, `install.sh`, and `.tar.gz` (`--bundle`)
-- [x] Progress bar / download speed display (TTY-only, 10 Hz, `\r` in-place)
+- [x] In-place status line — resolving/downloading overwrites one line using `\r`

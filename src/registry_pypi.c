@@ -210,7 +210,7 @@ static int pypi_parse_response(const char *json, Package *pkg, const char *arch)
 
     /* Extract dep_specs for transitive resolution. */
     if (info) {
-        cJSON *req_dist = cJSON_GetObjectItemCaseSensitive(info, "dep_specs");
+        cJSON *req_dist = cJSON_GetObjectItemCaseSensitive(info, "requires_dist");
         if (cJSON_IsArray(req_dist)) {
             int n = cJSON_GetArraySize(req_dist);
             if (pkg->dep_specs) {
