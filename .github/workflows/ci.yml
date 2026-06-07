@@ -6,6 +6,7 @@ on:
   pull_request:
 
 jobs:
+  # ── Ubuntu (22.04 / 24.04) × (gcc / clang) ──────────────────────────────────
   build:
     name: ${{ matrix.os }} / ${{ matrix.cc }}
     runs-on: ${{ matrix.os }}
@@ -81,6 +82,46 @@ jobs:
       # ── Smoke-test the binary ──────────────────────────────────────────────
       - name: Smoke test (--help)
         run: ./build/packmule --help || true   # exits 0; just check it runs
+
+      - name: Smoke test (missing -r flag)
+        run: |
+          if ./build/packmule 2>/dev/null; then
+            echo "Expected non-zero exit when -r is missing" && exit 1
+          fi
+          echo "OK: exited non-zero as expected"
+
+  # ── Fedora (latest) / GCC — run inside a Fedora container ───────────────────
+  build-fedora:
+    name: fedora-latest / gcc
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            cmake \
+            gcc \
+            libcurl-devel \
+            openssl-devel \
+            libarchive-devel \
+            cjson-devel \
+            gzip
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test (--help)
+        run: ./build/packmule --help || true
 
       - name: Smoke test (missing -r flag)
         run: |

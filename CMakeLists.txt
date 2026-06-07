@@ -72,10 +72,13 @@ target_include_directories(packmule_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Expose POSIX.1-2008 APIs (clock_gettime, realpath, fileno, PATH_MAX, …)
-# under strict -std=c11 on glibc systems.
-target_compile_definitions(packmule_core PUBLIC _POSIX_C_SOURCE=200809L)
-# On macOS, _POSIX_C_SOURCE hides Darwin extensions (mkdtemp, etc.) unless
+# _XOPEN_SOURCE=700 (SUSv4 / POSIX.1-2008 + XSI) unlocks all the POSIX APIs
+# we use under strict -std=c11 on glibc: clock_gettime, CLOCK_MONOTONIC,
+# realpath, PATH_MAX, fileno, mkdtemp, isatty.  It implies _POSIX_C_SOURCE=200809L
+# on glibc, and also sets __USE_XOPEN_EXTENDED which is required for realpath
+# (not covered by _POSIX_C_SOURCE alone).
+target_compile_definitions(packmule_core PUBLIC _XOPEN_SOURCE=700)
+# On macOS, _XOPEN_SOURCE hides Darwin-specific extensions unless
 # _DARWIN_C_SOURCE is also defined to re-enable them.
 target_compile_definitions(packmule_core PUBLIC
     $<$<PLATFORM_ID:Darwin>:_DARWIN_C_SOURCE>)
