@@ -5,7 +5,7 @@ Summary:        Air-gapped multi-registry package bundler
 
 License:        MIT
 URL:            https://github.com/christopherhagler/packmule
-Source0:        https://github.com/christopherhagler/packmule/archive/v%{version}/%{name}-%{version}.tar.gz
+Source0:        https://github.com/christopherhagler/packmule/archive/refs/tags/v%{version}.tar.gz
 
 BuildRequires:  cmake >= 3.15
 BuildRequires:  gcc
@@ -28,7 +28,7 @@ Supported registries:
   rpm   — RPM packages from any DNF/YUM repository
 
 %prep
-%autosetup
+%autosetup -n %{name}-%{version}
 
 %build
 %cmake -DCMAKE_BUILD_TYPE=Release

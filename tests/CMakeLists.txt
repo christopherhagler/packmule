@@ -1,6 +1,10 @@
 # Tests link against packmule_core (the OBJECT library) so they exercise the
 # real implementations without linking a second copy of main().
 
+# assert() is the test verification mechanism — keep it active in all build
+# types by removing the -DNDEBUG flag that Release/MinSizeRel normally add.
+add_compile_options(-UNDEBUG)
+
 add_executable(test_package test_package.c)
 target_link_libraries(test_package PRIVATE packmule_core)
 add_test(NAME test_package COMMAND test_package)
