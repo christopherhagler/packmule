@@ -420,7 +420,7 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     char *primary_url = pm_malloc((size_t)m + 1);
     snprintf(primary_url, (size_t)m + 1, "%s/%s", repo, primary_href);
 
-    int dl_rc = download_file(primary_url, tmp_path, 0);
+    int dl_rc = download_file(primary_url, tmp_path);
     pm_free(primary_url);
     if (dl_rc != 0) {
         pm_free(repo);

@@ -230,7 +230,7 @@ int main(int argc, char *argv[])
                    i + 1, reqs->count, pkg->filename);
             fflush(stdout);
 
-            if (download_file(pkg->url, dest, 1) != 0) {
+            if (download_file(pkg->url, dest) != 0) {
                 fprintf(stderr, "\n  packmule: download failed for %s\n", pkg->name);
                 exit_code = EXIT_FAILURE;
                 ++resolved;

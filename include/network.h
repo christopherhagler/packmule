@@ -39,15 +39,11 @@ char *fetch_json(const char *url);
  * download_file — fetch `url` and write the response body verbatim to
  * `dest_path`, creating or overwriting the file.
  *
- * When `show_progress` is non-zero and stdout is a TTY, a progress bar with
- * download speed is rendered in-place on the current line using \r.
- * Pass 0 for silent/internal downloads (e.g. repomd primary.xml.gz).
- *
  * Does not verify the file's integrity — the caller should hash the result
  * and compare against the registry-provided digest before trusting it.
  *
  * Returns 0 on success, -1 on failure.
  */
-int download_file(const char *url, const char *dest_path, int show_progress);
+int download_file(const char *url, const char *dest_path);
 
 #endif /* PACKMULE_NETWORK_H */
