@@ -1,5 +1,6 @@
 #include "utils.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,4 +65,16 @@ char *pm_strndup(const char *s, size_t n)
 void pm_free(void *ptr)
 {
     free(ptr);
+}
+
+char *pm_strtrim(char *s)
+{
+    while (isspace((unsigned char)*s))
+        ++s;
+    if (*s) {
+        char *end = s + strlen(s) - 1;
+        while (end > s && isspace((unsigned char)*end))
+            *end-- = '\0';
+    }
+    return s;
 }

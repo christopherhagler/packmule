@@ -40,20 +40,6 @@ static int arch_matches_platform(const char *platform, const char *arch)
     return 0;
 }
 
-/* ── Internal string helpers ─────────────────────────────────────────────── */
-
-static char *trim_inplace(char *s)
-{
-    while (isspace((unsigned char)*s))
-        ++s;
-    if (*s) {
-        char *end = s + strlen(s) - 1;
-        while (end > s && isspace((unsigned char)*end))
-            *end-- = '\0';
-    }
-    return s;
-}
-
 /* ── requirements.txt line parser ────────────────────────────────────────── */
 
 /*
@@ -73,7 +59,7 @@ static Package *parse_line(const char *line)
     const char *comment = strchr(line, '#');
     char *work    = comment ? pm_strndup(line, (size_t)(comment - line))
                             : pm_strdup(line);
-    char *trimmed = trim_inplace(work);
+    char *trimmed = pm_strtrim(work);
 
     if (trimmed[0] == '\0') {
         pm_free(work);
@@ -151,7 +137,7 @@ static PackageList *pypi_parse_manifest(const Registry *self, const char *path)
     char         line[4096];
 
     while (fgets(line, (int)sizeof(line), fp)) {
-        char *trimmed = trim_inplace(line);
+        char *trimmed = pm_strtrim(line);
 
         if (trimmed[0] == '\0' || trimmed[0] == '#')
             continue;

@@ -28,24 +28,11 @@
 
 #include <archive.h>
 #include <archive_entry.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ── Manifest parser ─────────────────────────────────────────────────────── */
-
-static char *rpm_trim(char *s)
-{
-    while (isspace((unsigned char)*s))
-        ++s;
-    if (*s) {
-        char *end = s + strlen(s) - 1;
-        while (end > s && isspace((unsigned char)*end))
-            *end-- = '\0';
-    }
-    return s;
-}
 
 /*
  * rpm_parse_manifest — read a simple line-by-line RPM package list.
@@ -69,7 +56,7 @@ static PackageList *rpm_parse_manifest(const Registry *self, const char *path)
     char         line[4096];
 
     while (fgets(line, (int)sizeof(line), fp)) {
-        char *trimmed = rpm_trim(line);
+        char *trimmed = pm_strtrim(line);
 
         if (trimmed[0] == '\0' || trimmed[0] == '#')
             continue;

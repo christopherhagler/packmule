@@ -43,4 +43,12 @@ char *pm_strndup(const char *s, size_t n);
 /* Free memory allocated by any pm_* allocator.  Safe to call with NULL. */
 void pm_free(void *ptr);
 
+/*
+ * pm_strtrim — trim leading and trailing ASCII whitespace from `s` in-place.
+ *
+ * Returns a pointer into `s` (never a new allocation).  The caller must NOT
+ * free the returned pointer; free the original buffer instead.
+ */
+char *pm_strtrim(char *s);
+
 #endif /* PACKMULE_UTILS_H */

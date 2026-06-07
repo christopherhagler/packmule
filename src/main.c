@@ -6,6 +6,7 @@
 #include "version.h"
 
 #include <errno.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,25 +24,20 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "packmule " PACKMULE_VERSION " -- air-gapped package bundler\n"
-            "\nUsage: %s -r <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-n]\n"
+            "\nUsage: %s -r <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]\n"
             "\n"
             "Options:\n"
-            "  -r <file>         Path to the package manifest (required)\n"
-            "  -o <dir>          Output directory for downloads (default: .)\n"
-            "  -t <type>         Registry backend (default: pypi)\n"
-            "  -a <arch>         Target CPU architecture for package selection\n"
-            "                    (default: current machine, e.g. x86_64, aarch64, arm64)\n"
-            "                    Use 'any' to prefer universal/source packages only\n"
-            "  -u <url>          Repository base URL\n"
-            "                    Required for rpm; optional for pypi/npm (overrides public endpoint)\n"
-            "                    e.g. https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os\n"
-            "                    e.g. https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi\n"
-            "  -b, --bundle      After downloading, write manifest.json and\n"
-            "                    install.sh into <dir>, then create <dir>.tar.gz\n"
-            "  -n, --dry-run     Resolve packages and print what would be\n"
-            "                    downloaded without writing any files\n"
-            "  -V                Print version and exit\n"
-            "  -h, --help        Show this help and exit\n"
+            "  -r <file>                  Path to the package manifest (required)\n"
+            "  -o <dir>                   Output directory for downloads (default: .)\n"
+            "  -t, --type <type>          Registry backend (default: pypi)\n"
+            "  -a, --arch <arch>          Target CPU architecture (default: current machine)\n"
+            "                             e.g. x86_64, aarch64, arm64; use 'any' for universal only\n"
+            "  -u, --repo-url <url>       Repository base URL\n"
+            "                             Required for rpm; optional override for pypi/npm\n"
+            "  -b, --bundle               Write manifest.json + install.sh, then create <dir>.tar.gz\n"
+            "  -n, --dry-run              Resolve and print what would be downloaded; no files written\n"
+            "  -V, --version              Print version and exit\n"
+            "  -h, --help                 Show this help and exit\n"
             "\n"
             "Available registry types:\n",
             prog);
@@ -75,78 +71,37 @@ int main(int argc, char *argv[])
     }
     char *arch = detected_arch[0] ? detected_arch : NULL;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+    static const struct option LONG_OPTS[] = {
+        { "help",     no_argument,       NULL, 'h' },
+        { "version",  no_argument,       NULL, 'V' },
+        { "type",     required_argument, NULL, 't' },
+        { "arch",     required_argument, NULL, 'a' },
+        { "repo-url", required_argument, NULL, 'u' },
+        { "bundle",   no_argument,       NULL, 'b' },
+        { "dry-run",  no_argument,       NULL, 'n' },
+        { NULL,       0,                 NULL,  0  },
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "hVr:o:t:a:u:bn", LONG_OPTS, NULL)) != -1) {
+        switch (opt) {
+        case 'h': usage(argv[0]); return EXIT_SUCCESS;
+        case 'V': puts("packmule " PACKMULE_VERSION); return EXIT_SUCCESS;
+        case 'r': requirements_file = optarg; break;
+        case 'o': output_dir        = optarg; break;
+        case 't': registry_type     = optarg; break;
+        case 'a': arch              = optarg; break;
+        case 'u': repo_url          = optarg; break;
+        case 'b': do_bundle         = 1;      break;
+        case 'n': dry_run           = 1;      break;
+        default:
             usage(argv[0]);
-            return EXIT_SUCCESS;
+            return EXIT_FAILURE;
         }
+    }
 
-        if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-            puts("packmule " PACKMULE_VERSION);
-            return EXIT_SUCCESS;
-        }
-
-        if (strcmp(argv[i], "-r") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "packmule: -r requires an argument\n");
-                usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            requirements_file = argv[++i];
-            continue;
-        }
-
-        if (strcmp(argv[i], "-o") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "packmule: -o requires an argument\n");
-                usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            output_dir = argv[++i];
-            continue;
-        }
-
-        if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--type") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "packmule: -t requires an argument\n");
-                usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            registry_type = argv[++i];
-            continue;
-        }
-
-        if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "packmule: -a requires an argument\n");
-                usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            arch = argv[++i];
-            continue;
-        }
-
-        if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--repo-url") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "packmule: -u requires an argument\n");
-                usage(argv[0]);
-                return EXIT_FAILURE;
-            }
-            repo_url = argv[++i];
-            continue;
-        }
-
-        if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bundle") == 0) {
-            do_bundle = 1;
-            continue;
-        }
-
-        if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
-            dry_run = 1;
-            continue;
-        }
-
-        fprintf(stderr, "packmule: unrecognised option: %s\n", argv[i]);
+    if (optind < argc) {
+        fprintf(stderr, "packmule: unexpected argument: %s\n", argv[optind]);
         usage(argv[0]);
         return EXIT_FAILURE;
     }
