@@ -32,6 +32,20 @@ const Registry *registry_find(const char *name)
     return NULL;
 }
 
+const Registry *registry_detect(const char *path)
+{
+    /* Reduce the path to its basename: the part after the final '/'. */
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    for (int i = 0; REGISTRY_TABLE[i] != NULL; i++) {
+        const Registry *reg = REGISTRY_TABLE[i];
+        if (reg->detect && reg->detect(base))
+            return reg;
+    }
+    return NULL;
+}
+
 const char *const *registry_names(void)
 {
     /* Statically built from the same order as REGISTRY_TABLE. */

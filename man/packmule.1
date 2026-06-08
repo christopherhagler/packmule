@@ -79,8 +79,19 @@ is given.
 .TP
 .BR \-t " type" ", " \-\-type " type"
 Select the registry backend.
-Defaults to
-.BR pypi .
+When omitted, the backend is auto-detected from the manifest filename
+.RB ( requirements*.txt
+\(rA
+.BR pypi ,
+.B package.json
+\(rA
+.BR npm ,
+.B packages.txt
+\(rA
+.BR rpm ),
+falling back to
+.B pypi
+for unrecognised names.
 Run
 .B packmule \-\-help
 for the full list of available types.

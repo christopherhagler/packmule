@@ -34,6 +34,15 @@ struct Registry {
     PackageList *(*parse_manifest)(const Registry *self, const char *path);
 
     /*
+     * detect — return 1 if `basename` (the manifest filename, no directory
+     * component) looks like a manifest this backend understands, else 0.
+     *
+     * Used by registry_detect() to infer --type when the user does not pass
+     * one.  May be NULL for backends that cannot be auto-detected.
+     */
+    int (*detect)(const char *basename);
+
+    /*
      * resolve — query the upstream registry to fill in pkg->url, pkg->sha256,
      * pkg->filename, and (if previously NULL) pkg->version.
      *
@@ -87,6 +96,15 @@ struct Registry {
  * is not recognised.  The returned pointer must NOT be freed.
  */
 const Registry *registry_find(const char *name);
+
+/*
+ * registry_detect — infer a backend from a manifest file path by asking each
+ * backend's detect() hook about the path's basename.
+ *
+ * Returns a pointer to a statically-allocated Registry, or NULL if no backend
+ * recognises the filename.  The returned pointer must NOT be freed.
+ */
+const Registry *registry_detect(const char *path);
 
 /*
  * registry_names — return a NULL-terminated array of all registered names.

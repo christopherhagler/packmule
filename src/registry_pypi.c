@@ -400,11 +400,30 @@ static int pypi_get_deps(const Registry *self, const Package *pkg,
     return added;
 }
 
+/* ── Filename detection ──────────────────────────────────────────────────── */
+
+/*
+ * pypi_detect — recognise pip requirements files.
+ *
+ * Matches any ".txt" basename containing "requirement", so that the common
+ * variants are all auto-detected:
+ *   requirements.txt, requirements-dev.txt, dev-requirements.txt,
+ *   requirements.in is intentionally excluded (".in" is pip-tools input).
+ */
+static int pypi_detect(const char *basename)
+{
+    size_t len = strlen(basename);
+    if (len < 4 || strcmp(basename + len - 4, ".txt") != 0)
+        return 0;
+    return strstr(basename, "requirement") != NULL;
+}
+
 /* ── Registry instance ───────────────────────────────────────────────────── */
 
 const Registry pypi_registry = {
     .name          = "pypi",
     .manifest_name = "requirements.txt",
+    .detect        = pypi_detect,
     .parse_manifest = pypi_parse_manifest,
     .resolve       = pypi_resolve,
     .get_deps      = pypi_get_deps,

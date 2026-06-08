@@ -474,11 +474,19 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     return 0;
 }
 
+/* ── Filename detection ──────────────────────────────────────────────────── */
+
+static int rpm_detect(const char *basename)
+{
+    return strcmp(basename, "packages.txt") == 0;
+}
+
 /* ── Registry instance ───────────────────────────────────────────────────── */
 
 const Registry rpm_registry = {
     .name           = "rpm",
     .manifest_name  = "packages.txt",
+    .detect         = rpm_detect,
     .parse_manifest = rpm_parse_manifest,
     .resolve        = rpm_resolve,
     .get_deps       = NULL, /* rpm does not support transitive resolution */

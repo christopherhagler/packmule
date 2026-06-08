@@ -29,7 +29,8 @@ static void usage(const char *prog)
             "Options:\n"
             "  -r <file>                  Path to the package manifest (required)\n"
             "  -o <dir>                   Output directory for downloads (default: .)\n"
-            "  -t, --type <type>          Registry backend (default: pypi)\n"
+            "  -t, --type <type>          Registry backend (default: auto-detect\n"
+            "                             from the manifest filename, else pypi)\n"
             "  -a, --arch <arch>          Target CPU architecture (default: current machine)\n"
             "                             e.g. x86_64, aarch64, arm64; use 'any' for universal only\n"
             "  -u, --repo-url <url>       Repository base URL\n"
@@ -57,7 +58,7 @@ int main(int argc, char *argv[])
 {
     const char *requirements_file = NULL;
     const char *output_dir        = ".";
-    const char *registry_type     = "pypi";
+    const char *registry_type     = NULL; /* NULL → auto-detect from filename */
     const char *repo_url          = NULL;
     int         dry_run           = 0;
     int         do_bundle         = 0;
@@ -112,12 +113,25 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const Registry *base_reg = registry_find(registry_type);
-    if (!base_reg) {
-        fprintf(stderr, "packmule: unknown registry type '%s'\n"
-                        "Available types:\n", registry_type);
-        print_registry_list();
-        return EXIT_FAILURE;
+    /* Resolve the backend: an explicit --type wins; otherwise infer it from
+     * the manifest filename (requirements.txt → pypi, package.json → npm, …),
+     * falling back to pypi when the name is unrecognised. */
+    int auto_detected = 0;
+    const Registry *base_reg;
+    if (registry_type) {
+        base_reg = registry_find(registry_type);
+        if (!base_reg) {
+            fprintf(stderr, "packmule: unknown registry type '%s'\n"
+                            "Available types:\n", registry_type);
+            print_registry_list();
+            return EXIT_FAILURE;
+        }
+    } else {
+        base_reg = registry_detect(requirements_file);
+        if (!base_reg)
+            base_reg = registry_find("pypi"); /* sensible default */
+        else
+            auto_detected = 1;
     }
 
     /* Shallow-copy the static registry so we can inject runtime config without
@@ -144,7 +158,8 @@ int main(int argc, char *argv[])
         reg_inst.ctx  = NULL;
     }
 
-    printf("packmule: backend   : %s\n", reg->name);
+    printf("packmule: backend   : %s%s\n",
+           reg->name, auto_detected ? " (auto-detected)" : "");
     printf("packmule: arch      : %s\n",
            arch ? arch : "any (universal/source packages only)");
     printf("packmule: manifest  : %s (%zu package(s))\n",

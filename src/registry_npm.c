@@ -245,11 +245,19 @@ static int npm_get_deps(const Registry *self, const Package *pkg,
     return added;
 }
 
+/* ── Filename detection ──────────────────────────────────────────────────── */
+
+static int npm_detect(const char *basename)
+{
+    return strcmp(basename, "package.json") == 0;
+}
+
 /* ── Registry instance ───────────────────────────────────────────────────── */
 
 const Registry npm_registry = {
     .name           = "npm",
     .manifest_name  = "package.json",
+    .detect         = npm_detect,
     .parse_manifest = npm_parse_manifest,
     .resolve        = npm_resolve,
     .get_deps       = npm_get_deps,

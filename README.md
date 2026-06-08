@@ -106,7 +106,7 @@ packmule -h | --help
 |---|---|
 | `-r <file>` | Path to the package manifest (**required**) |
 | `-o <dir>` | Output directory (default: `.`); created if absent |
-| `-t <type>`, `--type` | Registry backend: `pypi` (default), `npm`, `rpm` |
+| `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` → `pypi`, `package.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
 | `-a <arch>`, `--arch` | Target CPU architecture (default: current machine). Use `any` for universal/source only |
 | `-u <url>`, `--repo-url` | Repository base URL — required for `rpm`; optional for `pypi`/`npm` (overrides public endpoint) |
 | `-b`, `--bundle` | Write `manifest.json` and `install.sh`, then compress output to `<dir>.tar.gz` |
