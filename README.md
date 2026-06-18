@@ -1,6 +1,7 @@
 # packmule
 
 [![CI](https://github.com/christopherhagler/packmule/actions/workflows/ci.yml/badge.svg)](https://github.com/christopherhagler/packmule/actions/workflows/ci.yml)
+[![RPM packaging](https://github.com/christopherhagler/packmule/actions/workflows/rpm.yml/badge.svg)](https://github.com/christopherhagler/packmule/actions/workflows/rpm.yml)
 
 An air-gapped package bundler written in C.
 
@@ -362,6 +363,20 @@ cd build
 cpack -G DEB   # → packmule_0.1.0_<arch>.deb
 cpack -G RPM   # → packmule-0.1.0-<arch>.rpm
 cpack          # all three: DEB, RPM, TGZ
+```
+
+For Fedora/EPEL, `packmule.spec` is the canonical packaging. The
+[RPM packaging workflow](.github/workflows/rpm.yml) builds the SRPM and rebuilds
+it in a clean `mock` chroot — the same mechanism Fedora's Koji uses — across
+Fedora Rawhide and EPEL 8/9/10, then runs `rpmlint`. To reproduce locally on a
+Fedora host:
+
+```bash
+version=$(rpmspec -q --qf '%{version}\n' packmule.spec | head -1)
+git archive --format=tar.gz --prefix="packmule-${version}/" \
+  -o ~/rpmbuild/SOURCES/packmule-${version}.tar.gz HEAD
+rpmbuild -bs packmule.spec
+mock --rebuild ~/rpmbuild/SRPMS/packmule-${version}-*.src.rpm
 ```
 
 ---

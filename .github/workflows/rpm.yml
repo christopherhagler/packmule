@@ -1,0 +1,118 @@
+name: RPM packaging
+
+# Builds an SRPM and rebuilds it in a clean mock chroot — the same mechanism
+# Fedora's Koji uses — across Fedora Rawhide and EPEL 8/9/10, then runs rpmlint.
+# This is the closest approximation to the Fedora package-review build checks.
+#
+# mock needs a privileged container and cannot run as root, so each job runs in
+# a Fedora container and drives mock as an unprivileged "builder" user with
+# chroot isolation (systemd-nspawn is unavailable inside GitHub's runners).
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths: &build_paths
+      - "src/**"
+      - "include/**"
+      - "scripts/**"
+      - "cmake/**"
+      - "tests/**"
+      - "man/**"
+      - "CMakeLists.txt"
+      - "packmule.spec"
+      - ".github/workflows/rpm.yml"
+  pull_request:
+    paths: *build_paths
+
+jobs:
+  mock:
+    name: mock / ${{ matrix.root }}
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+      options: --privileged
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary Fedora target — packages must build on Rawhide.
+          - root: fedora-rawhide-x86_64
+            experimental: false
+          - root: epel-10-x86_64
+            experimental: false
+          - root: epel-9-x86_64
+            experimental: false
+          # EPEL 8's base (CentOS Stream 8) is near end-of-life; allow infra
+          # flakiness without failing the whole workflow.
+          - root: epel-8-x86_64
+            experimental: true
+
+    steps:
+      - name: Install packaging tooling
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            git-core rpm-build rpmlint rpmdevtools mock mock-core-configs
+
+      - uses: actions/checkout@v4
+
+      - name: Allow git to read the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Create unprivileged builder user
+        run: |
+          useradd -m builder
+          usermod -a -G mock builder
+
+      # rpmlint is advisory: it has known false positives, so surface its output
+      # without failing the build. The mock rebuild below is the hard gate.
+      - name: rpmlint the spec
+        continue-on-error: true
+        run: rpmlint packmule.spec
+
+      - name: Build source tarball and SRPM
+        run: |
+          set -euxo pipefail
+          version=$(rpmspec -q --qf '%{version}\n' packmule.spec | head -1)
+
+          install -d -o builder -g builder \
+            /home/builder/rpmbuild/SOURCES /home/builder/rpmbuild/SPECS
+
+          # Produce a tarball matching Source0 (packmule-<version>.tar.gz with a
+          # packmule-<version>/ top-level dir), the same shape GitHub's release
+          # tarball has, straight from the committed tree.
+          git archive --format=tar.gz \
+            --prefix="packmule-${version}/" \
+            -o "/home/builder/rpmbuild/SOURCES/packmule-${version}.tar.gz" HEAD
+
+          cp packmule.spec /home/builder/rpmbuild/SPECS/
+          chown -R builder:builder /home/builder/rpmbuild
+
+          su -l builder -c "rpmbuild -bs \
+            --define '_topdir /home/builder/rpmbuild' \
+            /home/builder/rpmbuild/SPECS/packmule.spec"
+
+      - name: rpmlint the SRPM
+        continue-on-error: true
+        run: su -l builder -c "rpmlint /home/builder/rpmbuild/SRPMS/*.src.rpm"
+
+      - name: Rebuild in a clean ${{ matrix.root }} chroot (mock)
+        run: |
+          su -l builder -c "mock --root=${{ matrix.root }} --isolation=simple \
+            --resultdir=/home/builder/mock-result \
+            --rebuild /home/builder/rpmbuild/SRPMS/*.src.rpm"
+
+      - name: rpmlint the built RPMs
+        continue-on-error: true
+        run: su -l builder -c "rpmlint /home/builder/mock-result/*.rpm"
+
+      - name: Upload RPMs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.root }}
+          path: |
+            /home/builder/mock-result/*.rpm
+            /home/builder/mock-result/*.log
+          if-no-files-found: ignore
