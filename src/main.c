@@ -3,6 +3,7 @@
 #include "network.h"
 #include "package.h"
 #include "registry.h"
+#include "utils.h"
 #include "version.h"
 
 #include <errno.h>
@@ -12,12 +13,18 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 static void print_registry_list(void)
 {
     const char *const *names = registry_names();
-    for (int i = 0; names[i]; i++)
-        fprintf(stderr, "  %s%s\n", names[i], i == 0 ? "  (default)" : "");
+    for (int i = 0; names[i]; i++) {
+        const Registry *reg = registry_find(names[i]);
+        fprintf(stderr, "  %-6s (%s)%s\n",
+                names[i],
+                reg && reg->manifest_name ? reg->manifest_name : "?",
+                i == 0 ? "  [default]" : "");
+    }
 }
 
 static void usage(const char *prog)
@@ -183,6 +190,14 @@ int main(int argc, char *argv[])
     int    exit_code = EXIT_SUCCESS;
     size_t resolved   = 0;
     size_t downloaded = 0;
+    unsigned long long total_bytes = 0;
+
+    /* Colour and in-place redraws only make sense on a terminal; when stdout
+     * is a pipe or CI log we emit plain, permanent lines only. */
+    int         tty   = isatty(fileno(stdout));
+    const char *c_grn = tty ? "\033[32m" : "";
+    const char *c_red = tty ? "\033[31m" : "";
+    const char *c_rst = tty ? "\033[0m"  : "";
 
     /* Iterate with reqs->count as the upper bound so that transitive deps
      * appended inside the loop are picked up automatically. */
@@ -190,27 +205,30 @@ int main(int argc, char *argv[])
         Package *pkg    = reqs->items[i];
         int  was_pinned = (pkg->version != NULL);
 
-        /* In download mode, overwrite the same status line using \r so the
-         * terminal does not scroll.  In dry-run mode, let output flow freely
-         * since the user is reviewing the full list. */
-        if (!dry_run) {
-            printf("\r  [%zu/%-4zu] resolving %-40.40s\033[K",
-                   i + 1, reqs->count, pkg->name);
-            fflush(stdout);
-        } else {
+        /* In download mode show a transient "resolving" line (terminal only)
+         * that the download bar / result line overwrites.  In dry-run mode let
+         * output flow freely since the user is reviewing the full list. */
+        if (dry_run) {
             printf("  [%zu/%zu] %s%s%s",
                    i + 1, reqs->count,
                    pkg->name,
                    pkg->version ? "==" : "",
                    pkg->version ? pkg->version : "");
             fflush(stdout);
+        } else if (tty) {
+            printf("\r  [%zu/%zu] resolving %-.50s\033[K",
+                   i + 1, reqs->count, pkg->name);
+            fflush(stdout);
         }
 
         if (reg->resolve(reg, pkg) != 0) {
-            if (dry_run)
+            if (dry_run) {
                 printf(" -- FAILED\n");
-            else
-                fprintf(stdout, "\n");
+            } else {
+                if (tty) fputs("\r\033[K", stdout);
+                printf("  %s✗%s [%zu/%zu] %s -- could not resolve\n",
+                       c_red, c_rst, i + 1, reqs->count, pkg->name);
+            }
             fprintf(stderr, "  packmule: could not resolve %s\n", pkg->name);
             exit_code = EXIT_FAILURE;
             continue;
@@ -229,52 +247,63 @@ int main(int argc, char *argv[])
                    "         url   : %s\n"
                    "         sha256: %s\n\n",
                    pkg->filename, pkg->url, pkg->sha256);
-        } else {
-            char dest[4096];
-            int nw = snprintf(dest, sizeof(dest), "%s/%s",
-                              output_dir, pkg->filename);
-            if (nw < 0 || nw >= (int)sizeof(dest)) {
-                fprintf(stderr, "\n  packmule: destination path too long for %s\n",
-                        pkg->filename);
-                exit_code = EXIT_FAILURE;
-                ++resolved;
-                continue;
-            }
-
-            printf("\r  [%zu/%-4zu] downloading %-38.38s\033[K",
-                   i + 1, reqs->count, pkg->filename);
-            fflush(stdout);
-
-            if (download_file(pkg->url, dest) != 0) {
-                fprintf(stderr, "\n  packmule: download failed for %s\n", pkg->name);
-                exit_code = EXIT_FAILURE;
-                ++resolved;
-                continue;
-            }
-
-            if (verify_file(dest, pkg->sha256) != 0) {
-                remove(dest);
-                exit_code = EXIT_FAILURE;
-                ++resolved;
-                continue;
-            }
-
-            ++downloaded;
+            ++resolved;
+            continue;
         }
 
+        char dest[4096];
+        int nw = snprintf(dest, sizeof(dest), "%s/%s", output_dir, pkg->filename);
+        if (nw < 0 || nw >= (int)sizeof(dest)) {
+            if (tty) fputs("\r\033[K", stdout);
+            printf("  %s✗%s [%zu/%zu] %s -- destination path too long\n",
+                   c_red, c_rst, i + 1, reqs->count, pkg->filename);
+            exit_code = EXIT_FAILURE;
+            ++resolved;
+            continue;
+        }
+
+        int dl_rc = download_file(pkg->url, dest, pkg->filename, tty);
+        if (tty) fputs("\r\033[K", stdout); /* erase the transient progress bar */
+
+        if (dl_rc != 0) {
+            printf("  %s✗%s [%zu/%zu] %s -- download failed\n",
+                   c_red, c_rst, i + 1, reqs->count, pkg->name);
+            exit_code = EXIT_FAILURE;
+            ++resolved;
+            continue;
+        }
+
+        if (verify_file(dest, pkg->sha256) != 0) {
+            remove(dest);
+            printf("  %s✗%s [%zu/%zu] %s -- checksum mismatch\n",
+                   c_red, c_rst, i + 1, reqs->count, pkg->filename);
+            exit_code = EXIT_FAILURE;
+            ++resolved;
+            continue;
+        }
+
+        /* Success: leave a permanent record with the on-disk size. */
+        char        size_str[16] = "?";
+        struct stat st;
+        if (stat(dest, &st) == 0) {
+            pm_human_size((double)st.st_size, size_str, sizeof(size_str));
+            total_bytes += (unsigned long long)st.st_size;
+        }
+        printf("  %s✓%s [%zu/%zu] %s  (%s)\n",
+               c_grn, c_rst, i + 1, reqs->count, pkg->filename, size_str);
+
+        ++downloaded;
         ++resolved;
     }
 
-    /* End the in-place status line with a newline before the summary. */
-    if (!dry_run)
-        putchar('\n');
-
     if (dry_run) {
-        printf("packmule: dry run complete -- %zu/%zu package(s) resolved"
+        printf("\npackmule: dry run complete -- %zu/%zu package(s) resolved"
                ", 0 downloaded\n", resolved, reqs->count);
     } else {
-        printf("packmule: %zu/%zu package(s) downloaded to %s\n",
-               downloaded, reqs->count, output_dir);
+        char total_str[16];
+        pm_human_size((double)total_bytes, total_str, sizeof(total_str));
+        printf("\npackmule: %zu/%zu package(s) downloaded to %s (%s)\n",
+               downloaded, reqs->count, output_dir, total_str);
     }
 
     if (do_bundle && !dry_run) {

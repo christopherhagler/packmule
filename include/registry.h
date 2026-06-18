@@ -81,12 +81,6 @@ struct Registry {
      * (PyPI, npm).  Points to argv memory; must NOT be freed by the backend.
      */
     const char *repo_url;
-
-    /*
-     * destroy — release resources held by ctx.  May be NULL when ctx is NULL
-     * or points to static data.
-     */
-    void (*destroy)(Registry *self);
 };
 
 /*

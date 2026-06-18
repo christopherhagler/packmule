@@ -42,8 +42,18 @@ char *fetch_json(const char *url);
  * Does not verify the file's integrity — the caller should hash the result
  * and compare against the registry-provided digest before trusting it.
  *
+ * Progress display:
+ *   When `show_progress` is nonzero, a single-line progress bar is drawn to
+ *   stdout while the transfer runs, labelled with `label` (e.g. the target
+ *   filename).  The bar is transient: it is left on the current line without a
+ *   trailing newline, so the caller is expected to erase or overwrite it after
+ *   download_file returns.  Callers should only enable this when stdout is a
+ *   terminal.  When `show_progress` is 0, no progress output is produced and
+ *   `label` is ignored (it may be NULL).
+ *
  * Returns 0 on success, -1 on failure.
  */
-int download_file(const char *url, const char *dest_path);
+int download_file(const char *url, const char *dest_path,
+                  const char *label, int show_progress);
 
 #endif /* PACKMULE_NETWORK_H */

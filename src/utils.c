@@ -1,6 +1,7 @@
 #include "utils.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,4 +78,38 @@ char *pm_strtrim(char *s)
             *end-- = '\0';
     }
     return s;
+}
+
+char *pm_asprintf(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int len = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+
+    if (len < 0) {
+        va_end(ap2);
+        const char msg[] = "packmule: fatal: string formatting error\n";
+        fwrite(msg, 1, sizeof(msg) - 1, stderr);
+        abort();
+    }
+
+    char *out = pm_malloc((size_t)len + 1);
+    vsnprintf(out, (size_t)len + 1, fmt, ap2);
+    va_end(ap2);
+    return out;
+}
+
+void pm_human_size(double bytes, char *buf, size_t bufsz)
+{
+    static const char *const units[] = { "B", "KB", "MB", "GB", "TB" };
+    int u = 0;
+    while (bytes >= 1024.0 && u < 4) {
+        bytes /= 1024.0;
+        u++;
+    }
+    snprintf(buf, bufsz, u == 0 ? "%.0f %s" : "%.1f %s", bytes, units[u]);
 }

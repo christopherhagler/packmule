@@ -313,23 +313,9 @@ static int pypi_resolve(const Registry *self, Package *pkg)
     while (blen > 0 && base_trimmed[blen - 1] == '/')
         base_trimmed[--blen] = '\0';
 
-    int n;
-    if (pkg->version)
-        n = snprintf(NULL, 0, "%s/%s/%s/json", base_trimmed, pkg->name, pkg->version);
-    else
-        n = snprintf(NULL, 0, "%s/%s/json", base_trimmed, pkg->name);
-
-    if (n < 0) {
-        fprintf(stderr, "packmule: internal error: snprintf failed\n");
-        pm_free(base_trimmed);
-        return -1;
-    }
-
-    char *url = pm_malloc((size_t)n + 1);
-    if (pkg->version)
-        snprintf(url, (size_t)n + 1, "%s/%s/%s/json", base_trimmed, pkg->name, pkg->version);
-    else
-        snprintf(url, (size_t)n + 1, "%s/%s/json", base_trimmed, pkg->name);
+    char *url = pkg->version
+        ? pm_asprintf("%s/%s/%s/json", base_trimmed, pkg->name, pkg->version)
+        : pm_asprintf("%s/%s/json", base_trimmed, pkg->name);
     pm_free(base_trimmed);
 
     char *json = fetch_json(url);
@@ -429,5 +415,4 @@ const Registry pypi_registry = {
     .get_deps      = pypi_get_deps,
     .ctx           = NULL, /* arch string, injected by main.c */
     .repo_url      = NULL, /* optional; defaults to https://pypi.org/pypi */
-    .destroy       = NULL,
 };

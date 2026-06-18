@@ -25,15 +25,26 @@ packmule: arch      : x86_64
 packmule: manifest  : requirements.txt (3 package(s))
 packmule: output dir: ./vendor
 
-  [53/53] downloading pycparser-3.0-py3-none-any.whl
+  numpy-2.1.0-cp310-cp310-manyl  [#############-------------]  52%   16.8 MB/s
+  ✓ [ 1/53] requests-2.31.0-py3-none-any.whl  (62.7 KB)
+  ✓ [ 2/53] numpy-2.1.0-cp310-cp310-manylinux_2_17_x86_64.whl  (13.1 MB)
+  ...
+  ✓ [53/53] pycparser-2.22-py3-none-any.whl  (117.6 KB)
 
-packmule: 53/53 package(s) downloaded to ./vendor
+packmule: 53/53 package(s) downloaded to ./vendor (84.2 MB)
 ```
 
-Each package passes through a "resolving…" then "downloading…" status
-that updates in-place on a single line using `\r` — the terminal does not
-scroll during a download run. Dry-run mode (`-n`) prints all resolved
-packages in full without overwriting.
+While a file is downloading on a terminal, packmule draws a single live
+progress bar showing percent complete and transfer speed. The bar redraws
+in place on one line — it never scrolls — and is replaced by a permanent
+`✓` line recording the filename and on-disk size once the file is verified.
+Failures leave a permanent `✗` line with the reason. The closing summary
+reports how many packages were downloaded and the total size on disk.
+
+When stdout is **not** a terminal (a pipe, file, or CI log), the live bar and
+colours are suppressed automatically: only the plain permanent `✓`/`✗` lines
+are emitted, so logs stay clean. Dry-run mode (`-n`) prints all resolved
+packages in full without a progress bar.
 
 The counter grows as transitive dependencies are discovered — the total shown
 in brackets increases as each package's dependencies are queued. Each file is
@@ -163,12 +174,15 @@ can be carried to the air-gapped machine in one step:
 $ packmule -r requirements.txt -o ./vendor -a x86_64 --bundle
 packmule: backend   : pypi
 ...
-packmule: 10/10 package(s) downloaded to ./vendor
+packmule: 10/10 package(s) downloaded to ./vendor (8.4 MB)
 packmule: writing manifest.json ...
+packmule: writing requirements.txt ...
 packmule: writing install.sh ...
 packmule: creating ./vendor.tar.gz ...
 packmule: bundle ready: ./vendor.tar.gz
 ```
+
+(`writing requirements.txt ...` appears for the `pypi` backend only.)
 
 `vendor.tar.gz` extracts to a directory containing:
 
@@ -323,7 +337,7 @@ All seven test suites are fully offline — no network access required:
 
 | Suite | Coverage |
 |---|---|
-| `test_package` | Package lifecycle, PackageList grow/contains/dedup, PEP 503 name normalisation |
+| `test_package` | Package lifecycle, PackageList grow, name-based dedup, PEP 503 name normalisation |
 | `test_registry` | Registry dispatch table, name lookup, vtable integrity, `get_deps` slot |
 | `test_registry_pypi` | PyPI manifest parsing and `get_deps`: extras filtering, name extraction, dedup |
 | `test_registry_npm` | npm manifest parsing and `get_deps`: dep enqueuing and dedup |
@@ -364,17 +378,26 @@ src/
   registry_npm.c      npm backend — package.json parser, tarball resolution
   registry_rpm.c      RPM backend — packages.txt parser, repomd/primary.xml resolve
   package.c           Package and PackageList data structures
-  bundle.c            manifest.json, install.sh, and .tar.gz bundle creation
-  utils.c             Abort-on-OOM allocators (pm_malloc, pm_free, …) and pm_strtrim
+  bundle.c            manifest.json + requirements.txt + install.sh + .tar.gz;
+                      install.sh is an embedded scripts/install_<name>.sh
+  utils.c             Abort-on-OOM allocators (pm_malloc, pm_free, …) and string
+                      helpers (pm_strtrim, pm_asprintf, pm_human_size)
 include/
   network.h
   hash.h
   registry.h          Registry vtable (name, manifest_name, parse_manifest,
-                      resolve, get_deps, ctx, repo_url, destroy)
+                      resolve, get_deps, ctx, repo_url)
   package.h           Package / PackageList types
   bundle.h            BundleOptions struct and bundle_create()
   version.h           PACKMULE_VERSION constant
-  utils.h             Allocator wrappers and pm_strtrim
+  utils.h             Allocator wrappers and string helpers
+scripts/
+  install_pypi.sh     Per-backend offline install scripts (real, shellcheck-able);
+  install_npm.sh        embedded into the binary at build time as byte arrays
+  install_rpm.sh        (build/generated/bundle_scripts.h) and written verbatim
+                        into the bundle by bundle.c
+cmake/
+  embed_scripts.cmake   Build-time codegen: scripts/*.sh → bundle_scripts.h
 tests/
   test_package.c
   test_registry.c
@@ -382,6 +405,7 @@ tests/
   test_registry_npm.c
   test_registry_rpm.c
   test_hash.c
+  test_bundle.c
   fixtures/           requirements.txt, package.json, packages.txt
 man/
   packmule.1
@@ -395,22 +419,27 @@ Implement the `Registry` vtable from `include/registry.h`:
 ```c
 struct Registry {
     const char  *name;           /* identifier passed to -t */
-    const char  *manifest_name;  /* shown in --help */
+    const char  *manifest_name;  /* default manifest filename, shown in --help */
     PackageList *(*parse_manifest)(const Registry *self, const char *path);
+    int          (*detect)        (const char *basename);
     int          (*resolve)       (const Registry *self, Package *pkg);
     int          (*get_deps)      (const Registry *self, const Package *pkg,
                                    const PackageList *seen, PackageList *out);
     void        *ctx;            /* arch string, injected by main.c */
     const char  *repo_url;       /* base URL, set from -u flag by main.c */
-    void        (*destroy)        (Registry *self);
 };
 ```
 
 1. Create `src/registry_<name>.c` with a `const Registry <name>_registry` instance.
-2. Implement `parse_manifest` and `resolve`. Optionally implement `get_deps` for
-   transitive dependency resolution; set it to `NULL` if not needed.
+2. Implement `parse_manifest` and `resolve`. Optionally implement `detect` (for
+   filename auto-detection) and `get_deps` (transitive resolution); set either to
+   `NULL` if not needed.
 3. Add an `extern` declaration and pointer entry in `src/registry.c`.
-4. The new backend appears automatically in `--help` and `--type`.
+4. The new backend — and its `manifest_name` — appears automatically in `--help`
+   and `--type`; `registry_names()` is derived from the dispatch table.
+5. To support `--bundle`, add `scripts/install_<name>.sh` and a one-line entry in
+   `script_for()` (`src/bundle.c`). The script is embedded into the binary at
+   build time, so no runtime resource files are needed.
 
 ### Memory convention
 
@@ -432,4 +461,5 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 - [x] RPM backend: manifest parsing, resolve via repomd.xml/primary.xml, SHA-256 verify
 - [x] Private/corporate registry support (`-u` for all backends)
 - [x] Bundle output — `manifest.json`, `install.sh`, and `.tar.gz` (`--bundle`)
-- [x] In-place status line — resolving/downloading overwrites one line using `\r`
+- [x] Per-file download progress bar (percent + speed) with permanent ✓/✗ lines;
+      auto-suppressed to plain output when stdout is not a terminal

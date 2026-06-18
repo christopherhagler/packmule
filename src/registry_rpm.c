@@ -28,9 +28,11 @@
 
 #include <archive.h>
 #include <archive_entry.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ── Manifest parser ─────────────────────────────────────────────────────── */
 
@@ -391,9 +393,7 @@ static int rpm_resolve(const Registry *self, Package *pkg)
         repo[--rlen] = '\0';
 
     /* ── Step 1: fetch repomd.xml ─────────────────────────────────────────── */
-    int   n          = snprintf(NULL, 0, "%s/repodata/repomd.xml", repo);
-    char *repomd_url = pm_malloc((size_t)n + 1);
-    snprintf(repomd_url, (size_t)n + 1, "%s/repodata/repomd.xml", repo);
+    char *repomd_url = pm_asprintf("%s/repodata/repomd.xml", repo);
 
     char *repomd_xml = fetch_json(repomd_url);
     pm_free(repomd_url);
@@ -412,17 +412,29 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     pm_free(repomd_xml);
 
     /* ── Step 3: download primary.xml.gz to a temp file ──────────────────── */
-    char tmp_path[256];
-    snprintf(tmp_path, sizeof(tmp_path), "/tmp/packmule_primary_%d.gz",
-             (int)getpid());
+    /* Use mkstemp for an unpredictable name: a fixed path in a world-writable
+     * directory invites symlink attacks and collides between concurrent runs.
+     * The extension is irrelevant — libarchive detects gzip from content. */
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !*tmpdir)
+        tmpdir = "/tmp";
 
-    int  m           = snprintf(NULL, 0, "%s/%s", repo, primary_href);
-    char *primary_url = pm_malloc((size_t)m + 1);
-    snprintf(primary_url, (size_t)m + 1, "%s/%s", repo, primary_href);
+    char tmp_path[PATH_MAX];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/packmule_primary_XXXXXX", tmpdir);
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        fprintf(stderr, "packmule: cannot create temp file in %s\n", tmpdir);
+        pm_free(repo);
+        return -1;
+    }
+    close(tmp_fd); /* download_file reopens by path; we only needed the name */
 
-    int dl_rc = download_file(primary_url, tmp_path);
+    char *primary_url = pm_asprintf("%s/%s", repo, primary_href);
+
+    int dl_rc = download_file(primary_url, tmp_path, NULL, 0);
     pm_free(primary_url);
     if (dl_rc != 0) {
+        remove(tmp_path);
         pm_free(repo);
         return -1;
     }
@@ -465,9 +477,7 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     pkg->filename = pm_strdup(slash ? slash + 1 : href);
 
     /* Build full download URL: repo_base + "/" + location_href */
-    int   un  = snprintf(NULL, 0, "%s/%s", repo, href);
-    pkg->url  = pm_malloc((size_t)un + 1);
-    snprintf(pkg->url, (size_t)un + 1, "%s/%s", repo, href);
+    pkg->url = pm_asprintf("%s/%s", repo, href);
     pm_free(href);
     pm_free(repo);
 
@@ -492,5 +502,4 @@ const Registry rpm_registry = {
     .get_deps       = NULL, /* rpm does not support transitive resolution */
     .ctx            = NULL, /* arch string, injected by main.c */
     .repo_url       = NULL, /* set by main.c from -u flag */
-    .destroy        = NULL,
 };

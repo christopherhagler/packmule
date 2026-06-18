@@ -77,22 +77,6 @@ static void test_package_list_grow(void)
     package_list_destroy(list);
 }
 
-/* ── package_list_contains ───────────────────────────────────────────────── */
-
-static void test_package_list_contains(void)
-{
-    PackageList *list = package_list_create();
-    package_list_add(list, package_create("numpy", "1.26.0"));
-
-    assert(package_list_contains(list, "numpy",  "1.26.0") == 1);
-    assert(package_list_contains(list, "numpy",  "1.25.0") == 0);
-    assert(package_list_contains(list, "pandas", "1.26.0") == 0);
-    /* NULL version matches any version of the package. */
-    assert(package_list_contains(list, "numpy",  NULL)     == 1);
-
-    package_list_destroy(list);
-}
-
 /* ── package_list_contains_name ──────────────────────────────────────────── */
 
 static void test_contains_name_basic(void)
@@ -170,7 +154,6 @@ int main(void)
     test_package_destroy_null();
     test_package_list_basic();
     test_package_list_grow();
-    test_package_list_contains();
     test_contains_name_basic();
     test_contains_name_case_insensitive();
     test_contains_name_pep503_dash_underscore();

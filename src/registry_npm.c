@@ -126,10 +126,7 @@ static char *npm_build_url(const char *name, const char *version,
     size_t blen = strlen(base);
     int    sep  = (blen > 0 && base[blen - 1] == '/') ? 0 : 1;
 
-    int   n   = snprintf(NULL, 0, "%s%s%s/%s", base, sep ? "/" : "", name, tag);
-    char *url = pm_malloc((size_t)n + 1);
-    snprintf(url, (size_t)n + 1, "%s%s%s/%s", base, sep ? "/" : "", name, tag);
-    return url;
+    return pm_asprintf("%s%s%s/%s", base, sep ? "/" : "", name, tag);
 }
 
 /* ── JSON response decoder ───────────────────────────────────────────────── */
@@ -263,5 +260,4 @@ const Registry npm_registry = {
     .get_deps       = npm_get_deps,
     .ctx            = NULL, /* arch — npm tarballs are platform-neutral */
     .repo_url       = NULL, /* optional; defaults to https://registry.npmjs.org */
-    .destroy        = NULL,
 };

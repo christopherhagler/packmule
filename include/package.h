@@ -61,11 +61,6 @@ PackageList *package_list_create(void);
  */
 int package_list_add(PackageList *list, Package *pkg);
 
-/* Returns 1 if a package with the same name+version already exists. */
-int package_list_contains(const PackageList *list,
-                           const char *name,
-                           const char *version);
-
 /* Returns 1 if any package with the given name exists (case-insensitive). */
 int package_list_contains_name(const PackageList *list, const char *name);
 

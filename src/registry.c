@@ -48,12 +48,17 @@ const Registry *registry_detect(const char *path)
 
 const char *const *registry_names(void)
 {
-    /* Statically built from the same order as REGISTRY_TABLE. */
-    static const char * const names[] = {
-        "pypi",
-        "npm",
-        "rpm",
-        NULL
-    };
+    /* Derive the name list from REGISTRY_TABLE on first use so the two can
+     * never drift apart when a backend is added or removed. */
+    static const char *names[sizeof(REGISTRY_TABLE) / sizeof(REGISTRY_TABLE[0])];
+    static int built = 0;
+
+    if (!built) {
+        size_t i;
+        for (i = 0; REGISTRY_TABLE[i] != NULL; i++)
+            names[i] = REGISTRY_TABLE[i]->name;
+        names[i] = NULL;
+        built = 1;
+    }
     return names;
 }

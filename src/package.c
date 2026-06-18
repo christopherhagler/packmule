@@ -57,23 +57,6 @@ int package_list_add(PackageList *list, Package *pkg)
     return 0;
 }
 
-int package_list_contains(const PackageList *list,
-                           const char       *name,
-                           const char       *version)
-{
-    for (size_t i = 0; i < list->count; i++) {
-        const Package *p = list->items[i];
-        if (strcmp(p->name, name) != 0)
-            continue;
-        /* If version is NULL we match any version of this package. */
-        if (version == NULL || p->version == NULL)
-            return 1;
-        if (strcmp(p->version, version) == 0)
-            return 1;
-    }
-    return 0;
-}
-
 int package_list_contains_name(const PackageList *list, const char *name)
 {
     for (size_t i = 0; i < list->count; i++) {

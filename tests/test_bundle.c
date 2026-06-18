@@ -36,6 +36,28 @@ static int path_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
+/* Return the permission bits of `path`, or 0 on error. */
+static unsigned file_mode(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    return (unsigned)(st.st_mode & 0777);
+}
+
+/* Return 1 if the file at `path` begins with `prefix`. */
+static int file_starts_with(const char *path, const char *prefix)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+    char buf[64] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    (void)n;
+    return strncmp(buf, prefix, strlen(prefix)) == 0;
+}
+
 /* Return 1 if the file at `path` contains `needle` anywhere. */
 static int file_contains(const char *path, const char *needle)
 {
@@ -109,6 +131,8 @@ static void test_pypi_bundle(void)
     char ipath[4096];
     snprintf(ipath, sizeof(ipath), "%s/install.sh", dir);
     assert(path_exists(ipath));
+    assert(file_starts_with(ipath, "#!/bin/sh"));
+    assert(file_mode(ipath) == 0755);
     assert(file_contains(ipath, "pip install"));
     assert(file_contains(ipath, "--no-index"));
     assert(file_contains(ipath, "requirements.txt"));
@@ -159,6 +183,8 @@ static void test_npm_bundle(void)
     char ipath[4096];
     snprintf(ipath, sizeof(ipath), "%s/install.sh", dir);
     assert(path_exists(ipath));
+    assert(file_starts_with(ipath, "#!/bin/sh"));
+    assert(file_mode(ipath) == 0755);
     assert(file_contains(ipath, "npm install"));
 
     /* npm bundles do NOT write requirements.txt */
@@ -204,6 +230,8 @@ static void test_rpm_bundle(void)
     char ipath[4096];
     snprintf(ipath, sizeof(ipath), "%s/install.sh", dir);
     assert(path_exists(ipath));
+    assert(file_starts_with(ipath, "#!/bin/sh"));
+    assert(file_mode(ipath) == 0755);
     assert(file_contains(ipath, "dnf install") || file_contains(ipath, "rpm -Uvh"));
 
     char tarball[4096];

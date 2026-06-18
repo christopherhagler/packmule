@@ -1,4 +1,4 @@
-.TH PACKMULE 1 "June 2026" "packmule 0.1.0" "User Commands"
+.TH PACKMULE 1 "2026-06-18" "packmule 0.1.0" "User Commands"
 .\"
 .\" packmule.1 \(em manual page for packmule(1)
 .\"
@@ -256,6 +256,19 @@ where it is run.
 The output directory (and the bundle produced by
 .BR \-\-bundle )
 requires no registry access on the target machine.
+.PP
+When standard output is a terminal,
+.B packmule
+draws a single-line progress bar for each file as it downloads, showing the
+percentage complete and the current transfer speed.
+The bar redraws in place and is replaced by a permanent status line marking
+success (with the filename and on-disk size) or failure (with the reason).
+When standard output is not a terminal (a pipe, file, or log), the progress bar
+and colour are suppressed and only the permanent per-package status lines are
+written, so captured logs remain readable.
+The dry-run mode
+.RB ( \-n )
+prints the full resolved list without a progress bar.
 .PP
 Package name deduplication for the
 .B pypi

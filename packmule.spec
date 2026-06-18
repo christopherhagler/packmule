@@ -5,15 +5,15 @@ Summary:        Air-gapped multi-registry package bundler
 
 License:        MIT
 URL:            https://github.com/christopherhagler/packmule
-Source0:        https://github.com/christopherhagler/packmule/archive/refs/tags/v%{version}.tar.gz
+Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
-BuildRequires:  cmake >= 3.15
 BuildRequires:  gcc
+BuildRequires:  cmake
+BuildRequires:  make
 BuildRequires:  libcurl-devel
 BuildRequires:  openssl-devel
 BuildRequires:  libarchive-devel
 BuildRequires:  cjson-devel
-BuildRequires:  gzip
 
 %description
 packmule reads a package manifest, queries the appropriate registry to resolve
@@ -23,23 +23,25 @@ The result is a self-contained directory that can be transported to a
 network-isolated machine and installed without outbound internet access.
 
 Supported registries:
-  pypi  — Python packages (PyPI); full transitive resolution
-  npm   — Node.js packages (npmjs.org); full transitive resolution
-  rpm   — RPM packages from any DNF/YUM repository
+  pypi - Python packages (PyPI); full transitive resolution
+  npm  - Node.js packages (npmjs.org); full transitive resolution
+  rpm  - RPM packages from any DNF/YUM repository
 
 %prep
 %autosetup -n %{name}-%{version}
 
 %build
-%cmake -DCMAKE_BUILD_TYPE=Release
+# Let %%cmake inject the distribution's optimization/hardening flags; do not set
+# CMAKE_BUILD_TYPE.  Disable -Werror (compiler bumps would otherwise FTBFS) and
+# let RPM's brp-compress handle man-page compression.
+%cmake -DPACKMULE_WERROR=OFF -DPACKMULE_COMPRESS_MAN=OFF
 %cmake_build
 
 %install
 %cmake_install
 
 %check
-cd %{_vpath_builddir}
-ctest --output-on-failure
+%ctest
 
 %files
 %license LICENSE
@@ -48,5 +50,5 @@ ctest --output-on-failure
 %{_mandir}/man1/packmule.1*
 
 %changelog
-* Sun Jun 07 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.1.0-1
+* Wed Jun 18 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.1.0-1
 - Initial package

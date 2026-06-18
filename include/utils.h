@@ -51,4 +51,23 @@ void pm_free(void *ptr);
  */
 char *pm_strtrim(char *s);
 
+/*
+ * pm_asprintf — printf into a freshly-allocated, exactly-sized buffer.
+ *
+ * Aborts on OOM or on an encoding error (the format strings used in this
+ * project are all fixed and valid, so an error here is a programmer bug).
+ * Caller owns the result and must pm_free() it.
+ */
+char *pm_asprintf(const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
+
+/*
+ * pm_human_size — format a byte count into `buf` as a short human-readable
+ * string, e.g. "512 B", "62.7 KB", "4.2 MB".  `buf` should be >= 16 bytes.
+ */
+void pm_human_size(double bytes, char *buf, size_t bufsz);
+
 #endif /* PACKMULE_UTILS_H */
