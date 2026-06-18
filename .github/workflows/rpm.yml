@@ -36,17 +36,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # mock-core-configs dropped the bare epel-8/9 names; EPEL roots must name
+        # their RHEL-compatible base (centos-stream / rocky / alma).
         include:
           # Primary Fedora target — packages must build on Rawhide.
           - root: fedora-rawhide-x86_64
             experimental: false
           - root: epel-10-x86_64
             experimental: false
-          - root: epel-9-x86_64
+          - root: centos-stream+epel-9-x86_64
             experimental: false
-          # EPEL 8's base (CentOS Stream 8) is near end-of-life; allow infra
-          # flakiness without failing the whole workflow.
-          - root: epel-8-x86_64
+          # CentOS Stream 8 is EOL, so build EPEL 8 against Rocky Linux 8.  Kept
+          # non-blocking: RHEL 8's older toolchain is the most likely to need a
+          # spec conditional, and we don't want that to gate the workflow.
+          - root: rocky+epel-8-x86_64
             experimental: true
 
     steps:
