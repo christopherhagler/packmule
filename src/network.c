@@ -185,7 +185,9 @@ static int progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     ps->last_pct  = pct;
     ps->last_draw = elapsed;
 
-    char speed[16] = "";
+    /* Sized to hold rate (up to 15 chars) + "/s" + NUL without truncation,
+     * which GCC's -Wformat-truncation verifies at compile time. */
+    char speed[24] = "";
     if (elapsed > 0.001) {
         char rate[16];
         pm_human_size((double)dlnow / elapsed, rate, sizeof(rate));

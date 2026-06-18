@@ -70,8 +70,10 @@ int main(int argc, char *argv[])
     int         dry_run           = 0;
     int         do_bundle         = 0;
 
-    /* Detect the current machine architecture as the default target. */
-    static char detected_arch[65];
+    /* Detect the current machine architecture as the default target.
+     * Sized to hold any platform's utsname.machine (Linux 65, BSD/macOS 256)
+     * so the copy below can never truncate. */
+    static char detected_arch[256];
     {
         struct utsname uts;
         if (uname(&uts) == 0)
