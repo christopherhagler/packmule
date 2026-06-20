@@ -7,7 +7,7 @@ packmule \- resolve, download, and bundle packages for air-gapped environments
 .\"
 .SH SYNOPSIS
 .B packmule
-.B \-r
+.B \-f
 .I manifest
 .RB [ \-o
 .IR output_dir ]
@@ -52,7 +52,7 @@ The exit status reflects whether all packages were obtained successfully.
 .\"
 .SH OPTIONS
 .TP
-.BI \-r " manifest"
+.BI \-f ", " \-\-manifest " manifest"
 Path to the input manifest file.
 This option is \fBrequired\fP.
 The expected format depends on the registry backend selected with
@@ -203,7 +203,7 @@ Preview what would be downloaded without writing any files:
 .PP
 .RS 4
 .EX
-packmule \-n \-r requirements.txt
+packmule \-n \-f requirements.txt
 .EE
 .RE
 .PP
@@ -211,7 +211,7 @@ Download all transitive dependencies for a Linux x86_64 target:
 .PP
 .RS 4
 .EX
-packmule \-r requirements.txt \-o ./vendor \-a x86_64
+packmule \-f requirements.txt \-o ./vendor \-a x86_64
 .EE
 .RE
 .PP
@@ -219,7 +219,7 @@ Download and produce a self-contained transport bundle (vendor.tar.gz):
 .PP
 .RS 4
 .EX
-packmule \-r requirements.txt \-o ./vendor \-a x86_64 \-\-bundle
+packmule \-f requirements.txt \-o ./vendor \-a x86_64 \-\-bundle
 .EE
 .RE
 .PP
@@ -227,7 +227,7 @@ Download Node.js dependencies and bundle them for transport:
 .PP
 .RS 4
 .EX
-packmule \-r package.json \-o ./vendor \-t npm \-\-bundle
+packmule \-f package.json \-o ./vendor \-t npm \-\-bundle
 .EE
 .RE
 .PP
@@ -235,7 +235,7 @@ Download RPM packages from a Fedora 40 repository:
 .PP
 .RS 4
 .EX
-packmule \-r packages.txt \-o ./rpms \-t rpm \-a x86_64 \e
+packmule \-f packages.txt \-o ./rpms \-t rpm \-a x86_64 \e
     \-u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os
 .EE
 .RE
@@ -244,7 +244,7 @@ Download Python packages from a private Artifactory mirror:
 .PP
 .RS 4
 .EX
-packmule \-r requirements.txt \-o ./vendor \e
+packmule \-f requirements.txt \-o ./vendor \e
     \-u https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi
 .EE
 .RE
@@ -334,7 +334,7 @@ This preference can be overridden with
 .TP
 .I manifest
 Input file passed to
-.BR \-r .
+.BR \-f .
 The format is determined by the active backend
 .RB ( \-t ).
 .TP

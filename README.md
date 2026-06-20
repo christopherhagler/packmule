@@ -20,7 +20,7 @@ automatically; RPM requires an explicit manifest.
 ## Quick start
 
 ```
-$ packmule -r requirements.txt -o ./vendor -a x86_64
+$ packmule -f requirements.txt -o ./vendor -a x86_64
 packmule: backend   : pypi
 packmule: arch      : x86_64
 packmule: manifest  : requirements.txt (3 package(s))
@@ -109,14 +109,14 @@ cmake --build build --parallel
 ## Usage
 
 ```
-packmule -r <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]
+packmule -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]
 packmule -V | --version
 packmule -h | --help
 ```
 
 | Flag | Description |
 |---|---|
-| `-r <file>` | Path to the package manifest (**required**) |
+| `-f <file>`, `--manifest` | Path to the package manifest (**required**) |
 | `-o <dir>` | Output directory (default: `.`); created if absent |
 | `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` → `pypi`, `package.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
 | `-a <arch>`, `--arch` | Target CPU architecture (default: current machine). Use `any` for universal/source only |
@@ -132,9 +132,9 @@ packmule detects the current machine's architecture via `uname(2)` and uses it
 as the default target. Override with `-a`:
 
 ```bash
-packmule -r requirements.txt -o ./vendor -a x86_64    # Linux x86-64
-packmule -r requirements.txt -o ./vendor -a aarch64   # Linux ARM64
-packmule -r requirements.txt -o ./vendor -a any       # universal/source only
+packmule -f requirements.txt -o ./vendor -a x86_64    # Linux x86-64
+packmule -f requirements.txt -o ./vendor -a aarch64   # Linux ARM64
+packmule -f requirements.txt -o ./vendor -a any       # universal/source only
 ```
 
 `aarch64` and `arm64` are treated as equivalent (same CPU, different OS naming
@@ -149,7 +149,7 @@ convention). Package selection priority (highest first):
 Use `-n` to audit what would be fetched before committing to a download:
 
 ```
-$ packmule -n -r requirements.txt -a x86_64
+$ packmule -n -f requirements.txt -a x86_64
 packmule: backend   : pypi
 packmule: arch      : x86_64
 packmule: manifest  : requirements.txt (3 package(s))
@@ -172,7 +172,7 @@ Add `--bundle` to compress the output directory into a single `.tar.gz` that
 can be carried to the air-gapped machine in one step:
 
 ```
-$ packmule -r requirements.txt -o ./vendor -a x86_64 --bundle
+$ packmule -f requirements.txt -o ./vendor -a x86_64 --bundle
 packmule: backend   : pypi
 ...
 packmule: 10/10 package(s) downloaded to ./vendor (8.4 MB)
@@ -221,15 +221,15 @@ public endpoints:
 
 ```bash
 # Artifactory PyPI proxy
-packmule -r requirements.txt -o ./vendor \
+packmule -f requirements.txt -o ./vendor \
   -u https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi
 
 # Nexus npm proxy
-packmule -r package.json -o ./vendor -t npm \
+packmule -f package.json -o ./vendor -t npm \
   -u https://nexus.example.com/repository/npm-proxy
 
 # Any DNF/YUM-compatible RPM repository
-packmule -r packages.txt -o ./vendor -t rpm -a x86_64 \
+packmule -f packages.txt -o ./vendor -t rpm -a x86_64 \
   -u https://repo.example.com/fedora/40/x86_64/os
 ```
 
@@ -291,7 +291,7 @@ published before ~2017 that lack `dist.integrity` are refused rather than
 silently falling back to the weaker SHA-1 `dist.shasum`.
 
 ```bash
-packmule -r package.json -o ./vendor -t npm
+packmule -f package.json -o ./vendor -t npm
 ```
 
 ### rpm — RPM repositories (DNF/YUM format)
@@ -309,7 +309,7 @@ python3-devel-3.11.0
 Requires a repository base URL via `-u`:
 
 ```bash
-packmule -r packages.txt -o ./rpms -t rpm -a x86_64 \
+packmule -f packages.txt -o ./rpms -t rpm -a x86_64 \
   -u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os
 ```
 

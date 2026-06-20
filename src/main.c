@@ -31,10 +31,10 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "packmule " PACKMULE_VERSION " -- air-gapped package bundler\n"
-            "\nUsage: %s -r <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]\n"
+            "\nUsage: %s -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]\n"
             "\n"
             "Options:\n"
-            "  -r <file>                  Path to the package manifest (required)\n"
+            "  -f, --manifest <file>      Path to the package manifest (required)\n"
             "  -o <dir>                   Output directory for downloads (default: .)\n"
             "  -t, --type <type>          Registry backend (default: auto-detect\n"
             "                             from the manifest filename, else pypi)\n"
@@ -52,18 +52,18 @@ static void usage(const char *prog)
     print_registry_list();
     fprintf(stderr,
             "\nExamples:\n"
-            "  %s -r requirements.txt -o ./vendor\n"
-            "  %s -r requirements.txt -o ./vendor -a x86_64\n"
-            "  %s -r requirements.txt -n\n"
-            "  %s -r package.json     -o ./vendor -t npm\n"
-            "  %s -r packages.txt     -o ./vendor -t rpm -a x86_64 \\\n"
+            "  %s -f requirements.txt -o ./vendor\n"
+            "  %s -f requirements.txt -o ./vendor -a x86_64\n"
+            "  %s -f requirements.txt -n\n"
+            "  %s -f package.json     -o ./vendor -t npm\n"
+            "  %s -f packages.txt     -o ./vendor -t rpm -a x86_64 \\\n"
             "      -u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os\n",
             prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[])
 {
-    const char *requirements_file = NULL;
+    const char *manifest_file     = NULL;
     const char *output_dir        = ".";
     const char *registry_type     = NULL; /* NULL → auto-detect from filename */
     const char *repo_url          = NULL;
@@ -83,6 +83,7 @@ int main(int argc, char *argv[])
 
     static const struct option LONG_OPTS[] = {
         { "help",     no_argument,       NULL, 'h' },
+        { "manifest", required_argument, NULL, 'f' },
         { "version",  no_argument,       NULL, 'V' },
         { "type",     required_argument, NULL, 't' },
         { "arch",     required_argument, NULL, 'a' },
@@ -93,11 +94,11 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hVr:o:t:a:u:bn", LONG_OPTS, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hVf:o:t:a:u:bn", LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'h': usage(argv[0]); return EXIT_SUCCESS;
         case 'V': puts("packmule " PACKMULE_VERSION); return EXIT_SUCCESS;
-        case 'r': requirements_file = optarg; break;
+        case 'f': manifest_file     = optarg; break;
         case 'o': output_dir        = optarg; break;
         case 't': registry_type     = optarg; break;
         case 'a': arch              = optarg; break;
@@ -116,8 +117,8 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (!requirements_file) {
-        fprintf(stderr, "packmule: -r <manifest> is required\n");
+    if (!manifest_file) {
+        fprintf(stderr, "packmule: -f <manifest> is required\n");
         usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -136,7 +137,7 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
     } else {
-        base_reg = registry_detect(requirements_file);
+        base_reg = registry_detect(manifest_file);
         if (!base_reg)
             base_reg = registry_find("pypi"); /* sensible default */
         else
@@ -155,7 +156,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    PackageList *reqs = reg->parse_manifest(reg, requirements_file);
+    PackageList *reqs = reg->parse_manifest(reg, manifest_file);
     if (!reqs) {
         network_cleanup();
         return EXIT_FAILURE;
@@ -172,7 +173,7 @@ int main(int argc, char *argv[])
     printf("packmule: arch      : %s\n",
            arch ? arch : "any (universal/source packages only)");
     printf("packmule: manifest  : %s (%zu package(s))\n",
-           requirements_file, reqs->count);
+           manifest_file, reqs->count);
     if (dry_run)
         printf("packmule: mode      : DRY RUN -- resolve only, no files written\n");
     else
