@@ -39,6 +39,28 @@ target_compile_options(packmule_warnings INTERFACE
 )
 
 # ── System dependencies ───────────────────────────────────────────────────────
+#
+# On macOS, several of our dependencies (libarchive, openssl, curl) are
+# "keg-only" in Homebrew: installed but not symlinked into the default prefix,
+# so find_package() can't see them out of the box.  Prepend their keg prefixes
+# to CMAKE_PREFIX_PATH so a bare `cmake -S . -B build` configures cleanly.
+# Anything the user passes on the command line still takes precedence.
+if(APPLE)
+    find_program(BREW_EXECUTABLE brew)
+    if(BREW_EXECUTABLE)
+        foreach(_pkg libarchive openssl curl)
+            execute_process(
+                COMMAND "${BREW_EXECUTABLE}" --prefix ${_pkg}
+                OUTPUT_VARIABLE _brew_prefix
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(_brew_prefix AND IS_DIRECTORY "${_brew_prefix}")
+                list(APPEND CMAKE_PREFIX_PATH "${_brew_prefix}")
+            endif()
+        endforeach()
+    endif()
+endif()
+
 find_package(CURL       REQUIRED)   # → CURL::libcurl
 find_package(OpenSSL    REQUIRED)   # → OpenSSL::Crypto
 find_package(LibArchive REQUIRED)   # → LibArchive::LibArchive
