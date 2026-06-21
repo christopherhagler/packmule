@@ -193,6 +193,7 @@ int main(int argc, char *argv[])
     int    exit_code = EXIT_SUCCESS;
     size_t resolved   = 0;
     size_t downloaded = 0;
+    size_t cached     = 0;
     unsigned long long total_bytes = 0;
 
     /* Colour and in-place redraws only make sense on a terminal; when stdout
@@ -265,6 +266,24 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        /* Verified cache: if the file is already on disk and matches the
+         * expected hash, skip the download — re-runs become resumable and
+         * idempotent.  A missing, truncated, or stale file (hash mismatch, or
+         * no hash to check against) falls through to a fresh download that
+         * overwrites it. */
+        struct stat cst;
+        if (stat(dest, &cst) == 0 && file_matches_hash(dest, pkg->sha256)) {
+            char size_str[16] = "?";
+            pm_human_size((double)cst.st_size, size_str, sizeof(size_str));
+            total_bytes += (unsigned long long)cst.st_size;
+            if (tty) fputs("\r\033[K", stdout); /* erase the transient line */
+            printf("  %s✓%s [%zu/%zu] %s  (%s, cached)\n",
+                   c_grn, c_rst, i + 1, reqs->count, pkg->filename, size_str);
+            ++cached;
+            ++resolved;
+            continue;
+        }
+
         int dl_rc = download_file(pkg->url, dest, pkg->filename, tty);
         if (tty) fputs("\r\033[K", stdout); /* erase the transient progress bar */
 
@@ -305,8 +324,11 @@ int main(int argc, char *argv[])
     } else {
         char total_str[16];
         pm_human_size((double)total_bytes, total_str, sizeof(total_str));
-        printf("\npackmule: %zu/%zu package(s) downloaded to %s (%s)\n",
-               downloaded, reqs->count, output_dir, total_str);
+        printf("\npackmule: %zu/%zu package(s) ready in %s (%s)",
+               downloaded + cached, reqs->count, output_dir, total_str);
+        if (cached)
+            printf(" -- %zu downloaded, %zu cached", downloaded, cached);
+        putchar('\n');
     }
 
     if (do_bundle && !dry_run) {

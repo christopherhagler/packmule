@@ -67,7 +67,13 @@ int sha256_file(const char *path, char out_hex[65])
     return 0;
 }
 
-int verify_file(const char *path, const char *expected)
+/*
+ * Shared core for verify_file / file_matches_hash.  Detects the algorithm from
+ * the format of `expected` and compares.  When `quiet` is non-zero, mismatches
+ * are reported only via the return value (no stderr) — used by the download
+ * cache probe, where a mismatch is an expected, benign "re-download" signal.
+ */
+static int verify_file_impl(const char *path, const char *expected, int quiet)
 {
     if (strncmp(expected, "sha512-", 7) == 0) {
         /*
@@ -87,11 +93,12 @@ int verify_file(const char *path, const char *expected)
         b64[b64_len] = '\0';
 
         if (strcmp((char *)b64, b64_expected) != 0) {
-            fprintf(stderr,
-                    "packmule: SHA-512 integrity mismatch for '%s'\n"
-                    "         expected: sha512-%s\n"
-                    "         got:      sha512-%s\n",
-                    path, b64_expected, (char *)b64);
+            if (!quiet)
+                fprintf(stderr,
+                        "packmule: SHA-512 integrity mismatch for '%s'\n"
+                        "         expected: sha512-%s\n"
+                        "         got:      sha512-%s\n",
+                        path, b64_expected, (char *)b64);
             return -1;
         }
         return 0;
@@ -102,12 +109,27 @@ int verify_file(const char *path, const char *expected)
     if (sha256_file(path, computed) != 0)
         return -1;
     if (strcmp(computed, expected) != 0) {
-        fprintf(stderr,
-                "packmule: SHA-256 mismatch for '%s'\n"
-                "         expected: %s\n"
-                "         got:      %s\n",
-                path, expected, computed);
+        if (!quiet)
+            fprintf(stderr,
+                    "packmule: SHA-256 mismatch for '%s'\n"
+                    "         expected: %s\n"
+                    "         got:      %s\n",
+                    path, expected, computed);
         return -1;
     }
     return 0;
+}
+
+int verify_file(const char *path, const char *expected)
+{
+    return verify_file_impl(path, expected, 0);
+}
+
+int file_matches_hash(const char *path, const char *expected)
+{
+    /* Never claim a match we can't actually check: an absent expected hash
+     * means the file must be (re)downloaded, not trusted on filename alone. */
+    if (!expected || !*expected)
+        return 0;
+    return verify_file_impl(path, expected, 1) == 0;
 }

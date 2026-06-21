@@ -27,4 +27,14 @@ int sha256_file(const char *path, char out_hex[65]);
  */
 int verify_file(const char *path, const char *expected);
 
+/*
+ * file_matches_hash — quiet predicate form of verify_file for cache probes.
+ *
+ * Returns 1 only if the file at `path` exists, is readable, and matches
+ * `expected` (same algorithm detection as verify_file).  Returns 0 on any
+ * mismatch, I/O error, or when `expected` is NULL/empty — and never logs to
+ * stderr, since a miss here just means "download it".
+ */
+int file_matches_hash(const char *path, const char *expected);
+
 #endif /* PACKMULE_HASH_H */
