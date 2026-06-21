@@ -57,7 +57,7 @@ int package_list_add(PackageList *list, Package *pkg)
     return 0;
 }
 
-int package_list_contains_name(const PackageList *list, const char *name)
+Package *package_list_find_name(const PackageList *list, const char *name)
 {
     for (size_t i = 0; i < list->count; i++) {
         const char *a = list->items[i]->name;
@@ -72,10 +72,15 @@ int package_list_contains_name(const PackageList *list, const char *name)
                 goto next;
         }
         if (*a == '\0' && *b == '\0')
-            return 1;
+            return list->items[i];
 next:;
     }
-    return 0;
+    return NULL;
+}
+
+int package_list_contains_name(const PackageList *list, const char *name)
+{
+    return package_list_find_name(list, name) != NULL;
 }
 
 void package_list_destroy(PackageList *list)

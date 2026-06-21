@@ -81,6 +81,26 @@ struct Registry {
      * (PyPI, npm).  Points to argv memory; must NOT be freed by the backend.
      */
     const char *repo_url;
+
+    /*
+     * py_minor — target CPython 3.x minor version for wheel selection (e.g. 12
+     * for Python 3.12).  Set by main.c from --python or auto-detected from the
+     * local python3.  0 means "no Python target": fall back to arch-only
+     * matching.  Only the pypi backend reads this; wheels are interpreter- and
+     * ABI-specific, so a wheel built for a different CPython minor will not
+     * install on the target.
+     */
+    int py_minor;
+
+    /*
+     * target_os — operating-system family for wheel selection: "linux",
+     * "macos", or "windows".  Set by main.c from --os or auto-detected from the
+     * host (uname).  NULL means "no OS preference" (arch-only matching).  Only
+     * the pypi backend reads it; a wheel's platform tag (manylinux/macosx/win)
+     * must match the install target's OS or pip will refuse it.  Points to
+     * static/argv memory; must NOT be freed by the backend.
+     */
+    const char *target_os;
 };
 
 /*

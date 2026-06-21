@@ -64,6 +64,13 @@ int package_list_add(PackageList *list, Package *pkg);
 /* Returns 1 if any package with the given name exists (case-insensitive). */
 int package_list_contains_name(const PackageList *list, const char *name);
 
+/*
+ * Returns the first package whose name matches `name` (case-insensitive, with
+ * PEP 503 '-'/'_'/'.' equivalence), or NULL if none.  The returned pointer is
+ * owned by the list; do not free it.
+ */
+Package *package_list_find_name(const PackageList *list, const char *name);
+
 /* Free all packages in `list` and the list itself.  Safe with NULL. */
 void package_list_destroy(PackageList *list);
 

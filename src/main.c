@@ -6,12 +6,14 @@
 #include "utils.h"
 #include "version.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -63,11 +65,61 @@ static const char *bundle_clobbers_manifest(const char *manifest_file,
     return strcmp(rmdir, rodir) == 0 ? match : NULL;
 }
 
+/*
+ * parse_python_minor — parse a --python value into a CPython 3.x minor number.
+ * Accepts "3.12", "3.12.2", "312", or "cp312"; returns the minor (e.g. 12) or
+ * -1 if the value is not a CPython 3.x spec we can target.
+ */
+static int parse_python_minor(const char *s)
+{
+    if (!s) return -1;
+    if (strncmp(s, "cp", 2) == 0) s += 2;   /* "cp312" → "312" */
+
+    if (s[0] != '3') return -1;
+    s++;
+    if (*s == '.') s++;                      /* "3.12" → "12"; "312" → "12" */
+    if (!isdigit((unsigned char)*s)) return -1;
+    return atoi(s);
+}
+
+/*
+ * detect_python_minor — ask the local python3 for its minor version so wheel
+ * selection defaults to the interpreter on this machine.  Returns the minor
+ * (e.g. 12) or 0 if no usable python3 is found.
+ */
+static int detect_python_minor(void)
+{
+    FILE *fp = popen("python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null", "r");
+    if (!fp) return 0;
+    char buf[16] = {0};
+    char *got = fgets(buf, sizeof(buf), fp);
+    pclose(fp);
+    if (!got) return 0;
+    int minor = atoi(buf);
+    return minor > 0 ? minor : 0;
+}
+
+/*
+ * normalize_os — map a user-supplied --os value (or a uname sysname) to the
+ * canonical family wheel selection uses: "linux", "macos", or "windows".
+ * Returns NULL for anything unrecognised.
+ */
+static const char *normalize_os(const char *s)
+{
+    if (!s) return NULL;
+    if (strcasecmp(s, "linux")   == 0)                                return "linux";
+    if (strcasecmp(s, "macos")   == 0 || strcasecmp(s, "mac")    == 0 ||
+        strcasecmp(s, "darwin")  == 0 || strcasecmp(s, "osx")    == 0) return "macos";
+    if (strcasecmp(s, "windows") == 0 || strcasecmp(s, "win")    == 0 ||
+        strcasecmp(s, "win32")   == 0)                                return "windows";
+    return NULL;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
             "packmule " PACKMULE_VERSION " -- air-gapped package bundler\n"
-            "\nUsage: %s -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]\n"
+            "\nUsage: %s -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-s <os>] [-p <ver>] [-u <url>] [-b] [-n]\n"
             "\n"
             "Options:\n"
             "  -f, --manifest <file>      Path to the package manifest (required)\n"
@@ -76,6 +128,10 @@ static void usage(const char *prog)
             "                             from the manifest filename, else pypi)\n"
             "  -a, --arch <arch>          Target CPU architecture (default: current machine)\n"
             "                             e.g. x86_64, aarch64, arm64; use 'any' for universal only\n"
+            "  -s, --os <os>              Target OS for wheels (pypi only): linux, macos,\n"
+            "                             windows, or any (default: the host OS)\n"
+            "  -p, --python <ver>         Target CPython version for wheels (pypi only)\n"
+            "                             e.g. 3.12 (default: the local python3)\n"
             "  -u, --repo-url <url>       Repository base URL\n"
             "                             Required for rpm; optional override for pypi/npm\n"
             "  -b, --bundle               Write manifest.json + install.sh, then create <dir>.tar.gz\n"
@@ -110,12 +166,19 @@ int main(int argc, char *argv[])
      * Sized to hold any platform's utsname.machine (Linux 65, BSD/macOS 256)
      * so the copy below can never truncate. */
     static char detected_arch[256];
+    const char *target_os = NULL;   /* host OS family, overridable by --os */
     {
         struct utsname uts;
-        if (uname(&uts) == 0)
+        if (uname(&uts) == 0) {
             snprintf(detected_arch, sizeof(detected_arch), "%s", uts.machine);
+            target_os = normalize_os(uts.sysname);
+        }
     }
     char *arch = detected_arch[0] ? detected_arch : NULL;
+
+    /* Target CPython minor for wheel selection: -1 means "not set yet"; it is
+     * resolved below to --python (if given) or the local python3. */
+    int py_minor = -1;
 
     static const struct option LONG_OPTS[] = {
         { "help",     no_argument,       NULL, 'h' },
@@ -123,6 +186,8 @@ int main(int argc, char *argv[])
         { "version",  no_argument,       NULL, 'V' },
         { "type",     required_argument, NULL, 't' },
         { "arch",     required_argument, NULL, 'a' },
+        { "os",       required_argument, NULL, 's' },
+        { "python",   required_argument, NULL, 'p' },
         { "repo-url", required_argument, NULL, 'u' },
         { "bundle",   no_argument,       NULL, 'b' },
         { "dry-run",  no_argument,       NULL, 'n' },
@@ -130,7 +195,7 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hVf:o:t:a:u:bn", LONG_OPTS, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hVf:o:t:a:s:p:u:bn", LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'h': usage(argv[0]); return EXIT_SUCCESS;
         case 'V': puts("packmule " PACKMULE_VERSION); return EXIT_SUCCESS;
@@ -141,11 +206,38 @@ int main(int argc, char *argv[])
         case 'u': repo_url          = optarg; break;
         case 'b': do_bundle         = 1;      break;
         case 'n': dry_run           = 1;      break;
+        case 's':
+            if (strcasecmp(optarg, "any") == 0) {
+                target_os = NULL;
+            } else {
+                target_os = normalize_os(optarg);
+                if (!target_os) {
+                    fprintf(stderr,
+                            "packmule: invalid --os value '%s'"
+                            " (expected linux, macos, windows, or any)\n", optarg);
+                    return EXIT_FAILURE;
+                }
+            }
+            break;
+        case 'p':
+            py_minor = parse_python_minor(optarg);
+            if (py_minor < 0) {
+                fprintf(stderr,
+                        "packmule: invalid --python value '%s'"
+                        " (expected a CPython 3.x version, e.g. 3.12)\n", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
         default:
             usage(argv[0]);
             return EXIT_FAILURE;
         }
     }
+
+    /* No explicit --python: default to the local python3 so wheels match the
+     * interpreter on this machine.  0 (none found) disables Python filtering. */
+    if (py_minor < 0)
+        py_minor = detect_python_minor();
 
     if (optind < argc) {
         fprintf(stderr, "packmule: unexpected argument: %s\n", argv[optind]);
@@ -185,6 +277,8 @@ int main(int argc, char *argv[])
     Registry       reg_inst  = *base_reg;
     reg_inst.ctx             = (void *)arch;
     reg_inst.repo_url        = repo_url;
+    reg_inst.py_minor        = py_minor;
+    reg_inst.target_os       = target_os;
     const Registry *reg      = &reg_inst;
 
     if (network_init() != 0) {
@@ -208,6 +302,14 @@ int main(int argc, char *argv[])
            reg->name, auto_detected ? " (auto-detected)" : "");
     printf("packmule: arch      : %s\n",
            arch ? arch : "any (universal/source packages only)");
+    if (strcmp(reg->name, "pypi") == 0) {
+        printf("packmule: os        : %s\n", target_os ? target_os : "any");
+        if (py_minor > 0)
+            printf("packmule: python    : 3.%d\n", py_minor);
+        else
+            printf("packmule: python    : any (no python3 found; "
+                   "arch-only wheel matching)\n");
+    }
     printf("packmule: manifest  : %s (%zu package(s))\n",
            manifest_file, reqs->count);
     if (dry_run)
