@@ -173,26 +173,76 @@ static int write_install_script(const BundleOptions *opts)
 
 /* ── Tarball ──────────────────────────────────────────────────────────────── */
 
-static int create_tarball(const char *src_dir, const char *archive_path)
+/*
+ * append_file — add one on-disk file to the open archive `a` under the
+ * archive-relative name `arcname`, preserving its mode/size/mtime via
+ * libarchive's disk reader.  `disk` is a reusable archive_read_disk handle.
+ */
+static int append_file(struct archive *a, struct archive *disk,
+                       const char *disk_path, const char *arcname)
 {
-    char real_src[PATH_MAX];
-    if (!realpath(src_dir, real_src)) {
-        fprintf(stderr, "packmule: cannot resolve '%s': %s\n",
-                src_dir, strerror(errno));
+    struct archive_entry *entry = archive_entry_new();
+    archive_entry_copy_sourcepath(entry, disk_path);
+
+    /* Populate mode/size/mtime/etc. from the file on disk. */
+    if (archive_read_disk_entry_from_file(disk, entry, -1, NULL) != ARCHIVE_OK) {
+        fprintf(stderr, "packmule: cannot stat '%s': %s\n",
+                disk_path, archive_error_string(disk));
+        archive_entry_free(entry);
         return -1;
     }
 
-    /*
-     * Compute how many leading characters to strip from each entry's pathname
-     * so the archive contains paths relative to the parent directory, e.g.
-     * "vendor/file.whl" rather than "/home/user/vendor/file.whl".
-     */
-    size_t strip = 0;
-    for (size_t i = 0; real_src[i]; i++) {
-        if (real_src[i] == '/')
-            strip = i + 1;
+    /* Store it under the bundle-relative name, not the on-disk path. */
+    archive_entry_set_pathname(entry, arcname);
+
+    int ret = 0;
+    if (archive_write_header(a, entry) != ARCHIVE_OK) {
+        fprintf(stderr, "packmule: write header error for '%s': %s\n",
+                arcname, archive_error_string(a));
+        ret = -1;
+        goto done;
     }
 
+    if (archive_entry_filetype(entry) == AE_IFREG &&
+        archive_entry_size(entry) > 0) {
+        int fd = open(disk_path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "packmule: cannot open '%s': %s\n",
+                    disk_path, strerror(errno));
+            ret = -1;
+            goto done;
+        }
+        char    buf[65536];
+        ssize_t n;
+        while ((n = read(fd, buf, sizeof(buf))) > 0) {
+            if (archive_write_data(a, buf, (size_t)n) < 0) {
+                fprintf(stderr, "packmule: write data error: %s\n",
+                        archive_error_string(a));
+                ret = -1;
+                break;
+            }
+        }
+        close(fd);
+    }
+
+done:
+    archive_entry_free(entry);
+    return ret;
+}
+
+/*
+ * create_tarball — write `archive_path` containing exactly the files packmule
+ * produced: the package files present on disk plus the generated manifest,
+ * install script, and (pypi) requirements.txt.  Every entry is stored under a
+ * top-level `prefix/` directory so extraction yields one clean folder.
+ *
+ * Archiving an explicit file list — rather than walking output_dir — keeps
+ * unrelated files out of the bundle and makes `-o .` safe: the archive lists
+ * only the files we wrote, so it can never try to add itself.
+ */
+static int create_tarball(const BundleOptions *opts,
+                          const char *archive_path, const char *prefix)
+{
     struct archive *a = archive_write_new();
     archive_write_add_filter_gzip(a);
     archive_write_set_format_pax_restricted(a);
@@ -209,71 +259,28 @@ static int create_tarball(const char *src_dir, const char *archive_path)
 
     int ret = 0;
 
-    if (archive_read_disk_open(disk, real_src) != ARCHIVE_OK) {
-        fprintf(stderr, "packmule: cannot traverse '%s': %s\n",
-                real_src, archive_error_string(disk));
-        ret = -1;
-        goto cleanup;
+    /* Metadata files first, then the package payloads. requirements.txt is
+     * pypi-only, so it is skipped here when absent. */
+    static const char *meta[] = { "manifest.json", "install.sh", "requirements.txt" };
+    for (size_t i = 0; i < sizeof(meta) / sizeof(meta[0]) && ret == 0; i++) {
+        if (!file_exists(opts->output_dir, meta[i]))
+            continue;
+        char disk_path[4096], arcname[4096];
+        snprintf(disk_path, sizeof(disk_path), "%s/%s", opts->output_dir, meta[i]);
+        snprintf(arcname,   sizeof(arcname),   "%s/%s", prefix, meta[i]);
+        ret = append_file(a, disk, disk_path, arcname);
     }
 
-    struct archive_entry *entry = archive_entry_new();
-
-    for (;;) {
-        int r = archive_read_next_header2(disk, entry);
-        if (r == ARCHIVE_EOF)
-            break;
-        if (r != ARCHIVE_OK) {
-            fprintf(stderr, "packmule: traverse error: %s\n",
-                    archive_error_string(disk));
-            ret = -1;
-            break;
-        }
-
-        if (archive_entry_filetype(entry) == AE_IFDIR)
-            archive_read_disk_descend(disk);
-
-        /* Strip the parent prefix so archive paths are relative. */
-        const char *orig = archive_entry_pathname(entry);
-        if (strlen(orig) >= strip)
-            archive_entry_set_pathname(entry, orig + strip);
-
-        if (archive_write_header(a, entry) != ARCHIVE_OK) {
-            fprintf(stderr, "packmule: write header error for '%s': %s\n",
-                    orig, archive_error_string(a));
-            ret = -1;
-            break;
-        }
-
-        /* Copy data for regular files only. */
-        if (archive_entry_filetype(entry) == AE_IFREG) {
-            const char *srcpath = archive_entry_sourcepath(entry);
-            int fd = open(srcpath, O_RDONLY);
-            if (fd < 0) {
-                fprintf(stderr, "packmule: cannot open '%s': %s\n",
-                        srcpath, strerror(errno));
-                ret = -1;
-                break;
-            }
-            char    buf[65536];
-            ssize_t n;
-            while ((n = read(fd, buf, sizeof(buf))) > 0) {
-                if (archive_write_data(a, buf, (size_t)n) < 0) {
-                    fprintf(stderr, "packmule: write data error: %s\n",
-                            archive_error_string(a));
-                    ret = -1;
-                    break;
-                }
-            }
-            close(fd);
-            if (ret != 0)
-                break;
-        }
+    for (size_t i = 0; i < opts->packages->count && ret == 0; i++) {
+        const Package *p = opts->packages->items[i];
+        if (!p->filename || !file_exists(opts->output_dir, p->filename))
+            continue;
+        char disk_path[4096], arcname[4096];
+        snprintf(disk_path, sizeof(disk_path), "%s/%s", opts->output_dir, p->filename);
+        snprintf(arcname,   sizeof(arcname),   "%s/%s", prefix, p->filename);
+        ret = append_file(a, disk, disk_path, arcname);
     }
 
-    archive_entry_free(entry);
-
-cleanup:
-    archive_read_close(disk);
     archive_read_free(disk);
     archive_write_close(a);
     archive_write_free(a);
@@ -321,8 +328,19 @@ int bundle_create(const BundleOptions *opts)
         memcpy(archive_path + dlen, ".tar.gz", 8);
     }
 
+    /* Top-level directory the archive entries live under, e.g.
+     * "out/manifest.json".  Derived from the resolved output directory's
+     * basename so an `-o .` bundle is named after the working directory. */
+    char        realdir[PATH_MAX];
+    const char *prefix = "bundle";
+    if (realpath(opts->output_dir, realdir)) {
+        const char *slash = strrchr(realdir, '/');
+        if (slash && slash[1])
+            prefix = slash + 1;
+    }
+
     printf("packmule: creating %s ...\n", archive_path);
-    int ret = create_tarball(opts->output_dir, archive_path);
+    int ret = create_tarball(opts, archive_path, prefix);
     if (ret == 0)
         printf("packmule: bundle ready: %s\n\n", archive_path);
 

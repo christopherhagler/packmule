@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <getopt.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,41 @@ static void print_registry_list(void)
                 reg && reg->manifest_name ? reg->manifest_name : "?",
                 i == 0 ? "  [default]" : "");
     }
+}
+
+/*
+ * bundle_clobbers_manifest — guard against a destructive `-o .` (or any output
+ * dir that is the manifest's own directory): bundling writes manifest.json,
+ * install.sh, and requirements.txt into the output dir, which would silently
+ * overwrite the user's input manifest if it shares one of those names and
+ * lives there.  Returns the colliding generated name, or NULL if safe.
+ */
+static const char *bundle_clobbers_manifest(const char *manifest_file,
+                                            const char *output_dir)
+{
+    static const char *generated[] = { "manifest.json", "install.sh",
+                                        "requirements.txt" };
+
+    const char *slash = strrchr(manifest_file, '/');
+    const char *mbase = slash ? slash + 1 : manifest_file;
+
+    const char *match = NULL;
+    for (size_t i = 0; i < sizeof(generated) / sizeof(generated[0]); i++)
+        if (strcmp(mbase, generated[i]) == 0) { match = generated[i]; break; }
+    if (!match)
+        return NULL;
+
+    /* Names collide — do they also land in the same directory? */
+    char mdir[PATH_MAX];
+    snprintf(mdir, sizeof(mdir), "%s", manifest_file);
+    char *ms = strrchr(mdir, '/');
+    if (ms) *ms = '\0';
+    else    snprintf(mdir, sizeof(mdir), ".");
+
+    char rmdir[PATH_MAX], rodir[PATH_MAX];
+    if (!realpath(mdir, rmdir) || !realpath(output_dir, rodir))
+        return NULL;               /* can't resolve → don't block */
+    return strcmp(rmdir, rodir) == 0 ? match : NULL;
 }
 
 static void usage(const char *prog)
@@ -187,6 +223,22 @@ int main(int argc, char *argv[])
             package_list_destroy(reqs);
             network_cleanup();
             return EXIT_FAILURE;
+        }
+
+        /* Refuse a bundle that would overwrite the input manifest before we
+         * spend time downloading anything. */
+        if (do_bundle) {
+            const char *clobber = bundle_clobbers_manifest(manifest_file, output_dir);
+            if (clobber) {
+                fprintf(stderr,
+                        "packmule: --bundle would overwrite your input manifest '%s'\n"
+                        "          (the bundle writes '%s' into the output directory).\n"
+                        "          Use a dedicated output directory, e.g. -o bundle\n",
+                        manifest_file, clobber);
+                package_list_destroy(reqs);
+                network_cleanup();
+                return EXIT_FAILURE;
+            }
         }
     }
 
