@@ -103,7 +103,7 @@ static int wheel_python_matches(const char *fn, int py_minor)
     if (py_minor <= 0)
         return 1;
 
-    char want[8];
+    char want[16];
     snprintf(want, sizeof(want), "cp3%d", py_minor); /* e.g. "cp312" */
     if (tag_at(fn, want))
         return 1;
