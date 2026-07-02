@@ -3,8 +3,10 @@
  *
  * parse_manifest tests: no network calls required.
  * get_deps tests: exercise extras filtering, name parsing, and dedup logic.
+ * pypi_parse_response tests: wheel selection against inline JSON.
  */
 #include "registry.h"
+#include "registry_internal.h"
 #include "package.h"
 
 #include <assert.h>
@@ -338,6 +340,88 @@ static void test_get_deps_null_dep_specs(void)
     package_list_destroy(out);
 }
 
+/* ── pypi_parse_response: wheel selection ────────────────────────────────── */
+
+/* Minimal PyPI JSON with a musllinux wheel, a manylinux wheel, and an sdist. */
+static const char *PYPI_JSON_ALL =
+    "{"
+    "  \"info\": { \"version\": \"1.0.0\" },"
+    "  \"urls\": ["
+    "    { \"filename\": \"demo-1.0.0-cp312-cp312-musllinux_1_2_x86_64.whl\","
+    "      \"url\": \"https://files.pythonhosted.org/musl.whl\","
+    "      \"digests\": { \"sha256\": \"musl111\" } },"
+    "    { \"filename\": \"demo-1.0.0-cp312-cp312-manylinux_2_17_x86_64.whl\","
+    "      \"url\": \"https://files.pythonhosted.org/many.whl\","
+    "      \"digests\": { \"sha256\": \"many222\" } },"
+    "    { \"filename\": \"demo-1.0.0.tar.gz\","
+    "      \"url\": \"https://files.pythonhosted.org/demo.tar.gz\","
+    "      \"digests\": { \"sha256\": \"sdist333\" } }"
+    "  ]"
+    "}";
+
+static void test_parse_response_prefers_manylinux(void)
+{
+    Package *pkg = package_create("demo", "1.0.0");
+    int rc = pypi_parse_response(PYPI_JSON_ALL, pkg, "x86_64", "linux", 12);
+
+    assert(rc == 0);
+    assert(strcmp(pkg->filename,
+                  "demo-1.0.0-cp312-cp312-manylinux_2_17_x86_64.whl") == 0);
+    assert(strcmp(pkg->sha256, "many222") == 0);
+
+    package_destroy(pkg);
+}
+
+static void test_parse_response_rejects_musllinux(void)
+{
+    /* Only the musllinux wheel and the sdist: a glibc linux target must fall
+     * back to the sdist — pip on glibc refuses musllinux wheels. */
+    const char *json =
+        "{"
+        "  \"info\": { \"version\": \"1.0.0\" },"
+        "  \"urls\": ["
+        "    { \"filename\": \"demo-1.0.0-cp312-cp312-musllinux_1_2_x86_64.whl\","
+        "      \"url\": \"https://files.pythonhosted.org/musl.whl\","
+        "      \"digests\": { \"sha256\": \"musl111\" } },"
+        "    { \"filename\": \"demo-1.0.0.tar.gz\","
+        "      \"url\": \"https://files.pythonhosted.org/demo.tar.gz\","
+        "      \"digests\": { \"sha256\": \"sdist333\" } }"
+        "  ]"
+        "}";
+
+    Package *pkg = package_create("demo", "1.0.0");
+    int rc = pypi_parse_response(json, pkg, "x86_64", "linux", 12);
+
+    assert(rc == 0);
+    assert(strcmp(pkg->filename, "demo-1.0.0.tar.gz") == 0);
+    assert(strcmp(pkg->sha256,   "sdist333")          == 0);
+
+    package_destroy(pkg);
+}
+
+static void test_parse_response_sanitizes_filename(void)
+{
+    /* A registry-supplied filename with path components must be reduced to
+     * its basename so it cannot escape the output directory. */
+    const char *json =
+        "{"
+        "  \"info\": { \"version\": \"1.0.0\" },"
+        "  \"urls\": ["
+        "    { \"filename\": \"a/../../evil-1.0.0-py3-none-any.whl\","
+        "      \"url\": \"https://files.pythonhosted.org/evil.whl\","
+        "      \"digests\": { \"sha256\": \"evil444\" } }"
+        "  ]"
+        "}";
+
+    Package *pkg = package_create("evil", "1.0.0");
+    int rc = pypi_parse_response(json, pkg, "x86_64", "linux", 12);
+
+    assert(rc == 0);
+    assert(strcmp(pkg->filename, "evil-1.0.0-py3-none-any.whl") == 0);
+
+    package_destroy(pkg);
+}
+
 int main(void)
 {
     test_basic_parse();
@@ -353,5 +437,8 @@ int main(void)
     test_get_deps_name_parsing();
     test_get_deps_dedup();
     test_get_deps_null_dep_specs();
+    test_parse_response_prefers_manylinux();
+    test_parse_response_rejects_musllinux();
+    test_parse_response_sanitizes_filename();
     return 0;
 }

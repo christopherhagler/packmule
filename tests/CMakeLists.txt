@@ -13,6 +13,10 @@ add_executable(test_registry test_registry.c)
 target_link_libraries(test_registry PRIVATE packmule_core)
 add_test(NAME test_registry COMMAND test_registry)
 
+add_executable(test_semver test_semver.c)
+target_link_libraries(test_semver PRIVATE packmule_core)
+add_test(NAME test_semver COMMAND test_semver)
+
 add_executable(test_registry_pypi test_registry_pypi.c)
 target_link_libraries(test_registry_pypi PRIVATE packmule_core)
 add_test(NAME test_registry_pypi COMMAND test_registry_pypi

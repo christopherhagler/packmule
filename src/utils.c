@@ -1,10 +1,12 @@
 #include "utils.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* ── Internal helpers ─────────────────────────────────────────────────────── */
 
@@ -112,4 +114,36 @@ void pm_human_size(double bytes, char *buf, size_t bufsz)
         u++;
     }
     snprintf(buf, bufsz, u == 0 ? "%.0f %s" : "%.1f %s", bytes, units[u]);
+}
+
+const char *pm_basename(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+int pm_mkdir_p(const char *path, unsigned int mode)
+{
+    if (path[0] == '\0')
+        return 0;
+
+    char buf[4096];
+    int  n = snprintf(buf, sizeof(buf), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    /* Create each intermediate component, then the full path. */
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        if (mkdir(buf, (mode_t)mode) != 0 && errno != EEXIST)
+            return -1;
+        *p = '/';
+    }
+    if (mkdir(buf, (mode_t)mode) != 0 && errno != EEXIST)
+        return -1;
+    return 0;
 }

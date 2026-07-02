@@ -319,7 +319,7 @@ int main(int argc, char *argv[])
     putchar('\n');
 
     if (!dry_run) {
-        if (mkdir(output_dir, 0755) != 0 && errno != EEXIST) {
+        if (pm_mkdir_p(output_dir, 0755) != 0) {
             fprintf(stderr, "packmule: cannot create output directory '%s': %s\n",
                     output_dir, strerror(errno));
             package_list_destroy(reqs);
@@ -410,7 +410,10 @@ int main(int argc, char *argv[])
         }
 
         char dest[4096];
-        int nw = snprintf(dest, sizeof(dest), "%s/%s", output_dir, pkg->filename);
+        /* Defense in depth: the backends already basename their filenames,
+         * but never trust a registry-supplied name with path components. */
+        int nw = snprintf(dest, sizeof(dest), "%s/%s",
+                          output_dir, pm_basename(pkg->filename));
         if (nw < 0 || nw >= (int)sizeof(dest)) {
             if (tty) fputs("\r\033[K", stdout);
             printf("  %s✗%s [%zu/%zu] %s -- destination path too long\n",

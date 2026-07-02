@@ -1,4 +1,5 @@
 #include "registry.h"
+#include "registry_internal.h"
 #include "network.h"
 #include "package.h"
 #include "utils.h"
@@ -61,8 +62,12 @@ static int platform_matches(const char *platform, const char *os,
         } else if (strcmp(os, "windows") == 0) {
             if (!strstr(platform, "win"))          return 0;
         } else if (strcmp(os, "linux") == 0) {
-            /* manylinux / musllinux / plain linux all contain "linux". */
+            /* manylinux / plain linux only.  musllinux wheels are built
+             * against musl libc (Alpine) and pip on a glibc system refuses
+             * them, so accepting one here would bundle an uninstallable
+             * wheel.  A future --libc flag could opt Alpine targets in. */
             if (!strstr(platform, "linux"))        return 0;
+            if (strstr(platform, "musllinux"))     return 0;
         }
     }
     return arch_matches_platform(platform, arch);
@@ -456,8 +461,8 @@ static int is_sdist(const char *fn)
  * Also sets pkg->version from info.version when it was previously NULL
  * (i.e., the package was requested unpinned).
  */
-static int pypi_parse_response(const char *json, Package *pkg, const char *arch,
-                               const char *target_os, int py_minor)
+int pypi_parse_response(const char *json, Package *pkg, const char *arch,
+                        const char *target_os, int py_minor)
 {
     cJSON *root = cJSON_Parse(json);
     if (!root) {
@@ -568,7 +573,9 @@ static int pypi_parse_response(const char *json, Package *pkg, const char *arch,
     pm_free(pkg->filename);
     pkg->url      = pm_strdup(url_item->valuestring);
     pkg->sha256   = pm_strdup(sha256_item->valuestring);
-    pkg->filename = pm_strdup(chosen_filename);
+    /* The filename came off the wire: keep only its basename so a hostile or
+     * broken index serving "a/../../etc/x.whl" cannot escape the output dir. */
+    pkg->filename = pm_strdup(pm_basename(chosen_filename));
     ret = 0;
 
 done:
@@ -687,12 +694,30 @@ static int pypi_get_deps(const Registry *self, const Package *pkg,
             continue;
         char name[256];
         parse_dep_name(*rd, name, sizeof(name));
-        if (name[0] && !package_list_contains_name(seen, name)) {
+        if (!name[0])
+            continue;
+
+        Package *existing = package_list_find_name(seen, name);
+        if (existing) {
+            /* Already queued/resolved.  Surface a real conflict (two
+             * different exact pins) instead of silently keeping the first. */
             char *version = parse_dep_version(*rd);
-            package_list_add(out, package_create(name, version));
+            if (version && existing->version &&
+                strcmp(version, existing->version) != 0) {
+                fprintf(stderr,
+                        "packmule: %s requires %s==%s but %s is already "
+                        "selected; keeping %s\n",
+                        pkg->name, name, version, existing->version,
+                        existing->version);
+            }
             pm_free(version);
-            added++;
+            continue;
         }
+
+        char *version = parse_dep_version(*rd);
+        package_list_add(out, package_create(name, version));
+        pm_free(version);
+        added++;
     }
     return added;
 }

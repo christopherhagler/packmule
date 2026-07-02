@@ -22,12 +22,14 @@
  */
 
 #include "registry.h"
+#include "registry_internal.h"
 #include "network.h"
 #include "package.h"
 #include "utils.h"
 
 #include <archive.h>
 #include <archive_entry.h>
+#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,9 +42,15 @@
  * rpm_parse_manifest — read a simple line-by-line RPM package list.
  *
  * Format per line:
- *   <name>            — name only; version resolved from the repo
- *   <name>-<version>  — exact version (last '-' separates name from version)
+ *   <name>            — name only; latest version resolved from the repo
+ *   <name>-<version>  — exact version pin
  *   # comment         — ignored
+ *
+ * The version split happens at the last '-' ONLY when the character after it
+ * is a digit: RPM package names routinely contain hyphens (python3-pip,
+ * vim-enhanced) while RPM versions always start with a digit, so a blind
+ * last-'-' split would silently turn "python3-pip" into name="python3",
+ * version="pip" and download the wrong package.
  */
 static PackageList *rpm_parse_manifest(const Registry *self, const char *path)
 {
@@ -63,11 +71,11 @@ static PackageList *rpm_parse_manifest(const Registry *self, const char *path)
         if (trimmed[0] == '\0' || trimmed[0] == '#')
             continue;
 
-        /* Split on the last '-' to separate name from version. */
         char    *last_dash = strrchr(trimmed, '-');
         Package *pkg;
 
-        if (last_dash && last_dash != trimmed) {
+        if (last_dash && last_dash != trimmed &&
+            isdigit((unsigned char)last_dash[1])) {
             *last_dash = '\0';
             pkg = package_create(trimmed, last_dash + 1);
         } else {
@@ -191,6 +199,7 @@ static char *decompress_to_string(const char *path)
     archive_read_support_filter_gzip(a);
     archive_read_support_filter_bzip2(a);
     archive_read_support_filter_xz(a);
+    archive_read_support_filter_zstd(a);  /* modern createrepo_c default */
     archive_read_support_format_raw(a);
 
     if (archive_read_open_filename(a, path, 65536) != ARCHIVE_OK) {
@@ -238,21 +247,216 @@ static char *decompress_to_string(const char *path)
     return buf;
 }
 
+/* ── RPM version comparison ──────────────────────────────────────────────── */
+
+/*
+ * rpm_vercmp — compare two RPM version/release strings with the standard
+ * rpmvercmp algorithm: split into alternating numeric and alphabetic
+ * segments, compare numeric segments as numbers ("1.10" > "1.9"), compare
+ * alphabetic segments lexically, and rank a numeric segment above an
+ * alphabetic one.  A '~' segment (pre-release) sorts before everything,
+ * including the empty string ("1.0~rc1" < "1.0").
+ *
+ * Returns <0, 0, >0 for a < b, a == b, a > b.
+ */
+int rpm_vercmp(const char *a, const char *b)
+{
+    if (strcmp(a, b) == 0)
+        return 0;
+
+    const char *p1 = a, *p2 = b;
+    while (*p1 || *p2) {
+        /* Skip separators (anything that is not alnum or '~'). */
+        while (*p1 && !isalnum((unsigned char)*p1) && *p1 != '~') p1++;
+        while (*p2 && !isalnum((unsigned char)*p2) && *p2 != '~') p2++;
+
+        /* Tilde sorts before everything, even end-of-string. */
+        if (*p1 == '~' || *p2 == '~') {
+            if (*p1 != '~') return 1;
+            if (*p2 != '~') return -1;
+            p1++; p2++;
+            continue;
+        }
+        if (!*p1 || !*p2)
+            break;
+
+        /* Grab one segment of the same character class from each string. */
+        const char *s1 = p1, *s2 = p2;
+        int numeric = isdigit((unsigned char)*s1);
+        if (numeric) {
+            while (isdigit((unsigned char)*p1)) p1++;
+            while (isdigit((unsigned char)*p2)) p2++;
+        } else {
+            while (isalpha((unsigned char)*p1)) p1++;
+            while (isalpha((unsigned char)*p2)) p2++;
+        }
+
+        /* Segment class mismatch: the numeric side is newer. */
+        if (s2 == p2)
+            return numeric ? 1 : -1;
+
+        if (numeric) {
+            /* Compare as numbers: strip leading zeros, longer run wins. */
+            while (*s1 == '0') s1++;
+            while (*s2 == '0') s2++;
+            size_t l1 = (size_t)(p1 - s1), l2 = (size_t)(p2 - s2);
+            if (l1 != l2)
+                return l1 > l2 ? 1 : -1;
+        }
+
+        size_t l1 = (size_t)(p1 - s1), l2 = (size_t)(p2 - s2);
+        int rc = strncmp(s1, s2, l1 < l2 ? l1 : l2);
+        if (rc != 0)
+            return rc > 0 ? 1 : -1;
+        if (l1 != l2)
+            return l1 > l2 ? 1 : -1;
+    }
+
+    /* One string ran out of segments: the longer one is newer. */
+    if (!*p1 && !*p2)
+        return 0;
+    return *p1 ? 1 : -1;
+}
+
 /* ── primary.xml package scanner ─────────────────────────────────────────── */
+
+/* One parsed <package> candidate from primary.xml. */
+typedef struct {
+    char *href;
+    char *sha256;
+    char *ver;      /* <version ver=…>  */
+    char *rel;      /* <version rel=…>  */
+    int   epoch;
+} RpmCandidate;
+
+static void candidate_free(RpmCandidate *c)
+{
+    pm_free(c->href);
+    pm_free(c->sha256);
+    pm_free(c->ver);
+    pm_free(c->rel);
+    memset(c, 0, sizeof(*c));
+}
+
+/*
+ * candidate_matches_pin — does this candidate satisfy the manifest's exact
+ * version pin?  Accepted pin forms, most to least specific:
+ *   "epoch:ver-rel"   "epoch:ver"   "ver-rel"   "ver"
+ */
+static int candidate_matches_pin(const RpmCandidate *c, const char *pin)
+{
+    char *forms[4];
+    int   n = 0;
+    forms[n++] = pm_asprintf("%s", c->ver);
+    if (c->rel)
+        forms[n++] = pm_asprintf("%s-%s", c->ver, c->rel);
+    forms[n++] = pm_asprintf("%d:%s", c->epoch, c->ver);
+    if (c->rel)
+        forms[n++] = pm_asprintf("%d:%s-%s", c->epoch, c->ver, c->rel);
+
+    int match = 0;
+    for (int i = 0; i < n; i++) {
+        if (!match && strcmp(forms[i], pin) == 0)
+            match = 1;
+        pm_free(forms[i]);
+    }
+    return match;
+}
+
+/* candidate_cmp — order two candidates by (epoch, version, release). */
+static int candidate_cmp(const RpmCandidate *x, const RpmCandidate *y)
+{
+    if (x->epoch != y->epoch)
+        return x->epoch > y->epoch ? 1 : -1;
+    int rc = rpm_vercmp(x->ver, y->ver);
+    if (rc != 0)
+        return rc;
+    /* A missing rel compares as the lowest. */
+    if (!x->rel || !y->rel)
+        return (x->rel ? 1 : 0) - (y->rel ? 1 : 0);
+    return rpm_vercmp(x->rel, y->rel);
+}
+
+/*
+ * parse_package_block — extract href/sha256/epoch/ver/rel from one
+ * <package>…</package> block.  Returns 0 on success (caller owns the strings
+ * in `out`), -1 when a required field is missing.
+ */
+static int parse_package_block(const char *p, const char *pkg_end,
+                               RpmCandidate *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    const char *loc = strstr_bound(p, pkg_end, "<location ");
+    if (!loc)
+        return -1;
+    out->href = xml_attr(loc + 10, "href");
+    if (!out->href)
+        return -1;
+
+    /* Checksum: want the element with type="sha256":
+     *   <checksum type="sha256" pkgid="YES">abc123…</checksum> */
+    const char *cs_search = p;
+    while ((cs_search = strstr_bound(cs_search, pkg_end, "<checksum ")) != NULL) {
+        const char *cs_tag_end = strchr(cs_search + 10, '>');
+        if (!cs_tag_end || cs_tag_end >= pkg_end) {
+            cs_search++;
+            continue;
+        }
+        char *cs_type = xml_attr(cs_search + 10, "type");
+        int   is_sha  = cs_type && strcmp(cs_type, "sha256") == 0;
+        pm_free(cs_type);
+        if (is_sha) {
+            const char *cs_val = cs_tag_end + 1;
+            const char *cs_end = strstr(cs_val, "</checksum>");
+            if (cs_end && cs_end < pkg_end)
+                out->sha256 = pm_strndup(cs_val, (size_t)(cs_end - cs_val));
+            break;
+        }
+        cs_search++;
+    }
+    if (!out->sha256) {
+        candidate_free(out);
+        return -1;
+    }
+
+    /* Version: <version epoch="0" ver="X" rel="Y"/>. */
+    const char *ver_tag = strstr_bound(p, pkg_end, "<version ");
+    if (ver_tag) {
+        out->ver = xml_attr(ver_tag + 9, "ver");
+        out->rel = xml_attr(ver_tag + 9, "rel");
+        char *epoch_s = xml_attr(ver_tag + 9, "epoch");
+        out->epoch = epoch_s ? atoi(epoch_s) : 0;
+        pm_free(epoch_s);
+    }
+    if (!out->ver) {
+        candidate_free(out);
+        return -1;
+    }
+    return 0;
+}
 
 /*
  * find_rpm_package — scan primary.xml for a package matching `name` and
  * (optionally) `arch`.  Also accepts "noarch" packages regardless of `arch`.
  *
+ * When `version` is non-NULL only a candidate whose EVR matches the pin (see
+ * candidate_matches_pin) is accepted; when NULL, the HIGHEST epoch:ver-rel
+ * among all matches is selected (repositories routinely carry several
+ * versions of a package — first-match would return an arbitrary one).
+ *
  * On success, allocates *out_href, *out_sha256, *out_version and returns 0.
- * The caller must pm_free() all three.  Returns -1 if not found.
+ * The caller must pm_free() all three.
+ * Returns RPM_FIND_NOT_FOUND when no package has that name/arch, and
+ * RPM_FIND_VERSION_MISMATCH when the name exists but not at `version`.
  */
-static int find_rpm_package(const char *primary_xml,
-                             const char *name,
-                             const char *arch,
-                             char **out_href,
-                             char **out_sha256,
-                             char **out_version)
+int find_rpm_package(const char *primary_xml,
+                     const char *name,
+                     const char *version,
+                     const char *arch,
+                     char **out_href,
+                     char **out_sha256,
+                     char **out_version)
 {
     /* Build search strings once. */
     char name_tag[256];
@@ -262,22 +466,23 @@ static int find_rpm_package(const char *primary_xml,
     if (arch)
         snprintf(arch_tag, sizeof(arch_tag), "<arch>%s</arch>", arch);
 
-    const char *p = primary_xml;
+    RpmCandidate best      = {0};
+    int          have_best = 0;
+    int          name_seen = 0;
 
+    const char *p = primary_xml;
     while ((p = strstr(p, "<package ")) != NULL) {
         const char *pkg_end = strstr(p, "</package>");
         if (!pkg_end)
             break;
 
-        /* Fast reject: does this block contain our package name? */
+        /* Fast reject: does this block contain our package name?  The full
+         * <name>…</name> tag text is matched, so <name>libbash</name> never
+         * matches a search for "bash". */
         if (!strstr_bound(p, pkg_end, name_tag)) {
             p = pkg_end + 10;
             continue;
         }
-
-        /* Verify that <name> is the package name element, not a substring
-         * inside another tag (e.g. <name>libbash</name> vs <name>bash</name>).
-         * The strstr_bound above already guarantees the full tag text matches. */
 
         /* Arch filter: accept target arch or noarch. */
         if (arch) {
@@ -289,85 +494,133 @@ static int find_rpm_package(const char *primary_xml,
             }
         }
 
-        /* Extract location href. */
-        const char *loc = strstr_bound(p, pkg_end, "<location ");
-        if (!loc) {
+        RpmCandidate cand;
+        if (parse_package_block(p, pkg_end, &cand) != 0) {
             p = pkg_end + 10;
             continue;
         }
-        char *href = xml_attr(loc + 10, "href");
-        if (!href) {
-            p = pkg_end + 10;
-            continue;
-        }
+        name_seen = 1;
 
-        /* Extract SHA-256 checksum.
-         * The checksum element looks like:
-         *   <checksum type="sha256" pkgid="YES">abc123...</checksum>
-         * We want the one with type="sha256". */
-        char       *sha256    = NULL;
-        const char *cs_search = p;
-        while ((cs_search = strstr_bound(cs_search, pkg_end, "<checksum ")) != NULL) {
-            const char *cs_tag_end = strchr(cs_search + 10, '>');
-            if (!cs_tag_end || cs_tag_end >= pkg_end) {
-                cs_search++;
-                continue;
-            }
-            char *cs_type = xml_attr(cs_search + 10, "type");
-            int   is_sha  = cs_type && strcmp(cs_type, "sha256") == 0;
-            pm_free(cs_type);
-            if (is_sha) {
-                const char *cs_val = cs_tag_end + 1;
-                const char *cs_end = strstr(cs_val, "</checksum>");
-                if (cs_end && cs_end < pkg_end)
-                    sha256 = pm_strndup(cs_val, (size_t)(cs_end - cs_val));
+        if (version) {
+            /* Pinned: first exact EVR match wins. */
+            if (candidate_matches_pin(&cand, version)) {
+                if (have_best)
+                    candidate_free(&best);
+                best      = cand;
+                have_best = 1;
                 break;
             }
-            cs_search++;
-        }
-
-        if (!sha256) {
-            fprintf(stderr,
-                    "packmule: no SHA-256 checksum found for %s in primary.xml\n",
-                    name);
-            pm_free(href);
-            p = pkg_end + 10;
-            continue;
-        }
-
-        /* Extract version string from <version epoch="0" ver="X" rel="Y"/>. */
-        char *version = NULL;
-        const char *ver_tag = strstr_bound(p, pkg_end, "<version ");
-        if (ver_tag) {
-            char *ver  = xml_attr(ver_tag + 9, "ver");
-            char *rel  = xml_attr(ver_tag + 9, "rel");
-            char *epoch_s = xml_attr(ver_tag + 9, "epoch");
-            int   epoch = epoch_s ? atoi(epoch_s) : 0;
-            pm_free(epoch_s);
-
-            if (ver && rel) {
-                int n;
-                if (epoch > 0)
-                    n = snprintf(NULL, 0, "%d:%s-%s", epoch, ver, rel);
-                else
-                    n = snprintf(NULL, 0, "%s-%s", ver, rel);
-                version = pm_malloc((size_t)n + 1);
-                if (epoch > 0)
-                    snprintf(version, (size_t)n + 1, "%d:%s-%s", epoch, ver, rel);
-                else
-                    snprintf(version, (size_t)n + 1, "%s-%s", ver, rel);
+            candidate_free(&cand);
+        } else {
+            /* Unpinned: keep the highest epoch:ver-rel seen so far. */
+            if (!have_best || candidate_cmp(&cand, &best) > 0) {
+                if (have_best)
+                    candidate_free(&best);
+                best      = cand;
+                have_best = 1;
+            } else {
+                candidate_free(&cand);
             }
-            pm_free(ver);
-            pm_free(rel);
         }
 
-        *out_href    = href;
-        *out_sha256  = sha256;
-        *out_version = version;
-        return 0;
+        p = pkg_end + 10;
     }
 
-    return -1;
+    if (!have_best)
+        return name_seen ? RPM_FIND_VERSION_MISMATCH : RPM_FIND_NOT_FOUND;
+
+    /* Render the canonical version string: [epoch:]ver[-rel]. */
+    char *ver_str;
+    if (best.epoch > 0)
+        ver_str = best.rel
+                ? pm_asprintf("%d:%s-%s", best.epoch, best.ver, best.rel)
+                : pm_asprintf("%d:%s",    best.epoch, best.ver);
+    else
+        ver_str = best.rel
+                ? pm_asprintf("%s-%s", best.ver, best.rel)
+                : pm_asprintf("%s",    best.ver);
+
+    *out_href    = best.href;
+    *out_sha256  = best.sha256;
+    *out_version = ver_str;
+    pm_free(best.ver);
+    pm_free(best.rel);
+    return 0;
+}
+
+/* ── Primary database cache ──────────────────────────────────────────────── */
+
+/*
+ * fetch_primary_xml — return the decompressed primary.xml for `repo` (already
+ * trailing-slash-stripped), fetching repomd.xml + primary.xml.gz on first use
+ * and caching the result for the rest of the run.  primary.xml is the same
+ * multi-MB blob for every package in the manifest; without this cache it
+ * would be downloaded and decompressed once PER PACKAGE.
+ *
+ * The returned pointer is owned by the cache — the caller must NOT free it.
+ * Returns NULL on error.  Single-threaded CLI: freed at process exit.
+ */
+static char *fetch_primary_xml(const char *repo)
+{
+    static char *cached_repo = NULL;
+    static char *cached_xml  = NULL;
+
+    if (cached_repo && strcmp(cached_repo, repo) == 0)
+        return cached_xml;
+
+    /* ── Step 1: fetch repomd.xml ─────────────────────────────────────────── */
+    char *repomd_url = pm_asprintf("%s/repodata/repomd.xml", repo);
+
+    char *repomd_xml = fetch_json(repomd_url);
+    pm_free(repomd_url);
+    if (!repomd_xml)
+        return NULL;
+
+    /* ── Step 2: locate primary database path ─────────────────────────────── */
+    char primary_href[1024];
+    if (find_primary_href(repomd_xml, primary_href, sizeof(primary_href)) != 0) {
+        pm_free(repomd_xml);
+        return NULL;
+    }
+    pm_free(repomd_xml);
+
+    /* ── Step 3: download primary.xml.gz to a temp file ──────────────────── */
+    /* Use mkstemp for an unpredictable name: a fixed path in a world-writable
+     * directory invites symlink attacks and collides between concurrent runs.
+     * The extension is irrelevant — libarchive detects gzip from content. */
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !*tmpdir)
+        tmpdir = "/tmp";
+
+    char tmp_path[PATH_MAX];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/packmule_primary_XXXXXX", tmpdir);
+    int tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        fprintf(stderr, "packmule: cannot create temp file in %s\n", tmpdir);
+        return NULL;
+    }
+    close(tmp_fd); /* download_file reopens by path; we only needed the name */
+
+    char *primary_url = pm_asprintf("%s/%s", repo, primary_href);
+
+    int dl_rc = download_file(primary_url, tmp_path, NULL, 0);
+    pm_free(primary_url);
+    if (dl_rc != 0) {
+        remove(tmp_path);
+        return NULL;
+    }
+
+    /* ── Step 4: decompress and cache ─────────────────────────────────────── */
+    char *primary_xml = decompress_to_string(tmp_path);
+    remove(tmp_path);
+    if (!primary_xml)
+        return NULL;
+
+    pm_free(cached_repo);
+    pm_free(cached_xml);
+    cached_repo = pm_strdup(repo);
+    cached_xml  = primary_xml;
+    return cached_xml;
 }
 
 /* ── Resolver ────────────────────────────────────────────────────────────── */
@@ -392,78 +645,35 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     while (rlen > 0 && repo[rlen - 1] == '/')
         repo[--rlen] = '\0';
 
-    /* ── Step 1: fetch repomd.xml ─────────────────────────────────────────── */
-    char *repomd_url = pm_asprintf("%s/repodata/repomd.xml", repo);
-
-    char *repomd_xml = fetch_json(repomd_url);
-    pm_free(repomd_url);
-    if (!repomd_xml) {
-        pm_free(repo);
-        return -1;
-    }
-
-    /* ── Step 2: locate primary database path ─────────────────────────────── */
-    char primary_href[1024];
-    if (find_primary_href(repomd_xml, primary_href, sizeof(primary_href)) != 0) {
-        pm_free(repomd_xml);
-        pm_free(repo);
-        return -1;
-    }
-    pm_free(repomd_xml);
-
-    /* ── Step 3: download primary.xml.gz to a temp file ──────────────────── */
-    /* Use mkstemp for an unpredictable name: a fixed path in a world-writable
-     * directory invites symlink attacks and collides between concurrent runs.
-     * The extension is irrelevant — libarchive detects gzip from content. */
-    const char *tmpdir = getenv("TMPDIR");
-    if (!tmpdir || !*tmpdir)
-        tmpdir = "/tmp";
-
-    char tmp_path[PATH_MAX];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/packmule_primary_XXXXXX", tmpdir);
-    int tmp_fd = mkstemp(tmp_path);
-    if (tmp_fd < 0) {
-        fprintf(stderr, "packmule: cannot create temp file in %s\n", tmpdir);
-        pm_free(repo);
-        return -1;
-    }
-    close(tmp_fd); /* download_file reopens by path; we only needed the name */
-
-    char *primary_url = pm_asprintf("%s/%s", repo, primary_href);
-
-    int dl_rc = download_file(primary_url, tmp_path, NULL, 0);
-    pm_free(primary_url);
-    if (dl_rc != 0) {
-        remove(tmp_path);
-        pm_free(repo);
-        return -1;
-    }
-
-    /* ── Step 4: decompress ───────────────────────────────────────────────── */
-    char *primary_xml = decompress_to_string(tmp_path);
-    remove(tmp_path);
+    /* Fetch (or reuse) the repository's primary database.  Cache-owned. */
+    const char *primary_xml = fetch_primary_xml(repo);
     if (!primary_xml) {
         pm_free(repo);
         return -1;
     }
 
-    /* ── Step 5: find the package in primary.xml ──────────────────────────── */
+    /* Find the package in primary.xml. */
     char *href    = NULL;
     char *sha256  = NULL;
     char *version = NULL;
 
-    if (find_rpm_package(primary_xml, pkg->name, arch,
-                         &href, &sha256, &version) != 0) {
-        fprintf(stderr,
-                "packmule: package '%s' not found in repository (arch: %s)\n",
-                pkg->name, arch ? arch : "any");
-        pm_free(primary_xml);
+    int frc = find_rpm_package(primary_xml, pkg->name, pkg->version, arch,
+                               &href, &sha256, &version);
+    if (frc != 0) {
+        if (frc == RPM_FIND_VERSION_MISMATCH)
+            fprintf(stderr,
+                    "packmule: package '%s' exists in the repository but not "
+                    "at version '%s' (arch: %s)\n",
+                    pkg->name, pkg->version, arch ? arch : "any");
+        else
+            fprintf(stderr,
+                    "packmule: package '%s' not found in repository (arch: %s)\n",
+                    pkg->name, arch ? arch : "any");
         pm_free(repo);
         return -1;
     }
-    pm_free(primary_xml);
 
-    /* ── Step 6: populate pkg fields ─────────────────────────────────────── */
+    /* Populate pkg fields. */
     pm_free(pkg->version);
     pm_free(pkg->url);
     pm_free(pkg->sha256);

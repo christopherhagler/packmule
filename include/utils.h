@@ -70,4 +70,21 @@ char *pm_asprintf(const char *fmt, ...)
  */
 void pm_human_size(double bytes, char *buf, size_t bufsz);
 
+/*
+ * pm_basename — pointer to the last path component of `path` (the text after
+ * the final '/'), or `path` itself when it contains no '/'.
+ *
+ * Returns a pointer INTO `path` (no allocation); the caller must not free it.
+ * Used to sanitise registry-supplied filenames so a malicious "a/../../b"
+ * can never escape the output directory.
+ */
+const char *pm_basename(const char *path);
+
+/*
+ * pm_mkdir_p — create `path` and any missing parent directories with `mode`
+ * (like `mkdir -p`).  Existing directories are not an error.
+ * Returns 0 on success, -1 on failure with errno set.
+ */
+int pm_mkdir_p(const char *path, unsigned int mode);
+
 #endif /* PACKMULE_UTILS_H */
