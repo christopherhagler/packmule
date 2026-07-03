@@ -3,6 +3,7 @@
 #include <openssl/evp.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #define READ_CHUNK 65536
 
@@ -104,11 +105,12 @@ static int verify_file_impl(const char *path, const char *expected, int quiet)
         return 0;
     }
 
-    /* Default: SHA-256 hex (PyPI and RPM). */
+    /* Default: SHA-256 hex (PyPI and RPM).  Compare case-insensitively: some
+     * repositories publish uppercase hex digests. */
     char computed[65];
     if (sha256_file(path, computed) != 0)
         return -1;
-    if (strcmp(computed, expected) != 0) {
+    if (strcasecmp(computed, expected) != 0) {
         if (!quiet)
             fprintf(stderr,
                     "packmule: SHA-256 mismatch for '%s'\n"

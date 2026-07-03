@@ -27,6 +27,8 @@ void package_destroy(Package *pkg)
     pm_free(pkg->url);
     pm_free(pkg->sha256);
     pm_free(pkg->filename);
+    pm_free(pkg->constraint);
+    pm_free(pkg->extras);
     if (pkg->dep_specs) {
         for (char **p = pkg->dep_specs; *p; p++)
             pm_free(*p);

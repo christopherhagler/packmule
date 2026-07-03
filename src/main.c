@@ -16,6 +16,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void print_registry_list(void)
@@ -115,6 +116,64 @@ static const char *normalize_os(const char *s)
     return NULL;
 }
 
+/*
+ * verify_pypi_bundle — best-effort proof that the bundle actually installs
+ * offline: run pip's resolver against ONLY the bundled files
+ * (--dry-run --no-index).  This converts "fails on the air-gapped machine"
+ * into "fails right here, while there is still a network to fix it with".
+ *
+ * Only meaningful when this machine matches the bundle's target platform;
+ * otherwise it reports why it was skipped.  A failed check warns rather than
+ * failing the run, because pip < 22.2 lacks --dry-run.
+ */
+static void verify_pypi_bundle(const char *output_dir, const char *arch,
+                               const char *host_arch, const char *target_os,
+                               const char *host_os, int py_minor)
+{
+    int host_py = detect_python_minor();
+    if (host_py <= 0) {
+        printf("packmule: skipping offline install check (no local python3)\n");
+        return;
+    }
+    if ((py_minor > 0 && py_minor != host_py) ||
+        (target_os && (!host_os || strcmp(target_os, host_os) != 0)) ||
+        (arch && strcmp(arch, host_arch) != 0)) {
+        printf("packmule: skipping offline install check (bundle targets a "
+               "different os/arch/python than this machine)\n");
+        return;
+    }
+
+    printf("packmule: checking the bundle installs offline (pip --dry-run) ...\n");
+    fflush(stdout);
+
+    char *req   = pm_asprintf("%s/requirements.txt", output_dir);
+    char *links = pm_asprintf("--find-links=%s", output_dir);
+
+    int   ok  = -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("python3", "python3", "-m", "pip", "install", "--dry-run",
+               "--no-index", "--quiet", links, "--no-build-isolation",
+               "-r", req, (char *)NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        int st;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0)
+            ok = 0;
+    }
+    pm_free(req);
+    pm_free(links);
+
+    if (ok == 0)
+        printf("packmule: offline install check PASSED\n");
+    else
+        fprintf(stderr,
+                "packmule: warning: offline install check FAILED -- pip could"
+                " not resolve the bundle without an index.\n"
+                "          The bundle may not install on the target machine."
+                " (Note: the check requires pip >= 22.2.)\n");
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -166,12 +225,14 @@ int main(int argc, char *argv[])
      * Sized to hold any platform's utsname.machine (Linux 65, BSD/macOS 256)
      * so the copy below can never truncate. */
     static char detected_arch[256];
+    const char *host_os   = NULL;   /* this machine's OS family, fixed */
     const char *target_os = NULL;   /* host OS family, overridable by --os */
     {
         struct utsname uts;
         if (uname(&uts) == 0) {
             snprintf(detected_arch, sizeof(detected_arch), "%s", uts.machine);
-            target_os = normalize_os(uts.sysname);
+            host_os   = normalize_os(uts.sysname);
+            target_os = host_os;
         }
     }
     char *arch = detected_arch[0] ? detected_arch : NULL;
@@ -367,11 +428,11 @@ int main(int argc, char *argv[])
          * that the download bar / result line overwrites.  In dry-run mode let
          * output flow freely since the user is reviewing the full list. */
         if (dry_run) {
-            printf("  [%zu/%zu] %s%s%s",
-                   i + 1, reqs->count,
-                   pkg->name,
-                   pkg->version ? "==" : "",
-                   pkg->version ? pkg->version : "");
+            printf("  [%zu/%zu] %s", i + 1, reqs->count, pkg->name);
+            if (pkg->version)
+                printf("==%s", pkg->version);
+            else if (pkg->constraint)
+                printf("%s", pkg->constraint);
             fflush(stdout);
         } else if (tty) {
             printf("\r  [%zu/%zu] resolving %-.50s\033[K",
@@ -499,6 +560,9 @@ int main(int argc, char *argv[])
             bopts.packages      = reqs;
             if (bundle_create(&bopts) != 0)
                 exit_code = EXIT_FAILURE;
+            else if (strcmp(reg->name, "pypi") == 0)
+                verify_pypi_bundle(output_dir, arch, detected_arch,
+                                   target_os, host_os, py_minor);
         }
     }
 

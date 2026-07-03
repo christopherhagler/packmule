@@ -91,7 +91,9 @@ static void configure_download(CURL *curl, char *error_buf)
  */
 static int attempt_should_retry(CURLcode res, long http_code, int attempt)
 {
-    int transient = (res != CURLE_OK) || http_code >= 500;
+    /* 429 (rate limited) is transient too: PyPI and npm both rate-limit, and
+     * a large manifest can trip it mid-run. */
+    int transient = (res != CURLE_OK) || http_code >= 500 || http_code == 429;
     if (!transient || attempt + 1 >= MAX_ATTEMPTS)
         return 0;
     sleep(attempt == 0 ? 1 : 3);

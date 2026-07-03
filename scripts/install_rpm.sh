@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Prefer dnf for automatic dependency ordering within the bundle; fall back to
 # the low-level rpm tool when dnf is unavailable.
 if command -v dnf >/dev/null 2>&1; then
-  dnf install --disablerepo='*' "$DIR"/*.rpm
+  dnf install -y --disablerepo='*' "$DIR"/*.rpm
 else
   rpm -Uvh "$DIR"/*.rpm
 fi

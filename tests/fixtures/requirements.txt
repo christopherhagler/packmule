@@ -40,8 +40,8 @@ packaging>=23.0
 # ── Environment marker (marker stripped; version extracted from ==) ────────
 pywin32==306 ; sys_platform == "win32"
 
-# ── Constraint file reference (line skipped entirely) ─────────────────────
--r constraints.txt
+# ── Constraint file reference (line skipped with a warning) ────────────────
+-c constraints.txt
 
 # ── Testing ────────────────────────────────────────────────────────────────
 pytest==8.1.1

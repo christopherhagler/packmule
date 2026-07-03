@@ -3,7 +3,9 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Install each bundled tarball. npm resolves the bundled deps from disk.
-for f in "$DIR"/*.tgz; do
-  npm install "$f"
-done
+# Install every bundled tarball in a single npm invocation so npm can satisfy
+# shared dependencies from the bundle itself instead of asking the registry.
+# --no-audit / --no-fund suppress the network calls npm otherwise makes after
+# an install, which would fail (or hang) on an air-gapped machine.
+set -- "$DIR"/*.tgz
+npm install --no-audit --no-fund "$@"

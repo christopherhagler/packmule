@@ -199,7 +199,13 @@ static char *decompress_to_string(const char *path)
     archive_read_support_filter_gzip(a);
     archive_read_support_filter_bzip2(a);
     archive_read_support_filter_xz(a);
-    archive_read_support_filter_zstd(a);  /* modern createrepo_c default */
+    /* zstd is the modern createrepo_c default (Fedora/RHEL 9+); surface a
+     * clear message now rather than an opaque header error later when this
+     * libarchive was built without it. */
+    if (archive_read_support_filter_zstd(a) == ARCHIVE_FATAL)
+        fprintf(stderr,
+                "packmule: warning: libarchive lacks zstd support; "
+                "zstd-compressed repodata will fail to decompress\n");
     archive_read_support_format_raw(a);
 
     if (archive_read_open_filename(a, path, 65536) != ARCHIVE_OK) {

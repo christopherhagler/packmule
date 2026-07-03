@@ -27,6 +27,12 @@ typedef struct {
     char *url;         /* Download URL for the chosen artifact. */
     char *sha256;      /* Expected SHA-256 hex digest (64 chars + NUL). */
     char *filename;    /* Basename of the downloaded file. */
+    char *constraint;  /* Version range constraint (e.g. ">=1.20,<2.0") when the
+                          requirement is not an exact pin, or NULL.  Consumed by
+                          resolve() to pick a satisfying version. */
+    char *extras;      /* Comma-separated requested extras (e.g. "standard"),
+                          lowercase, or NULL.  Consumed by get_deps() to admit
+                          extras-gated dependencies. */
     char **dep_specs;  /* NULL-terminated array of registry dep specifiers, or NULL.
                           Populated by resolve(); consumed by get_deps(). */
 } Package;

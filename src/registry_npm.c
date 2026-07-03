@@ -406,6 +406,25 @@ static int npm_get_deps(const Registry *self, const Package *pkg,
             range = NULL;
         }
 
+        /* npm alias: "dep": "npm:real-name@range" installs `real-name`.
+         * Without this rewrite we would query the registry for the alias
+         * name, which does not exist as a package. */
+        if (range && strncmp(range, "npm:", 4) == 0) {
+            const char *real = range + 4;
+            const char *rat  = strrchr(real, '@');
+            pm_free(name);
+            if (rat && rat != real) {
+                name = pm_strndup(real, (size_t)(rat - real));
+                char *nrange = (rat[1] != '\0') ? pm_strdup(rat + 1) : NULL;
+                pm_free(range);
+                range = nrange;
+            } else {
+                name = pm_strdup(real);
+                pm_free(range);
+                range = NULL;
+            }
+        }
+
         if (!package_list_contains_name(seen, name)) {
             package_list_add(out, package_create(name, range));
             added++;

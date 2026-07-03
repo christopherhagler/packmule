@@ -17,6 +17,18 @@ add_executable(test_semver test_semver.c)
 target_link_libraries(test_semver PRIVATE packmule_core)
 add_test(NAME test_semver COMMAND test_semver)
 
+add_executable(test_pep440 test_pep440.c)
+target_link_libraries(test_pep440 PRIVATE packmule_core)
+add_test(NAME test_pep440 COMMAND test_pep440)
+
+add_executable(test_pep508 test_pep508.c)
+target_link_libraries(test_pep508 PRIVATE packmule_core)
+add_test(NAME test_pep508 COMMAND test_pep508)
+
+add_executable(test_wheeltag test_wheeltag.c)
+target_link_libraries(test_wheeltag PRIVATE packmule_core)
+add_test(NAME test_wheeltag COMMAND test_wheeltag)
+
 add_executable(test_registry_pypi test_registry_pypi.c)
 target_link_libraries(test_registry_pypi PRIVATE packmule_core)
 add_test(NAME test_registry_pypi COMMAND test_registry_pypi
@@ -41,3 +53,23 @@ add_executable(test_bundle test_bundle.c)
 target_link_libraries(test_bundle PRIVATE packmule_core)
 add_test(NAME test_bundle COMMAND test_bundle
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ── End-to-end tests (network-dependent, opt-in) ─────────────────────────────
+#
+# Full pipeline against the real registries: resolve → download → bundle →
+# extract → offline install (pypi: fresh venv with --no-index; npm: registry
+# pointed at an unroutable address).  Off by default because they need
+# network access; enable with -DPACKMULE_E2E_TESTS=ON and run via
+# `ctest -L e2e`.  A missing prerequisite (python3/npm) skips, not fails.
+option(PACKMULE_E2E_TESTS "Enable network-dependent end-to-end tests" OFF)
+if(PACKMULE_E2E_TESTS)
+    foreach(backend pypi npm rpm)
+        add_test(NAME e2e_${backend}
+            COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_${backend}.sh)
+        set_tests_properties(e2e_${backend} PROPERTIES
+            ENVIRONMENT "PACKMULE=$<TARGET_FILE:packmule>"
+            SKIP_RETURN_CODE 77
+            LABELS e2e
+            TIMEOUT 600)
+    endforeach()
+endif()

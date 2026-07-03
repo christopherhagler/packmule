@@ -112,6 +112,9 @@ add_library(packmule_core OBJECT
     src/network.c
     src/hash.c
     src/semver.c
+    src/pep440.c
+    src/pep508.c
+    src/wheeltag.c
     src/registry.c
     src/registry_pypi.c
     src/registry_npm.c
