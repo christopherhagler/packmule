@@ -7,6 +7,15 @@ typedef struct {
     const char  *output_dir;
     const char  *registry_name;
     PackageList *packages;
+
+    /*
+     * Optional extra file copied into the bundle (and archived) as
+     * `aux_name`.  Used by the npm backend to ship the project's
+     * package-lock.json so install.sh can replay the exact tree offline.
+     * Both NULL when unused.
+     */
+    const char  *aux_file;
+    const char  *aux_name;
 } BundleOptions;
 
 /*

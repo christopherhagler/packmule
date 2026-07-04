@@ -123,6 +123,56 @@ static int write_requirements_txt(const BundleOptions *opts)
     return 0;
 }
 
+/* ── Aux file (npm: the project's package-lock.json) ─────────────────────── */
+
+/*
+ * copy_aux_file — copy opts->aux_file into the output dir as opts->aux_name.
+ * A no-op when the source already IS the destination (e.g. -f package-lock.json
+ * with -o pointing at the same directory), which a plain copy would truncate.
+ */
+static int copy_aux_file(const BundleOptions *opts)
+{
+    char dest[4096];
+    snprintf(dest, sizeof(dest), "%s/%s", opts->output_dir, opts->aux_name);
+
+    char rsrc[PATH_MAX], rdst[PATH_MAX];
+    if (realpath(opts->aux_file, rsrc) && realpath(dest, rdst) &&
+        strcmp(rsrc, rdst) == 0)
+        return 0;
+
+    FILE *in = fopen(opts->aux_file, "rb");
+    if (!in) {
+        fprintf(stderr, "packmule: cannot read %s: %s\n",
+                opts->aux_file, strerror(errno));
+        return -1;
+    }
+    FILE *out = fopen(dest, "wb");
+    if (!out) {
+        fprintf(stderr, "packmule: cannot write %s: %s\n",
+                dest, strerror(errno));
+        fclose(in);
+        return -1;
+    }
+
+    char   buf[65536];
+    size_t n;
+    int    ret = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fprintf(stderr, "packmule: short write to %s\n", dest);
+            ret = -1;
+            break;
+        }
+    }
+    if (ferror(in)) {
+        fprintf(stderr, "packmule: read error on %s\n", opts->aux_file);
+        ret = -1;
+    }
+    fclose(in);
+    fclose(out);
+    return ret;
+}
+
 /* ── Install script ───────────────────────────────────────────────────────── */
 
 /*
@@ -259,11 +309,14 @@ static int create_tarball(const BundleOptions *opts,
 
     int ret = 0;
 
-    /* Metadata files first, then the package payloads. requirements.txt is
-     * pypi-only, so it is skipped here when absent. */
-    static const char *meta[] = { "manifest.json", "install.sh", "requirements.txt" };
+    /* Metadata files first, then the package payloads.  requirements.txt is
+     * pypi-only, so it is skipped here when absent.  The aux file (npm's
+     * package-lock.json) is added only when this bundle wrote it — a stray
+     * same-named file in the output dir must not ride along. */
+    const char *meta[] = { "manifest.json", "install.sh", "requirements.txt",
+                           opts->aux_name };
     for (size_t i = 0; i < sizeof(meta) / sizeof(meta[0]) && ret == 0; i++) {
-        if (!file_exists(opts->output_dir, meta[i]))
+        if (!meta[i] || !file_exists(opts->output_dir, meta[i]))
             continue;
         char disk_path[4096], arcname[4096];
         snprintf(disk_path, sizeof(disk_path), "%s/%s", opts->output_dir, meta[i]);
@@ -298,6 +351,12 @@ int bundle_create(const BundleOptions *opts)
     if (strcmp(opts->registry_name, "pypi") == 0) {
         printf("packmule: writing requirements.txt ...\n");
         if (write_requirements_txt(opts) != 0)
+            return -1;
+    }
+
+    if (opts->aux_file && opts->aux_name) {
+        printf("packmule: copying %s ...\n", opts->aux_name);
+        if (copy_aux_file(opts) != 0)
             return -1;
     }
 

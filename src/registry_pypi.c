@@ -48,18 +48,10 @@ static Package *parse_line(const char *line, int *fatal)
      * '@' (direct URL), or whitespace.  Stopping at whitespace matters for
      * unpinned lines with a marker, e.g. "colorama ; sys_platform != 'win32'":
      * without it the space before ';' is captured into the name and the
-     * resolve URL becomes malformed. */
+     * resolve URL becomes malformed.  Unlike pep508_spec_name this keeps the
+     * manifest's casing (PyPI URLs accept either; tests pin the behaviour). */
     size_t name_len = 0;
-    while (trimmed[name_len] &&
-           !isspace((unsigned char)trimmed[name_len]) &&
-           trimmed[name_len] != '[' &&
-           trimmed[name_len] != '=' &&
-           trimmed[name_len] != '>' &&
-           trimmed[name_len] != '<' &&
-           trimmed[name_len] != '!' &&
-           trimmed[name_len] != '~' &&
-           trimmed[name_len] != '@' &&
-           trimmed[name_len] != ';')
+    while (trimmed[name_len] && !strchr("[(;<>=!~@ \t", trimmed[name_len]))
         ++name_len;
 
     if (name_len == 0) {
@@ -71,9 +63,10 @@ static Package *parse_line(const char *line, int *fatal)
 
     char *name = pm_strndup(trimmed, name_len);
 
-    /* Optional extras [a,b]: recorded lowercased and space-free so that
-     * extras-gated dependencies are followed during transitive resolution. */
-    char *extras = NULL;
+    /* Reject the two shapes pep508_spec_* silently returns NULL for, because
+     * here dropping the requirement would ship an incomplete bundle: an
+     * unterminated extras bracket, and a direct URL ("pkg @ https://…") whose
+     * artifact we cannot verify or reproduce from PyPI. */
     const char *cursor = trimmed + name_len;
     while (isspace((unsigned char)*cursor)) ++cursor;
     if (*cursor == '[') {
@@ -85,54 +78,33 @@ static Package *parse_line(const char *line, int *fatal)
             pm_free(work);
             return NULL;
         }
-        char ebuf[128];
-        size_t k = 0;
-        for (const char *p = cursor + 1; p < close && k < sizeof(ebuf) - 1; p++)
-            if (!isspace((unsigned char)*p))
-                ebuf[k++] = (char)tolower((unsigned char)*p);
-        ebuf[k] = '\0';
-        if (k)
-            extras = pm_strdup(ebuf);
         cursor = close + 1;
+        while (isspace((unsigned char)*cursor)) ++cursor;
     }
-    while (isspace((unsigned char)*cursor)) ++cursor;
-
-    /* Direct URL requirement ("pkg @ https://…"): we cannot verify what that
-     * URL serves, and resolving the name against PyPI instead would silently
-     * bundle a different artifact than the one the manifest pinned. */
     if (*cursor == '@') {
         fprintf(stderr,
                 "packmule: direct-URL requirement not supported: %s\n"
                 "          Pin a PyPI version instead, or copy the file into "
                 "the output directory manually.\n", trimmed);
         *fatal = 1;
-        pm_free(extras);
         pm_free(name);
         pm_free(work);
         return NULL;
     }
 
-    /* Collect the version specifier up to any ';' marker, dropping spaces and
-     * parentheses.  A lone exact pin ("==2.31.0") stays a pin; every other
-     * specifier (">=2,<3", "~=2.4", "==1.*") becomes a PEP 440 constraint
-     * resolved against the package's release list at fetch time. */
-    char spec[256];
-    size_t k = 0;
-    for (; *cursor && *cursor != ';' && k < sizeof(spec) - 1; ++cursor) {
-        if (isspace((unsigned char)*cursor) || *cursor == '(' || *cursor == ')')
-            continue;
-        spec[k++] = *cursor;
-    }
-    spec[k] = '\0';
-
+    /* Extras are recorded lowercased and space-free so that extras-gated
+     * dependencies are followed during transitive resolution.  A lone exact
+     * pin ("==2.31.0") stays a pin; every other specifier (">=2,<3", "~=2.4",
+     * "==1.*") becomes a PEP 440 constraint resolved at fetch time. */
+    char *extras      = pep508_spec_extras(trimmed);
     char *version_str = NULL;
-    char *constraint  = NULL;
-    if (k > 0) {
-        if (spec[0] == '=' && spec[1] == '=' && spec[2] != '=' &&
-            !strchr(spec, ',') && !strchr(spec, '*'))
-            version_str = pm_strdup(spec + 2);
-        else
-            constraint = pm_strdup(spec);
+    char *constraint  = pep508_spec_constraint(trimmed);
+    if (constraint &&
+        constraint[0] == '=' && constraint[1] == '=' && constraint[2] != '=' &&
+        !strchr(constraint, ',') && !strchr(constraint, '*')) {
+        version_str = pm_strdup(constraint + 2);
+        pm_free(constraint);
+        constraint = NULL;
     }
 
     Package *pkg    = package_create(name, version_str);
@@ -142,6 +114,21 @@ static Package *parse_line(const char *line, int *fatal)
     pm_free(name);
     pm_free(work);
     return pkg;
+}
+
+/*
+ * merge_constraint — AND another PEP 440 range into pkg->constraint (comma is
+ * conjunction), so the eventual resolution honours every requester.
+ */
+static void merge_constraint(Package *pkg, const char *constraint)
+{
+    if (pkg->constraint) {
+        char *merged = pm_asprintf("%s,%s", pkg->constraint, constraint);
+        pm_free(pkg->constraint);
+        pkg->constraint = merged;
+    } else {
+        pkg->constraint = pm_strdup(constraint);
+    }
 }
 
 #define MAX_INCLUDE_DEPTH 8
@@ -269,17 +256,8 @@ static int parse_requirements_file(const Registry *self, const char *path,
                         existing->name, existing->version, pkg->version,
                         existing->version);
             }
-            /* Unpinned ranges intersect by concatenation: comma is AND. */
-            if (!existing->version && pkg->constraint) {
-                if (existing->constraint) {
-                    char *merged = pm_asprintf("%s,%s", existing->constraint,
-                                               pkg->constraint);
-                    pm_free(existing->constraint);
-                    existing->constraint = merged;
-                } else {
-                    existing->constraint = pm_strdup(pkg->constraint);
-                }
-            }
+            if (!existing->version && pkg->constraint)
+                merge_constraint(existing, pkg->constraint);
             /* Union of requested extras. */
             if (pkg->extras) {
                 if (!existing->extras) {
@@ -693,16 +671,7 @@ static int pypi_get_deps(const Registry *self, const Package *pkg,
                         "already selected; the offline install may fail\n",
                         pkg->name, name, constraint, existing->version);
             } else if (constraint && !existing->version) {
-                /* Not resolved yet: intersect ranges (comma is AND) so the
-                 * eventual resolution honours every dependent. */
-                if (existing->constraint) {
-                    char *merged = pm_asprintf("%s,%s", existing->constraint,
-                                               constraint);
-                    pm_free(existing->constraint);
-                    existing->constraint = merged;
-                } else {
-                    existing->constraint = pm_strdup(constraint);
-                }
+                merge_constraint(existing, constraint);
             }
             pm_free(version);
             pm_free(constraint);

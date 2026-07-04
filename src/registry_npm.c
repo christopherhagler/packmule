@@ -1,7 +1,9 @@
 /*
  * registry_npm.c — npm registry backend.
  *
- * Manifest format: package.json ("dependencies" object only).
+ * Manifest format: package.json ("dependencies", "optionalDependencies",
+ *                  and non-optional "peerDependencies"; devDependencies are
+ *                  omitted and install.sh runs npm with --omit=dev).
  * Registry API:    https://registry.npmjs.org/<name>/<version>
  *                  https://registry.npmjs.org/<name>/latest
  *                  https://registry.npmjs.org/<name>          (packument)
@@ -20,9 +22,11 @@
  * the integrity field was introduced (~2017) are rejected rather than falling
  * back to the weaker dist.shasum (SHA-1).
  *
- * Transitive dependencies are read from the "dependencies" object in the
- * resolved version document and stored in pkg->dep_specs as "name@range"
- * for npm_get_deps() to enqueue breadth-first with their ranges intact.
+ * Transitive dependencies are read from the resolved version document's
+ * dependency objects (see NPM_DEP_KEYS) and stored in pkg->dep_specs as
+ * "name@range" for npm_get_deps() to enqueue breadth-first with their
+ * ranges intact.  npm 7+ installs peerDependencies by default, so peers
+ * must be part of the bundled closure or the offline install fails.
  */
 
 #include "registry.h"
@@ -37,36 +41,119 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ── Manifest parser ─────────────────────────────────────────────────────── */
+/* ── Dependency-spec helpers (shared by manifest and transitive paths) ───── */
 
 /*
- * npm_parse_manifest — read "dependencies" from a package.json file.
- *
- * Only the "dependencies" object is processed; "devDependencies",
- * "peerDependencies", and "optionalDependencies" are intentionally ignored
- * because they are not required for a production offline install.
- *
- * Version strings are stored verbatim (e.g. "^4.18.0", "~1.2.3", "2.31.0").
- * Range resolution happens in npm_resolve.
+ * apply_alias — rewrite an npm alias in place: "dep": "npm:real-name@range"
+ * installs `real-name`, so the alias name must be replaced before querying
+ * the registry (the alias itself does not exist as a package).  `*name` and
+ * `*range` are owned heap strings (range may be NULL) and are replaced when
+ * the range carries an alias.
  */
-static PackageList *npm_parse_manifest(const Registry *self, const char *path)
+static void apply_alias(char **name, char **range)
 {
-    (void)self;
+    if (!*range || strncmp(*range, "npm:", 4) != 0)
+        return;
 
+    /* Split "real-name@range" at the LAST '@' so scoped names survive. */
+    const char *real = *range + 4;
+    const char *at   = strrchr(real, '@');
+    pm_free(*name);
+    if (at && at != real) {
+        *name = pm_strndup(real, (size_t)(at - real));
+        char *nrange = (at[1] != '\0') ? pm_strdup(at + 1) : NULL;
+        pm_free(*range);
+        *range = nrange;
+    } else {
+        *name = pm_strdup(real);
+        pm_free(*range);
+        *range = NULL;
+    }
+}
+
+/*
+ * spec_is_unbundleable — specs with no registry tarball behind them: git
+ * repositories, direct URLs, local paths, and workspace references.  A '/'
+ * catches the bare GitHub shorthand ("user/repo"); no semver range contains
+ * one.  Call after apply_alias (a scoped alias target has a '/').
+ */
+static int spec_is_unbundleable(const char *spec)
+{
+    return strncmp(spec, "file:", 5)       == 0 ||
+           strncmp(spec, "link:", 5)       == 0 ||
+           strncmp(spec, "workspace:", 10) == 0 ||
+           strncmp(spec, "git", 3)         == 0 ||   /* git:, git+ssh:, … */
+           strncmp(spec, "github:", 7)     == 0 ||
+           strncmp(spec, "http://", 7)     == 0 ||
+           strncmp(spec, "https://", 8)    == 0 ||
+           strchr(spec, '/')               != NULL;
+}
+
+/*
+ * npm_local_filename — the bundled tarball's local name, derived from the
+ * last path component of its registry URL.  For scoped packages the scope is
+ * prefixed: "@babel/core" and "@vue/core" both publish "core-<ver>.tgz",
+ * which would collide in one output dir.  install.sh's lockfile rewriter
+ * mirrors this rule — keep the two in sync.  Caller owns the result.
+ */
+static char *npm_local_filename(const char *name, const char *tarball_url)
+{
+    const char *slash = strrchr(tarball_url, '/');
+    const char *base  = slash ? slash + 1 : tarball_url;
+    if (name[0] == '@') {
+        const char *scope_end = strchr(name, '/');
+        if (scope_end)
+            return pm_asprintf("%.*s-%s", (int)(scope_end - (name + 1)),
+                               name + 1, base);
+    }
+    return pm_strdup(base);
+}
+
+/*
+ * peer_is_optional — is `name` marked { "optional": true } in the document's
+ * peerDependenciesMeta?  Optional peers are the consumer's choice and must
+ * not be forced into the bundle.
+ */
+static int peer_is_optional(const cJSON *doc, const char *name)
+{
+    const cJSON *meta = cJSON_GetObjectItemCaseSensitive(doc,
+                                                         "peerDependenciesMeta");
+    const cJSON *m    = cJSON_GetObjectItemCaseSensitive(meta, name);
+    const cJSON *opt  = cJSON_GetObjectItemCaseSensitive(m, "optional");
+    return cJSON_IsTrue(opt);
+}
+
+/*
+ * The dependency objects that must reach the air-gapped machine.  npm 7+
+ * installs peerDependencies by default, and arborist resolves
+ * optionalDependencies before deciding platform compatibility — offline,
+ * anything missing from this closure is a hard install failure.
+ * devDependencies stay out: install.sh runs npm with --omit=dev.
+ */
+static const char *const NPM_DEP_KEYS[] = {
+    "dependencies", "optionalDependencies", "peerDependencies",
+};
+enum { NPM_DEP_NKEYS = 3 };
+
+/* ── Manifest parser ─────────────────────────────────────────────────────── */
+
+/* read_json_file — parse the JSON document at `path`.  Returns NULL (with a
+ * message when `quiet` is 0) on I/O or parse failure.  Caller cJSON_Deletes. */
+static cJSON *read_json_file(const char *path, int quiet)
+{
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        fprintf(stderr, "packmule: cannot open %s\n", path);
+        if (!quiet)
+            fprintf(stderr, "packmule: cannot open %s\n", path);
         return NULL;
     }
 
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fprintf(stderr, "packmule: cannot seek in %s\n", path);
-        fclose(fp);
-        return NULL;
-    }
-    long fsize = ftell(fp);
+    long fsize = -1;
+    if (fseek(fp, 0, SEEK_END) == 0)
+        fsize = ftell(fp);
     if (fsize < 0) {
-        fprintf(stderr, "packmule: cannot determine size of %s\n", path);
+        if (!quiet)
+            fprintf(stderr, "packmule: cannot determine size of %s\n", path);
         fclose(fp);
         return NULL;
     }
@@ -79,22 +166,213 @@ static PackageList *npm_parse_manifest(const Registry *self, const char *path)
 
     cJSON *root = cJSON_Parse(buf);
     pm_free(buf);
-
-    if (!root) {
+    if (!root && !quiet)
         fprintf(stderr, "packmule: failed to parse JSON in %s\n", path);
+    return root;
+}
+
+/*
+ * npm_parse_lockfile — build the download list from a package-lock.json /
+ * npm-shrinkwrap.json "packages" object (lockfileVersion >= 2).
+ *
+ * The lock is npm's own resolution of the FULL tree — including multiple
+ * versions of one package at different nesting positions, which the range
+ * walker cannot represent.  Every non-dev entry becomes one download (same
+ * name+version at several positions dedupes to one tarball); install.sh
+ * replays the tree with `npm ci --offline` against the bundled files.
+ */
+static PackageList *npm_parse_lockfile(const cJSON *root, const char *path)
+{
+    const cJSON *lv = cJSON_GetObjectItemCaseSensitive(root, "lockfileVersion");
+    if (!cJSON_IsNumber(lv) || lv->valuedouble < 2) {
+        fprintf(stderr,
+                "packmule: %s uses lockfileVersion %g; version 2 or 3 is "
+                "required.\n          Regenerate it with npm 7 or newer "
+                "(npm install --package-lock-only).\n",
+                path, cJSON_IsNumber(lv) ? lv->valuedouble : 0.0);
         return NULL;
     }
 
+    const cJSON *pkgs = cJSON_GetObjectItemCaseSensitive(root, "packages");
+    if (!cJSON_IsObject(pkgs)) {
+        fprintf(stderr, "packmule: %s has no \"packages\" object\n", path);
+        return NULL;
+    }
+
+    PackageList *list  = package_list_create();
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, pkgs) {
+        const char *key = entry->string;
+        if (!key || !*key)              /* "" is the root project itself */
+            continue;
+
+        /* devDependencies are not installed on the target (--omit=dev);
+         * bundled deps ship inside their parent's tarball. */
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "dev")) ||
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "inBundle")) ||
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "link")))
+            continue;
+
+        /* The name is the path segment after the LAST "node_modules/". */
+        const char *name = key, *nm;
+        while ((nm = strstr(name, "node_modules/")) != NULL)
+            name = nm + strlen("node_modules/");
+
+        const cJSON *ver = cJSON_GetObjectItemCaseSensitive(entry, "version");
+        const cJSON *res = cJSON_GetObjectItemCaseSensitive(entry, "resolved");
+        const cJSON *integ = cJSON_GetObjectItemCaseSensitive(entry, "integrity");
+
+        if (!cJSON_IsString(res) ||
+            strncmp(res->valuestring, "http", 4) != 0) {
+            fprintf(stderr,
+                    "packmule: cannot bundle %s (from %s):\n"
+                    "          it does not resolve to a registry tarball "
+                    "(git/file/workspace dependency).\n",
+                    name, path);
+            package_list_destroy(list);
+            return NULL;
+        }
+        if (!cJSON_IsString(integ) ||
+            strncmp(integ->valuestring, "sha512-", 7) != 0) {
+            fprintf(stderr,
+                    "packmule: %s in %s has no SHA-512 integrity; refusing "
+                    "to bundle an unverifiable file.\n"
+                    "          Regenerate the lock with npm 7+ to refresh "
+                    "integrity metadata.\n",
+                    name, path);
+            package_list_destroy(list);
+            return NULL;
+        }
+
+        /* One tarball serves every tree position of the same name+version. */
+        const char *vstr = cJSON_IsString(ver) ? ver->valuestring : NULL;
+        int dup = 0;
+        for (size_t i = 0; i < list->count && !dup; i++)
+            dup = strcmp(list->items[i]->name, name) == 0 &&
+                  list->items[i]->version && vstr &&
+                  strcmp(list->items[i]->version, vstr) == 0;
+        if (dup)
+            continue;
+
+        Package *p  = package_create(name, vstr);
+        p->url      = pm_strdup(res->valuestring);
+        p->sha256   = pm_strdup(integ->valuestring);
+        p->filename = npm_local_filename(name, res->valuestring);
+        package_list_add(list, p);
+    }
+    return list;
+}
+
+/*
+ * npm_effective_lockfile — the lockfile a bundle built from `manifest_path`
+ * should use: the manifest itself when it IS a lock, else a valid
+ * package-lock.json / npm-shrinkwrap.json sitting next to it.  Returns a
+ * heap path or NULL (no lock: flat package.json resolution applies).
+ * main.c uses this to copy the lock into the bundle.
+ */
+char *npm_effective_lockfile(const char *manifest_path)
+{
+    cJSON *root = read_json_file(manifest_path, 1);
+    if (root) {
+        int is_lock = cJSON_HasObjectItem(root, "lockfileVersion");
+        cJSON_Delete(root);
+        if (is_lock)
+            return pm_strdup(manifest_path);
+    }
+
+    static const char *const lock_names[] = { "package-lock.json",
+                                              "npm-shrinkwrap.json" };
+    const char *slash = strrchr(manifest_path, '/');
+    for (size_t i = 0; i < sizeof(lock_names) / sizeof(lock_names[0]); i++) {
+        char *cand = slash
+            ? pm_asprintf("%.*s/%s", (int)(slash - manifest_path),
+                          manifest_path, lock_names[i])
+            : pm_strdup(lock_names[i]);
+        cJSON *lock = read_json_file(cand, 1);
+        if (lock) {
+            int is_lock = cJSON_HasObjectItem(lock, "lockfileVersion");
+            cJSON_Delete(lock);
+            if (is_lock)
+                return cand;
+        }
+        pm_free(cand);
+    }
+    return NULL;
+}
+
+/*
+ * npm_parse_manifest — build the download list for an npm project.
+ *
+ * A lockfile (the manifest itself, or one found next to package.json) wins:
+ * it is npm's own exact resolution and the only faithful representation of
+ * trees that need multiple versions of a package.  Without one, the
+ * production dependency objects (see NPM_DEP_KEYS) of package.json are
+ * walked and ranges are resolved against the registry.  npm aliases are
+ * rewritten to their real package names; git/URL/path specs are a hard
+ * error, because a bundle silently missing them (or shipping "latest" of
+ * the wrong thing) would fail on the air-gapped machine.
+ */
+static PackageList *npm_parse_manifest(const Registry *self, const char *path)
+{
+    (void)self;
+
+    char *lock = npm_effective_lockfile(path);
+    if (lock) {
+        if (strcmp(lock, path) != 0)
+            printf("packmule: using %s for the exact dependency tree\n", lock);
+        cJSON *root = read_json_file(lock, 0);
+        PackageList *list = root ? npm_parse_lockfile(root, lock) : NULL;
+        cJSON_Delete(root);
+        pm_free(lock);
+        return list;
+    }
+
+    cJSON *root = read_json_file(path, 0);
+    if (!root)
+        return NULL;
+
     PackageList *list = package_list_create();
 
-    cJSON *deps = cJSON_GetObjectItemCaseSensitive(root, "dependencies");
-    if (cJSON_IsObject(deps)) {
+    for (int i = 0; i < NPM_DEP_NKEYS; i++) {
+        cJSON *deps = cJSON_GetObjectItemCaseSensitive(root, NPM_DEP_KEYS[i]);
+        if (!cJSON_IsObject(deps))
+            continue;
+        int is_peer = (strcmp(NPM_DEP_KEYS[i], "peerDependencies") == 0);
+
         cJSON *entry = NULL;
         cJSON_ArrayForEach(entry, deps) {
-            if (!cJSON_IsString(entry))
+            if (!entry->string || !cJSON_IsString(entry))
                 continue;
-            Package *pkg = package_create(entry->string, entry->valuestring);
-            package_list_add(list, pkg);
+            if (is_peer && peer_is_optional(root, entry->string))
+                continue;
+
+            char *name  = pm_strdup(entry->string);
+            char *range = entry->valuestring[0]
+                        ? pm_strdup(entry->valuestring) : NULL;
+            apply_alias(&name, &range);
+
+            if (range && spec_is_unbundleable(range)) {
+                fprintf(stderr,
+                        "packmule: cannot bundle %s@%s (from %s):\n"
+                        "          git/URL/path dependencies have no registry "
+                        "tarball to download.\n"
+                        "          Publish it to a registry, or copy it into "
+                        "the bundle manually.\n",
+                        name, range, path);
+                pm_free(name);
+                pm_free(range);
+                package_list_destroy(list);
+                cJSON_Delete(root);
+                return NULL;
+            }
+
+            /* The same package may appear in several objects (commonly
+             * dependencies + optionalDependencies); the first — most
+             * specific — entry wins. */
+            if (!package_list_contains_name(list, name))
+                package_list_add(list, package_create(name, range));
+            pm_free(name);
+            pm_free(range);
         }
     }
 
@@ -227,41 +505,56 @@ static int npm_parse_version_doc(const cJSON *doc, Package *pkg)
     pkg->url     = pm_strdup(tarball->valuestring);
     pkg->sha256  = pm_strdup(integrity->valuestring);  /* "sha512-<base64>" */
 
-    /* Derive filename from the last path component of the tarball URL.  For
-     * scoped packages prefix the scope: "@babel/core" and "@vue/core" both
-     * publish "core-<ver>.tgz", which would collide in one output dir. */
-    const char *slash = strrchr(tarball->valuestring, '/');
-    const char *base  = slash ? slash + 1 : tarball->valuestring;
-    if (pkg->name[0] == '@') {
-        const char *scope_end = strchr(pkg->name, '/');
-        if (scope_end)
-            pkg->filename = pm_asprintf("%.*s-%s",
-                                        (int)(scope_end - (pkg->name + 1)),
-                                        pkg->name + 1, base);
-        else
-            pkg->filename = pm_strdup(base);
-    } else {
-        pkg->filename = pm_strdup(base);
-    }
+    pkg->filename = npm_local_filename(pkg->name, tarball->valuestring);
 
-    /* Extract transitive dependencies as "name@range". */
-    cJSON *deps = cJSON_GetObjectItemCaseSensitive(doc, "dependencies");
-    if (cJSON_IsObject(deps)) {
-        int n = cJSON_GetArraySize(deps);
+    /* Extract transitive dependencies as "name@range" from every object in
+     * NPM_DEP_KEYS (see there for why peers and optionals are included). */
+    int total = 0;
+    for (int i = 0; i < NPM_DEP_NKEYS; i++) {
+        cJSON *deps = cJSON_GetObjectItemCaseSensitive(doc, NPM_DEP_KEYS[i]);
+        if (cJSON_IsObject(deps))
+            total += cJSON_GetArraySize(deps);
+    }
+    if (total > 0) {
         if (pkg->dep_specs) {
             for (char **p = pkg->dep_specs; *p; p++)
                 pm_free(*p);
             pm_free(pkg->dep_specs);
         }
-        pkg->dep_specs = pm_malloc(((size_t)n + 1) * sizeof(char *));
-        int    k       = 0;
-        cJSON *entry   = NULL;
-        cJSON_ArrayForEach(entry, deps) {
-            if (!entry->string)
+        pkg->dep_specs = pm_malloc(((size_t)total + 1) * sizeof(char *));
+        int k = 0;
+        for (int i = 0; i < NPM_DEP_NKEYS; i++) {
+            cJSON *deps = cJSON_GetObjectItemCaseSensitive(doc, NPM_DEP_KEYS[i]);
+            if (!cJSON_IsObject(deps))
                 continue;
-            pkg->dep_specs[k++] = pm_asprintf("%s@%s", entry->string,
-                                              cJSON_IsString(entry)
-                                                  ? entry->valuestring : "");
+            int is_peer = (strcmp(NPM_DEP_KEYS[i], "peerDependencies") == 0);
+
+            cJSON *entry = NULL;
+            cJSON_ArrayForEach(entry, deps) {
+                if (!entry->string)
+                    continue;
+                if (is_peer && peer_is_optional(doc, entry->string))
+                    continue;
+
+                /* Skip a name already emitted from an earlier, more specific
+                 * object (dependencies + optionalDependencies overlap). */
+                size_t nlen = strlen(entry->string);
+                int    dup  = 0;
+                for (int j = 0; j < k && !dup; j++) {
+                    const char *at = strrchr(pkg->dep_specs[j], '@');
+                    size_t len = (at && at != pkg->dep_specs[j])
+                               ? (size_t)(at - pkg->dep_specs[j])
+                               : strlen(pkg->dep_specs[j]);
+                    dup = (len == nlen &&
+                           strncmp(pkg->dep_specs[j], entry->string, len) == 0);
+                }
+                if (dup)
+                    continue;
+
+                pkg->dep_specs[k++] = pm_asprintf("%s@%s", entry->string,
+                                                  cJSON_IsString(entry)
+                                                      ? entry->valuestring : "");
+            }
         }
         pkg->dep_specs[k] = NULL;
     }
@@ -319,23 +612,42 @@ static int npm_resolve_range(const char *json, Package *pkg)
     }
 
     if (!best && unparseable) {
-        /* Spec isn't semver (git URL, tag like "next"): npm would resolve it
-         * out-of-registry; the closest in-registry behaviour is "latest". */
-        fprintf(stderr,
-                "packmule: %s: spec '%s' is not a semver range; "
-                "falling back to latest\n",
-                pkg->name, pkg->version);
+        /* Not a semver range.  A dist-tag ("next", "beta") resolves through
+         * the packument's dist-tags exactly as npm would; anything else falls
+         * back to "latest" with a warning (git/URL/path specs never get here —
+         * manifest parsing rejects them). */
         cJSON *tags = cJSON_GetObjectItemCaseSensitive(root, "dist-tags");
-        cJSON *latest = cJSON_GetObjectItemCaseSensitive(tags, "latest");
-        if (cJSON_IsString(latest))
-            best = cJSON_GetObjectItemCaseSensitive(versions,
-                                                    latest->valuestring);
+        cJSON *tag  = cJSON_GetObjectItemCaseSensitive(tags, pkg->version);
+        if (cJSON_IsString(tag))
+            best = cJSON_GetObjectItemCaseSensitive(versions, tag->valuestring);
+
+        if (!best) {
+            fprintf(stderr,
+                    "packmule: %s: spec '%s' is not a semver range or "
+                    "dist-tag; falling back to latest\n",
+                    pkg->name, pkg->version);
+            cJSON *latest = cJSON_GetObjectItemCaseSensitive(tags, "latest");
+            if (cJSON_IsString(latest))
+                best = cJSON_GetObjectItemCaseSensitive(versions,
+                                                        latest->valuestring);
+        }
     }
 
     if (!best) {
         fprintf(stderr,
                 "packmule: no published version of %s satisfies '%s'\n",
                 pkg->name, pkg->version ? pkg->version : "(none)");
+        /* A space-joined spec is the intersection of several dependents'
+         * ranges (see npm_get_deps).  When it is unsatisfiable the tree
+         * needs two versions of this package at once — something only a
+         * lockfile-driven bundle can represent. */
+        if (pkg->version && strchr(pkg->version, ' '))
+            fprintf(stderr,
+                    "          The dependency tree needs multiple versions "
+                    "of %s.  Bundle your project's\n"
+                    "          package-lock.json instead (generate one with "
+                    "`npm install --package-lock-only`).\n",
+                    pkg->name);
         goto done;
     }
 
@@ -359,6 +671,11 @@ static int is_any_version(const char *ver)
 
 static int npm_resolve(const Registry *self, Package *pkg)
 {
+    /* Lockfile entries arrive fully resolved (url/integrity/filename from
+     * the lock); there is nothing to ask the registry. */
+    if (pkg->url && pkg->sha256 && pkg->filename)
+        return 0;
+
     char *url;
     int   want_range = 0;
 
@@ -393,12 +710,13 @@ static int npm_get_deps(const Registry *self, const Package *pkg,
         return 0;
     int added = 0;
     for (char **dep = pkg->dep_specs; *dep; dep++) {
-        /* Split "name@range" at the LAST '@': a scoped name's leading '@' is
-         * at index 0 and never matches. */
-        const char *at = strrchr(*dep, '@');
+        /* Split "name@range" at the first '@' past index 0: a scoped name's
+         * own '@' is only ever at index 0, and the range must keep any '@'
+         * of its own ("npm:left-pad@^1.3.0") for apply_alias to split. */
+        const char *at = strchr(*dep + 1, '@');
         char *name;
         char *range;
-        if (at && at != *dep) {
+        if (at) {
             name  = pm_strndup(*dep, (size_t)(at - *dep));
             range = (at[1] != '\0') ? pm_strdup(at + 1) : NULL;
         } else {
@@ -406,26 +724,53 @@ static int npm_get_deps(const Registry *self, const Package *pkg,
             range = NULL;
         }
 
-        /* npm alias: "dep": "npm:real-name@range" installs `real-name`.
-         * Without this rewrite we would query the registry for the alias
-         * name, which does not exist as a package. */
-        if (range && strncmp(range, "npm:", 4) == 0) {
-            const char *real = range + 4;
-            const char *rat  = strrchr(real, '@');
+        apply_alias(&name, &range);
+
+        /* A git/URL dependency deep in the tree cannot be fetched from the
+         * registry; shipping the bundle without it guarantees an offline
+         * failure, so fail the build while there is still a network. */
+        if (range && spec_is_unbundleable(range)) {
+            fprintf(stderr,
+                    "packmule: cannot bundle %s's dependency %s@%s:\n"
+                    "          git/URL/path dependencies have no registry "
+                    "tarball to download.\n",
+                    pkg->name, name, range);
             pm_free(name);
-            if (rat && rat != real) {
-                name = pm_strndup(real, (size_t)(rat - real));
-                char *nrange = (rat[1] != '\0') ? pm_strdup(rat + 1) : NULL;
-                pm_free(range);
-                range = nrange;
-            } else {
-                name = pm_strdup(real);
-                pm_free(range);
-                range = NULL;
-            }
+            pm_free(range);
+            return -1;
         }
 
-        if (!package_list_contains_name(seen, name)) {
+        Package *existing = package_list_find_name(seen, name);
+        if (existing) {
+            if (existing->url) {
+                /* Already resolved: the selected version must satisfy this
+                 * dependent's range too, or the offline install will try
+                 * (and fail) to fetch a second version from the registry. */
+                if (range && existing->version &&
+                    semver_satisfies(existing->version, range) == 0)
+                    fprintf(stderr,
+                            "packmule: warning: %s requires %s@%s but %s is "
+                            "already selected; the offline install may fail\n",
+                            pkg->name, name, range, existing->version);
+            } else if (range) {
+                /* Still queued: narrow its spec so the eventual resolution
+                 * honours every dependent (space is AND in node-semver).
+                 * "||" alternation cannot be intersected by concatenation;
+                 * keep the first spec and let the bundle check catch any
+                 * real mismatch. */
+                if (!existing->version || is_any_version(existing->version)) {
+                    pm_free(existing->version);
+                    existing->version = pm_strdup(range);
+                } else if (strcmp(existing->version, range) != 0 &&
+                           !strstr(existing->version, "||") &&
+                           !strstr(range, "||")) {
+                    char *merged = pm_asprintf("%s %s",
+                                               existing->version, range);
+                    pm_free(existing->version);
+                    existing->version = merged;
+                }
+            }
+        } else {
             package_list_add(out, package_create(name, range));
             added++;
         }
@@ -439,7 +784,9 @@ static int npm_get_deps(const Registry *self, const Package *pkg,
 
 static int npm_detect(const char *basename)
 {
-    return strcmp(basename, "package.json") == 0;
+    return strcmp(basename, "package.json")       == 0 ||
+           strcmp(basename, "package-lock.json")  == 0 ||
+           strcmp(basename, "npm-shrinkwrap.json") == 0;
 }
 
 /* ── Registry instance ───────────────────────────────────────────────────── */

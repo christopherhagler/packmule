@@ -3,6 +3,7 @@
 #include "network.h"
 #include "package.h"
 #include "registry.h"
+#include "registry_internal.h"
 #include "utils.h"
 #include "version.h"
 
@@ -172,6 +173,79 @@ static void verify_pypi_bundle(const char *output_dir, const char *arch,
                 " not resolve the bundle without an index.\n"
                 "          The bundle may not install on the target machine."
                 " (Note: the check requires pip >= 22.2.)\n");
+}
+
+/*
+ * verify_npm_bundle — npm counterpart of verify_pypi_bundle: run the bundle's
+ * own install.sh in a scratch project with the registry pointed at an
+ * unroutable address and an empty npm cache (a warm cache on THIS machine
+ * could silently satisfy a dependency missing from the bundle).  Any gap in
+ * the bundled closure surfaces here instead of on the air-gapped machine.
+ *
+ * For a lockfile bundle the scratch package.json is synthesized from the
+ * lock's root entry, because `npm ci` refuses a mismatched pair.  Scripts
+ * are disabled: postinstall hooks may need toolchains this machine lacks.
+ * npm tarballs are platform-neutral, so this runs regardless of target arch.
+ */
+static void verify_npm_bundle(const char *output_dir)
+{
+    char abs[PATH_MAX];
+    if (!realpath(output_dir, abs) || strchr(abs, '\'')) {
+        printf("packmule: skipping offline install check "
+               "(cannot resolve output path)\n");
+        return;
+    }
+
+    printf("packmule: checking the bundle installs offline (install.sh) ...\n");
+    fflush(stdout);
+
+    char *cmd = pm_asprintf(
+        "d=$(mktemp -d) || exit 1; cd \"$d\" || exit 1; "
+        "export npm_config_cache=\"$d/cache\" npm_config_ignore_scripts=true; "
+        "if [ -f '%s/package-lock.json' ]; then "
+            "command -v node >/dev/null 2>&1 || exit 127; "
+            "node -e '"
+                "const fs=require(\"fs\");"
+                "const l=JSON.parse(fs.readFileSync(process.argv[1],\"utf8\"));"
+                "const r=(l.packages||{})[\"\"]||{};"
+                "fs.writeFileSync(\"package.json\",JSON.stringify({"
+                    "name:r.name||\"packmule-verify\","
+                    "version:r.version||\"0.0.0\","
+                    "dependencies:r.dependencies||{},"
+                    "devDependencies:r.devDependencies||{},"
+                    "optionalDependencies:r.optionalDependencies||{},"
+                    "peerDependencies:r.peerDependencies||{}}));"
+            "' '%s/package-lock.json' || exit 1; "
+        "else printf '{}' > package.json; fi; "
+        "sh '%s/install.sh' >/dev/null; "
+        "rc=$?; cd /; rm -rf \"$d\"; exit $rc", abs, abs, abs);
+
+    int   ok = -1, no_npm = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Unroutable registry: any resolution gap fails fast instead of
+         * silently succeeding via the network. */
+        setenv("npm_config_registry", "http://127.0.0.1:9/", 1);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    } else if (pid > 0) {
+        int st;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st)) {
+            if (WEXITSTATUS(st) == 0)        ok = 0;
+            else if (WEXITSTATUS(st) == 127) no_npm = 1;
+        }
+    }
+    pm_free(cmd);
+
+    if (ok == 0)
+        printf("packmule: offline install check PASSED\n");
+    else if (no_npm)
+        printf("packmule: skipping offline install check (no local npm)\n");
+    else
+        fprintf(stderr,
+                "packmule: warning: offline install check FAILED -- npm could"
+                " not build an install tree from the bundle alone.\n"
+                "          The bundle may not install on the target machine.\n");
 }
 
 static void usage(const char *prog)
@@ -454,9 +528,12 @@ int main(int argc, char *argv[])
         }
 
         /* Enqueue transitive deps via the registry's own get_deps hook.
-         * All format-specific filtering is the registry's responsibility. */
-        if (reg->get_deps)
-            reg->get_deps(reg, pkg, reqs, reqs);
+         * All format-specific filtering is the registry's responsibility.
+         * A negative return means a dependency that cannot be bundled at
+         * all (e.g. an npm git/URL dep) — fail the build now, while there
+         * is still a network to fix it with. */
+        if (reg->get_deps && reg->get_deps(reg, pkg, reqs, reqs) < 0)
+            exit_code = EXIT_FAILURE;
 
         if (dry_run) {
             if (!was_pinned && pkg->version)
@@ -558,11 +635,26 @@ int main(int argc, char *argv[])
             bopts.output_dir    = output_dir;
             bopts.registry_name = reg->name;
             bopts.packages      = reqs;
+            bopts.aux_file      = NULL;
+            bopts.aux_name      = NULL;
+
+            /* An npm bundle built from a lockfile must carry that lock:
+             * install.sh replays its exact tree with `npm ci --offline`. */
+            char *npm_lock = NULL;
+            if (strcmp(reg->name, "npm") == 0 &&
+                (npm_lock = npm_effective_lockfile(manifest_file)) != NULL) {
+                bopts.aux_file = npm_lock;
+                bopts.aux_name = "package-lock.json";
+            }
+
             if (bundle_create(&bopts) != 0)
                 exit_code = EXIT_FAILURE;
             else if (strcmp(reg->name, "pypi") == 0)
                 verify_pypi_bundle(output_dir, arch, detected_arch,
                                    target_os, host_os, py_minor);
+            else if (strcmp(reg->name, "npm") == 0)
+                verify_npm_bundle(output_dir);
+            pm_free(npm_lock);
         }
     }
 

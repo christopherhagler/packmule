@@ -118,7 +118,7 @@ packmule -h | --help
 |---|---|
 | `-f <file>`, `--manifest` | Path to the package manifest (**required**) |
 | `-o <dir>` | Output directory (default: `.`); created if absent |
-| `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` → `pypi`, `package.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
+| `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` → `pypi`, `package.json` / `package-lock.json` / `npm-shrinkwrap.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
 | `-a <arch>`, `--arch` | Target CPU architecture (default: current machine). Use `any` for universal/source only |
 | `-u <url>`, `--repo-url` | Repository base URL — required for `rpm`; optional for `pypi`/`npm` (overrides public endpoint) |
 | `-b`, `--bundle` | Write `manifest.json` and `install.sh`, then compress output to `<dir>.tar.gz` |
@@ -207,17 +207,21 @@ Install scripts by backend:
 | Backend | Command |
 |---|---|
 | `pypi` | `python3 -m pip install --no-index --find-links="$DIR" --no-build-isolation -r "$DIR/requirements.txt"` (installs bundled setuptools/wheel first when the bundle contains an sdist) |
-| `npm` | single `npm install --no-audit --no-fund` invocation over every `.tgz` in the directory |
+| `npm` | lockfile bundle: `npm ci --offline --omit=dev` replaying the bundled `package-lock.json` against the bundled tarballs; flat bundle: one `npm install --offline --omit=dev --no-save` over every `.tgz` (devDependencies hidden from npm for the duration and the manifest restored afterwards) |
 | `rpm` | `dnf install -y --disablerepo='*' *.rpm`, falling back to `rpm -Uvh` |
 
 Bundling is skipped if any package failed to download. The output directory
 is always left intact alongside the archive.
 
-After a pypi bundle is created, packmule verifies it end-to-end by running
-`pip install --dry-run --no-index` against only the bundled files (when this
-machine matches the bundle's target os/arch/python and pip is ≥ 22.2), so a
-bundle that cannot install offline fails **here**, not on the air-gapped
-machine.
+After a bundle is created, packmule verifies it end-to-end so a bundle that
+cannot install offline fails **here**, not on the air-gapped machine:
+
+- **pypi** — `pip install --dry-run --no-index` against only the bundled
+  files (when this machine matches the bundle's target os/arch/python and
+  pip is ≥ 22.2).
+- **npm** — runs the generated `install.sh` in a scratch project with the
+  registry pointed at an unroutable address and an empty npm cache, with
+  scripts disabled.
 
 ### Private registries
 
@@ -293,23 +297,49 @@ Integrity: SHA-256 hex digest from the PyPI JSON API (`urls[].digests.sha256`).
 
 ### npm — Node.js packages
 
-Reads the `"dependencies"` object from a `package.json` file.
-`devDependencies`, `peerDependencies`, and `optionalDependencies` are ignored.
+**Lockfile mode (preferred).** When the manifest is a `package-lock.json` /
+`npm-shrinkwrap.json` (lockfileVersion ≥ 2) — or a valid one sits next to
+the given `package.json` — packmule downloads exactly the tarballs npm
+itself resolved, including **multiple versions of one package** at
+different nesting positions (something a flat per-name bundle cannot
+represent). The lock ships inside the bundle, and `install.sh` replays the
+exact tree with `npm ci --offline`, pointing every entry at its bundled
+file and restoring the project's own lockfile afterwards.
 
+**Range mode (no lockfile).** The `dependencies`, `optionalDependencies`,
+and non-optional `peerDependencies` objects of `package.json` are walked
+(npm 7+ installs peers by default, so they must be in the bundle;
+`devDependencies` stay out — `install.sh` runs npm with `--omit=dev`).
 Exact versions (`4.18.2`) are queried directly; range specifiers
 (`^4.18.2`, `~1.2.3`, `>=1.0.0`, `1.x`, `a || b`) resolve to the highest
-published version satisfying the range, mirroring npm's own selection.
-Aliases (`"dep": "npm:real-pkg@^1.0"`) resolve to the aliased package.
+published version satisfying the range; dist-tags (`next`, `beta`) resolve
+through the packument's `dist-tags`. Aliases (`"dep": "npm:real-pkg@^1.0"`)
+resolve to the aliased package. When two dependents constrain the same
+still-queued package, their ranges intersect; if the tree turns out to need
+two versions of one package at once, the build fails with a pointer to
+lockfile mode instead of shipping a bundle that cannot install.
 
-Transitive dependencies are resolved from the `dependencies` field of each
-resolved version document. Scoped packages (`@scope/name`) are supported.
+In both modes, `git:`/`github:`/`file:`/`link:`/URL dependencies are a hard
+build-time error — they have no registry tarball, and a bundle silently
+missing them would only fail later, on the air-gapped machine.
+
+After `--bundle`, packmule verifies the result by running the generated
+`install.sh` in a scratch project with the npm registry pointed at an
+unroutable address and an **empty npm cache**, so a missing dependency
+fails the build here rather than on the target.
+
+Transitive dependencies are resolved from each version document's
+dependency objects. Scoped packages (`@scope/name`) are supported; their
+tarballs are prefixed with the scope (`babel-core-7.24.0.tgz`) to avoid
+basename collisions.
 
 Integrity: SHA-512 SRI from `dist.integrity` (`sha512-<base64>`). Packages
 published before ~2017 that lack `dist.integrity` are refused rather than
 silently falling back to the weaker SHA-1 `dist.shasum`.
 
 ```bash
-packmule -f package.json -o ./vendor -t npm
+packmule -f package-lock.json -o ./vendor -t npm   # exact tree (preferred)
+packmule -f package.json      -o ./vendor -t npm   # uses sibling lock if present
 ```
 
 ### rpm — RPM repositories (DNF/YUM format)
@@ -363,7 +393,7 @@ The unit suites are fully offline — no network access required:
 | `test_pep508` | Dependency-spec parsing (name/extras/pin/constraint) and environment-marker evaluation |
 | `test_wheeltag` | Wheel filename classification, platform/arch/python tag matching, manylinux glibc floors |
 | `test_registry_pypi` | requirements.txt parsing (includes, extras, constraints) and `get_deps`; wheel selection via `pypi_parse_response` |
-| `test_registry_npm` | npm manifest parsing and `get_deps`: dep enqueuing and dedup |
+| `test_registry_npm` | npm manifest/lockfile parsing and `get_deps`: aliases, peers, range intersection, dedup |
 | `test_registry_rpm` | RPM manifest parsing: name-only, name-version, hyphenated names |
 | `test_hash` | `sha256_file`, `verify_file` — SHA-256 hex and SHA-512 SRI paths |
 | `test_bundle` | Bundle creation for all three backends; skips packages missing from disk |
@@ -380,7 +410,7 @@ ctest --test-dir build -L e2e --output-on-failure
 | Test | What it proves |
 |---|---|
 | `e2e_pypi` | manifest → resolve → download → bundle → extract → **offline install into a fresh venv** (`--no-index`) → import check |
-| `e2e_npm` | manifest → bundle → extract → install with the registry pointed at an **unroutable address** → `require()` check |
+| `e2e_npm` | two full cycles — flat (ranges, scoped package, devDeps excluded) and lockfile (a tree needing two `debug` versions) — bundle → extract → install with the registry pointed at an **unroutable address** → `require()` and nesting checks |
 | `e2e_rpm` | repomd.xml → primary.xml decompress → package match → sha256/version extraction against a live DNF repo (dry run) |
 
 A missing prerequisite (`python3`, `npm`) skips the test rather than failing it,

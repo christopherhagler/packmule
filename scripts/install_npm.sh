@@ -3,9 +3,77 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# ── Lockfile bundle ─────────────────────────────────────────────────────────
+# The bundle carries the project's package-lock.json: replay its exact tree
+# (including nested duplicate versions npm cannot hoist) with `npm ci`,
+# pointing every entry at its bundled tarball.  The project's own lockfile is
+# restored afterwards so later online npm use is unaffected.
+if [ -f "$DIR/package-lock.json" ]; then
+    [ -f package.json ] || {
+        echo "install.sh: run this from your project directory (no package.json here)" >&2
+        exit 1
+    }
+    command -v node >/dev/null 2>&1 || {
+        echo "install.sh: node is required" >&2
+        exit 1
+    }
+
+    if [ -f package-lock.json ]; then
+        cp package-lock.json .packmule-package-lock.json.bak
+        trap 'mv .packmule-package-lock.json.bak package-lock.json' EXIT
+    else
+        trap 'rm -f package-lock.json' EXIT
+    fi
+
+    # Rewrite each entry's resolved URL to its bundled file.  The filename
+    # rule (scope prefixed onto the URL basename) mirrors packmule's
+    # npm_local_filename() -- keep the two in sync.
+    node -e '
+        const fs = require("fs");
+        const dir = process.argv[1];
+        const lock = JSON.parse(fs.readFileSync(dir + "/package-lock.json", "utf8"));
+        for (const [key, e] of Object.entries(lock.packages || {})) {
+            if (!key || !e.resolved || !e.resolved.startsWith("http")) continue;
+            const name = key.split("node_modules/").pop();
+            const base = e.resolved.split("/").pop();
+            const fn = name[0] === "@"
+                ? name.slice(1).split("/")[0] + "-" + base : base;
+            e.resolved = "file:" + dir + "/" + fn;
+        }
+        fs.writeFileSync("package-lock.json", JSON.stringify(lock, null, 2));
+    ' "$DIR"
+
+    # --offline: never touch the registry (devDependencies stay un-fetched
+    # thanks to --omit=dev); --no-audit/--no-fund: no post-install network.
+    npm ci --offline --omit=dev --no-audit --no-fund
+    exit 0
+fi
+
+# ── Flat tarball bundle (no lockfile) ───────────────────────────────────────
+set -- "$DIR"/*.tgz
+[ -e "$1" ] || { echo "install.sh: no .tgz packages found in $DIR" >&2; exit 1; }
+
+# npm resolves devDependencies from the registry even with --omit=dev (they
+# are recorded in the lockfile despite not being installed), which fails on
+# an air-gapped machine.  They are not bundled, so hide them from npm for the
+# duration of the install; the original package.json is restored on exit.
+if [ -f package.json ] && \
+   node -e 'process.exit(require("./package.json").devDependencies ? 0 : 1)' \
+        2>/dev/null; then
+    cp package.json .packmule-package.json.bak
+    trap 'mv .packmule-package.json.bak package.json' EXIT
+    node -e '
+        const fs = require("fs");
+        const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+        delete p.devDependencies;
+        fs.writeFileSync("package.json", JSON.stringify(p, null, 2));
+    '
+fi
+
 # Install every bundled tarball in a single npm invocation so npm can satisfy
 # shared dependencies from the bundle itself instead of asking the registry.
-# --no-audit / --no-fund suppress the network calls npm otherwise makes after
-# an install, which would fail (or hang) on an air-gapped machine.
-set -- "$DIR"/*.tgz
-npm install --no-audit --no-fund "$@"
+# --offline stops npm probing the registry for newer versions (each probe
+# retries with ~70s of backoff on an air-gapped machine before giving up);
+# --no-save keeps npm from rewriting the project manifest to file: specs;
+# --no-audit / --no-fund suppress npm's post-install network calls.
+npm install --offline --omit=dev --no-save --no-audit --no-fund "$@"

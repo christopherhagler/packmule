@@ -52,6 +52,16 @@ int find_rpm_package(const char *primary_xml,
  */
 int npm_parse_response(const char *json, Package *pkg);
 
+/*
+ * npm_effective_lockfile — the lockfile a bundle built from `manifest_path`
+ * uses: the manifest itself when it is a package-lock.json/npm-shrinkwrap.json
+ * (identified by content, not name), else a valid lock sitting next to it.
+ * Returns a heap path (caller frees with pm_free) or NULL when the bundle is
+ * built from package.json ranges alone.  main.c copies the returned file into
+ * the bundle so install.sh can replay the exact tree with `npm ci --offline`.
+ */
+char *npm_effective_lockfile(const char *manifest_path);
+
 /* ── registry_pypi.c ─────────────────────────────────────────────────────── */
 
 /*
