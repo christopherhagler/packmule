@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(packmule VERSION 0.1.0 LANGUAGES C)
+project(packmule VERSION 0.2.0 LANGUAGES C)
 
 # Provides CMAKE_INSTALL_BINDIR, CMAKE_INSTALL_MANDIR, etc.
 # Defaults: bin, share/man, lib, include — relative to CMAKE_INSTALL_PREFIX.

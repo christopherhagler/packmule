@@ -1,5 +1,5 @@
 Name:           packmule
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Air-gapped multi-registry package bundler
 
@@ -50,5 +50,12 @@ Supported registries:
 %{_mandir}/man1/packmule.1*
 
 %changelog
+* Fri Jul 03 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.2.0-1
+- npm: package-lock.json bundling with exact-tree offline replay (npm ci --offline)
+- npm: bundle peer and optional dependencies; devDependencies handled offline
+- npm: build-time offline install verification against an empty npm cache
+- pypi: PEP 440 range constraints, extras, sdist build tooling, offline pip check
+- Opt-in end-to-end test suite (PACKMULE_E2E_TESTS)
+
 * Wed Jun 18 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.1.0-1
 - Initial package
