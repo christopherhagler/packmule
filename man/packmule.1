@@ -15,6 +15,10 @@ packmule \- resolve, download, and bundle packages for air-gapped environments
 .IR type ]
 .RB [ \-a
 .IR arch ]
+.RB [ \-s
+.IR os ]
+.RB [ \-p
+.IR ver ]
 .RB [ \-u
 .IR url ]
 .RB [ \-b ]
@@ -116,6 +120,34 @@ and
 .B arm64
 are treated as equivalent (same CPU, different OS naming conventions).
 .TP
+.BR \-s " os" ", " \-\-os " os"
+Target operating system for wheel selection
+.RB ( pypi
+backend only): one of
+.BR linux ,
+.BR macos ,
+.BR windows ,
+or
+.B any
+to disable OS filtering.
+Defaults to the OS of the current machine.
+.TP
+.BR \-p " ver" ", " \-\-python " ver"
+Target CPython version for wheel selection and environment-marker
+evaluation
+.RB ( pypi
+backend only), e.g.\&
+.IR 3.12 .
+Accepts
+.IR 3.12 ,
+.IR 3.12.2 ,
+.IR 312 ,
+or
+.IR cp312 .
+Defaults to the version of the local
+.B python3
+interpreter; when none is found, wheels are matched by architecture only.
+.TP
 .BR \-u " url" ", " \-\-repo\-url " url"
 Base URL of the upstream package repository.
 Required when using the
@@ -156,14 +188,18 @@ version, filename, and SHA\-256 digest.
 The install script is pre-configured for the active registry backend:
 .B pip install \-\-no\-index \-\-find\-links
 for
-.BR pypi ,
-a loop of
-.B npm install
-calls over each
-.I .tgz
+.BR pypi ;
 for
 .BR npm ,
-and
+either
+.B npm ci \-\-offline
+replaying a bundled
+.I package-lock.json
+(lockfile bundles) or a single offline
+.B npm install
+over every bundled
+.I .tgz
+(flat bundles); and
 .B dnf install \-\-disablerepo=\'*\'
 (falling back to
 .BR "rpm \-Uvh" )
@@ -270,6 +306,13 @@ The dry-run mode
 .RB ( \-n )
 prints the full resolved list without a progress bar.
 .PP
+Re-runs are idempotent: a file already present in the output directory with a
+matching digest is not downloaded again \(em it is reported with a
+.B (cached)
+marker.
+Missing, truncated, or stale files are re-downloaded and overwritten, so an
+interrupted run can simply be repeated.
+.PP
 Package name deduplication for the
 .B pypi
 backend follows PEP\~503: the characters
@@ -281,28 +324,26 @@ are treated as equivalent, and comparisons are case-insensitive.
 .PP
 For the
 .B pypi
-backend, only
-.B ==
-version specifiers result in a pinned query.
-Broader specifiers
-.RB ( >= ", " <= ", " ~= ", " != )
-cause the version to be treated as unpinned and resolved to the latest
-release.
+backend, PEP\~440 version specifiers
+.RB ( == ", " >= ", " < ", " ~= ", " != ", " ==x.* )
+are honoured: each package resolves to the highest release satisfying the
+intersection of all ranges requested by its dependents.
 Extras-gated transitive dependencies
 .RI ( "; extra == 'security'" )
-are filtered out during transitive resolution \(em optional extras are never
-followed automatically.
-Other environment markers
+are followed only when the parent was requested with that extra.
+OS and Python-version environment markers
 .RI ( "; python_version > '3.8'" )
-are not evaluated; all non-extras transitive dependencies are queued
-regardless of their marker conditions.
+are evaluated against the target platform
+.RB ( \-a ", " \-s ", " \-p );
+markers that cannot be fully evaluated keep the dependency rather than risk
+dropping one.
 .PP
 For the
 .B npm
-backend, exact versions (digits and dots only) are queried directly; all
-range specifiers resolve to the
-.B latest
-tag.
+backend, exact versions are queried directly; range specifiers
+.RB ( ^ ", " ~ ", " >= ", " 1.x ", " "a || b" )
+resolve to the highest published version satisfying the range, and
+dist-tags resolve through the packument.
 Packages published before approximately 2017 that lack a
 .B dist.integrity
 SHA\-512 field are refused rather than falling back to the weaker SHA\-1

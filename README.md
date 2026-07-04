@@ -109,7 +109,7 @@ cmake --build build --parallel
 ## Usage
 
 ```
-packmule -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-u <url>] [-b] [-n]
+packmule -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-s <os>] [-p <ver>] [-u <url>] [-b] [-n]
 packmule -V | --version
 packmule -h | --help
 ```
@@ -120,6 +120,8 @@ packmule -h | --help
 | `-o <dir>` | Output directory (default: `.`); created if absent |
 | `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` → `pypi`, `package.json` / `package-lock.json` / `npm-shrinkwrap.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
 | `-a <arch>`, `--arch` | Target CPU architecture (default: current machine). Use `any` for universal/source only |
+| `-s <os>`, `--os` | *(pypi only)* Target OS for wheel selection: `linux`, `macos`, `windows`, or `any` (default: the host OS) |
+| `-p <ver>`, `--python` | *(pypi only)* Target CPython version for wheel selection and environment markers, e.g. `3.12` (default: the local `python3`) |
 | `-u <url>`, `--repo-url` | Repository base URL — required for `rpm`; optional for `pypi`/`npm` (overrides public endpoint) |
 | `-b`, `--bundle` | Write `manifest.json` and `install.sh`, then compress output to `<dir>.tar.gz` |
 | `-n`, `--dry-run` | Resolve and print what would be downloaded — no files written |
@@ -164,6 +166,19 @@ packmule: mode      : DRY RUN -- resolve only, no files written
   ...
 
 packmule: dry run complete -- 8/8 package(s) resolved, 0 downloaded
+```
+
+### Re-running after a failure
+
+Re-runs are idempotent: before downloading, packmule checks whether the file
+already exists in the output directory with a matching digest. Verified files
+are skipped and marked `(cached)` in the output; missing, truncated, or
+stale files (hash mismatch) are re-downloaded and overwritten. A run that
+failed partway can simply be repeated — only the gap is fetched.
+
+```
+  ✓ [ 1/53] requests-2.31.0-py3-none-any.whl  (62.7 KB, cached)
+  ✓ [ 2/53] numpy-2.1.0-cp310-cp310-manylinux_2_17_x86_64.whl  (13.1 MB)
 ```
 
 ### Bundling for transport
@@ -540,15 +555,30 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 
 ## Roadmap
 
-- [x] SHA-256 and SHA-512 SRI verification of every downloaded file
-- [x] Dry-run mode (`-n`)
-- [x] Registry vtable — pluggable backends
-- [x] PyPI backend: manifest parsing, resolve, download, SHA-256 verify
-- [x] Transitive dependency resolution (PyPI `requires_dist`, npm `dependencies`)
-- [x] Architecture-aware package selection (`-a <arch>`)
-- [x] npm backend: manifest parsing, resolve, SHA-512 SRI verify
-- [x] RPM backend: manifest parsing, resolve via repomd.xml/primary.xml, SHA-256 verify
-- [x] Private/corporate registry support (`-u` for all backends)
-- [x] Bundle output — `manifest.json`, `install.sh`, and `.tar.gz` (`--bundle`)
-- [x] Per-file download progress bar (percent + speed) with permanent ✓/✗ lines;
-      auto-suppressed to plain output when stdout is not a terminal
+### Next up
+
+- [ ] RPM transitive dependency resolution — follow `<rpm:requires>` /
+      `<rpm:provides>` in `primary.xml` so the RPM backend resolves
+      dependencies automatically like PyPI and npm
+- [ ] PyPI lockfile mode — exact-tree bundling from `uv.lock`, `poetry.lock`,
+      and PEP 751 `pylock.toml`, mirroring the npm lockfile mode
+- [ ] Registry authentication — `~/.netrc`, token via flag/environment
+      variable, and a custom CA bundle (`--cacert`) for TLS-intercepting
+      corporate proxies
+
+### Planned
+
+- [ ] `verify` subcommand — re-check an existing bundle against its
+      `manifest.json`, and hash-verify inside `install.sh` before installing
+- [ ] SBOM output — emit CycloneDX/SPDX from the resolved package set
+- [ ] Parallel downloads with retry/backoff and HTTP Range resume
+- [ ] Debian/apt backend
+
+### Later
+
+- [ ] Multi-arch bundles — one invocation targeting several architectures
+- [ ] Delta bundles — diff against a previous bundle's `manifest.json` and
+      ship only changed packages
+- [ ] Signature verification beyond digests — GPG for RPMs, PyPI
+      attestations, npm provenance
+- [ ] More backends: Go modules, crates.io, Maven
