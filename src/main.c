@@ -4,7 +4,9 @@
 #include "package.h"
 #include "registry.h"
 #include "registry_internal.h"
+#include "resolve.h"
 #include "utils.h"
+#include "verify.h"
 #include "version.h"
 
 #include <ctype.h>
@@ -17,8 +19,34 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
-#include <sys/wait.h>
 #include <unistd.h>
+
+/* ── Terminal presentation ───────────────────────────────────────────────── */
+
+/*
+ * Colour and in-place redraws only make sense on a terminal; when stdout is a
+ * pipe or a CI log we emit plain, permanent lines only.
+ */
+static struct {
+    int         tty;
+    const char *grn, *red, *ylw, *rst;
+} ui;
+
+static void ui_init(void)
+{
+    ui.tty = isatty(fileno(stdout));
+    ui.grn = ui.tty ? "\033[32m" : "";
+    ui.red = ui.tty ? "\033[31m" : "";
+    ui.ylw = ui.tty ? "\033[33m" : "";
+    ui.rst = ui.tty ? "\033[0m"  : "";
+}
+
+/* Erase the transient status line, if there is one. */
+static void ui_clear_line(void)
+{
+    if (ui.tty)
+        fputs("\r\033[K", stdout);
+}
 
 static void print_registry_list(void)
 {
@@ -34,19 +62,18 @@ static void print_registry_list(void)
 
 /*
  * bundle_clobbers_manifest — guard against a destructive `-o .` (or any output
- * dir that is the manifest's own directory): bundling writes manifest.json,
- * install.sh, and requirements.txt into the output dir, which would silently
- * overwrite the user's input manifest if it shares one of those names and
- * lives there.  Returns the colliding generated name, or NULL if safe.
+ * dir that is the manifest's own directory): bundling writes generated files
+ * into the output dir, which would silently overwrite the user's input
+ * manifest if it shares one of those names and lives there.  Returns the
+ * colliding generated name, or NULL if safe.
  */
 static const char *bundle_clobbers_manifest(const char *manifest_file,
                                             const char *output_dir)
 {
-    static const char *generated[] = { "manifest.json", "install.sh",
-                                        "requirements.txt" };
+    static const char *const generated[] = { "manifest.json", "install.sh",
+                                             "requirements.txt", "SHA256SUMS" };
 
-    const char *slash = strrchr(manifest_file, '/');
-    const char *mbase = slash ? slash + 1 : manifest_file;
+    const char *mbase = pm_basename(manifest_file);
 
     const char *match = NULL;
     for (size_t i = 0; i < sizeof(generated) / sizeof(generated[0]); i++)
@@ -91,7 +118,8 @@ static int parse_python_minor(const char *s)
  */
 static int detect_python_minor(void)
 {
-    FILE *fp = popen("python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null", "r");
+    FILE *fp = popen("python3 -c 'import sys; print(sys.version_info[1])'"
+                     " 2>/dev/null", "r");
     if (!fp) return 0;
     char buf[16] = {0};
     char *got = fgets(buf, sizeof(buf), fp);
@@ -117,142 +145,12 @@ static const char *normalize_os(const char *s)
     return NULL;
 }
 
-/*
- * verify_pypi_bundle — best-effort proof that the bundle actually installs
- * offline: run pip's resolver against ONLY the bundled files
- * (--dry-run --no-index).  This converts "fails on the air-gapped machine"
- * into "fails right here, while there is still a network to fix it with".
- *
- * Only meaningful when this machine matches the bundle's target platform;
- * otherwise it reports why it was skipped.  A failed check warns rather than
- * failing the run, because pip < 22.2 lacks --dry-run.
- */
-static void verify_pypi_bundle(const char *output_dir, const char *arch,
-                               const char *host_arch, const char *target_os,
-                               const char *host_os, int py_minor)
-{
-    int host_py = detect_python_minor();
-    if (host_py <= 0) {
-        printf("packmule: skipping offline install check (no local python3)\n");
-        return;
-    }
-    if ((py_minor > 0 && py_minor != host_py) ||
-        (target_os && (!host_os || strcmp(target_os, host_os) != 0)) ||
-        (arch && strcmp(arch, host_arch) != 0)) {
-        printf("packmule: skipping offline install check (bundle targets a "
-               "different os/arch/python than this machine)\n");
-        return;
-    }
-
-    printf("packmule: checking the bundle installs offline (pip --dry-run) ...\n");
-    fflush(stdout);
-
-    char *req   = pm_asprintf("%s/requirements.txt", output_dir);
-    char *links = pm_asprintf("--find-links=%s", output_dir);
-
-    int   ok  = -1;
-    pid_t pid = fork();
-    if (pid == 0) {
-        execlp("python3", "python3", "-m", "pip", "install", "--dry-run",
-               "--no-index", "--quiet", links, "--no-build-isolation",
-               "-r", req, (char *)NULL);
-        _exit(127);
-    } else if (pid > 0) {
-        int st;
-        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0)
-            ok = 0;
-    }
-    pm_free(req);
-    pm_free(links);
-
-    if (ok == 0)
-        printf("packmule: offline install check PASSED\n");
-    else
-        fprintf(stderr,
-                "packmule: warning: offline install check FAILED -- pip could"
-                " not resolve the bundle without an index.\n"
-                "          The bundle may not install on the target machine."
-                " (Note: the check requires pip >= 22.2.)\n");
-}
-
-/*
- * verify_npm_bundle — npm counterpart of verify_pypi_bundle: run the bundle's
- * own install.sh in a scratch project with the registry pointed at an
- * unroutable address and an empty npm cache (a warm cache on THIS machine
- * could silently satisfy a dependency missing from the bundle).  Any gap in
- * the bundled closure surfaces here instead of on the air-gapped machine.
- *
- * For a lockfile bundle the scratch package.json is synthesized from the
- * lock's root entry, because `npm ci` refuses a mismatched pair.  Scripts
- * are disabled: postinstall hooks may need toolchains this machine lacks.
- * npm tarballs are platform-neutral, so this runs regardless of target arch.
- */
-static void verify_npm_bundle(const char *output_dir)
-{
-    char abs[PATH_MAX];
-    if (!realpath(output_dir, abs) || strchr(abs, '\'')) {
-        printf("packmule: skipping offline install check "
-               "(cannot resolve output path)\n");
-        return;
-    }
-
-    printf("packmule: checking the bundle installs offline (install.sh) ...\n");
-    fflush(stdout);
-
-    char *cmd = pm_asprintf(
-        "d=$(mktemp -d) || exit 1; cd \"$d\" || exit 1; "
-        "export npm_config_cache=\"$d/cache\" npm_config_ignore_scripts=true; "
-        "if [ -f '%s/package-lock.json' ]; then "
-            "command -v node >/dev/null 2>&1 || exit 127; "
-            "node -e '"
-                "const fs=require(\"fs\");"
-                "const l=JSON.parse(fs.readFileSync(process.argv[1],\"utf8\"));"
-                "const r=(l.packages||{})[\"\"]||{};"
-                "fs.writeFileSync(\"package.json\",JSON.stringify({"
-                    "name:r.name||\"packmule-verify\","
-                    "version:r.version||\"0.0.0\","
-                    "dependencies:r.dependencies||{},"
-                    "devDependencies:r.devDependencies||{},"
-                    "optionalDependencies:r.optionalDependencies||{},"
-                    "peerDependencies:r.peerDependencies||{}}));"
-            "' '%s/package-lock.json' || exit 1; "
-        "else printf '{}' > package.json; fi; "
-        "sh '%s/install.sh' >/dev/null; "
-        "rc=$?; cd /; rm -rf \"$d\"; exit $rc", abs, abs, abs);
-
-    int   ok = -1, no_npm = 0;
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Unroutable registry: any resolution gap fails fast instead of
-         * silently succeeding via the network. */
-        setenv("npm_config_registry", "http://127.0.0.1:9/", 1);
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(127);
-    } else if (pid > 0) {
-        int st;
-        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st)) {
-            if (WEXITSTATUS(st) == 0)        ok = 0;
-            else if (WEXITSTATUS(st) == 127) no_npm = 1;
-        }
-    }
-    pm_free(cmd);
-
-    if (ok == 0)
-        printf("packmule: offline install check PASSED\n");
-    else if (no_npm)
-        printf("packmule: skipping offline install check (no local npm)\n");
-    else
-        fprintf(stderr,
-                "packmule: warning: offline install check FAILED -- npm could"
-                " not build an install tree from the bundle alone.\n"
-                "          The bundle may not install on the target machine.\n");
-}
-
 static void usage(const char *prog)
 {
     fprintf(stderr,
             "packmule " PACKMULE_VERSION " -- air-gapped package bundler\n"
             "\nUsage: %s -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-s <os>] [-p <ver>] [-u <url>] [-b] [-n]\n"
+            "       %s verify <bundle-dir>\n"
             "\n"
             "Options:\n"
             "  -f, --manifest <file>      Path to the package manifest (required)\n"
@@ -267,13 +165,22 @@ static void usage(const char *prog)
             "                             e.g. 3.12 (default: the local python3)\n"
             "  -u, --repo-url <url>       Repository base URL\n"
             "                             Required for rpm; optional override for pypi/npm\n"
-            "  -b, --bundle               Write manifest.json + install.sh, then create <dir>.tar.gz\n"
+            "  -b, --bundle               Write manifest.json + install.sh + SHA256SUMS,\n"
+            "                             then create <dir>.tar.gz\n"
             "  -n, --dry-run              Resolve and print what would be downloaded; no files written\n"
+            "  -j, --jobs <n>             Parallel downloads (1-%d, default %d)\n"
+            "      --no-verify            Skip the post-bundle offline install check\n"
+            "      --rpm-deps <mode>      rpm transitive deps: resolve (default) or none.\n"
+            "                             'resolve' bundles the full closure from the repo,\n"
+            "                             including base packages the target may already have\n"
             "  -V, --version              Print version and exit\n"
             "  -h, --help                 Show this help and exit\n"
             "\n"
+            "Commands:\n"
+            "  verify <dir>               Re-check an extracted bundle against its SHA256SUMS\n"
+            "\n"
             "Available registry types:\n",
-            prog);
+            prog, prog, NETWORK_MAX_JOBS, NETWORK_DEFAULT_JOBS);
     print_registry_list();
     fprintf(stderr,
             "\nExamples:\n"
@@ -282,18 +189,219 @@ static void usage(const char *prog)
             "  %s -f requirements.txt -n\n"
             "  %s -f package.json     -o ./vendor -t npm\n"
             "  %s -f packages.txt     -o ./vendor -t rpm -a x86_64 \\\n"
-            "      -u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os\n",
-            prog, prog, prog, prog, prog);
+            "      -u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os\n"
+            "  %s verify ./vendor\n",
+            prog, prog, prog, prog, prog, prog);
 }
+
+/* ── Resolution progress ─────────────────────────────────────────────────── */
+
+static int g_dry_run;
+
+static void on_resolve_progress(const Package *pkg, size_t index, size_t total,
+                                int round)
+{
+    if (g_dry_run || !ui.tty)
+        return;
+    /* Transient: the next status line or the phase summary overwrites it. */
+    printf("\r  [%zu/%zu] resolving %-.40s%s\033[K",
+           index + 1, total, pkg->name, round > 1 ? " (revisit)" : "");
+    fflush(stdout);
+}
+
+/* ── Dry run report ──────────────────────────────────────────────────────── */
+
+static void print_dry_run(const PackageList *reqs)
+{
+    for (size_t i = 0; i < reqs->count; i++) {
+        const Package *p = reqs->items[i];
+
+        printf("  [%zu/%zu] %s", i + 1, reqs->count, p->name);
+        if (p->constraint)
+            printf(" %s", p->constraint);
+
+        if (p->state != PKG_RESOLVED) {
+            printf(" -- %sFAILED%s\n", ui.red, ui.rst);
+            continue;
+        }
+
+        printf(" -> %s%s\n", p->version ? p->version : "?",
+               p->user_pinned ? " (pinned)" : "");
+
+        char *dg = digest_to_string(&p->digest);
+        printf("         file  : %s\n"
+               "         url   : %s\n"
+               "         digest: %s\n\n",
+               p->filename ? p->filename : "?",
+               p->url ? p->url : "?",
+               dg ? dg : "(none)");
+        pm_free(dg);
+    }
+}
+
+/* ── Download phase ──────────────────────────────────────────────────────── */
+
+typedef struct {
+    size_t             downloaded;
+    size_t             cached;
+    size_t             failed;
+    unsigned long long total_bytes;
+} DownloadStats;
+
+/* Transient "n/m downloading" line while transfers overlap. */
+static void on_download_done(const DownloadJob *job, size_t completed,
+                             size_t total)
+{
+    (void)job;
+    if (!ui.tty)
+        return;
+    printf("\r  downloading ... %zu/%zu\033[K", completed, total);
+    fflush(stdout);
+}
+
+/*
+ * download_all — fetch every resolved package into `output_dir`.
+ *
+ * Downloading only after resolution has reached a fixed point matters: the
+ * resolver may revise its choice of version for a package more than once, and
+ * fetching eagerly would leave the earlier candidates on disk and in the
+ * bundle.
+ *
+ * Files already present with the right digest are skipped first, so a re-run
+ * is cheap and interrupted runs resume.  The rest are fetched with several
+ * transfers in flight, then verified serially.
+ */
+static int download_all(const PackageList *reqs, const char *output_dir,
+                        int jobs_n, DownloadStats *out)
+{
+    DownloadStats st = {0};
+    int rc = 0;
+
+    /* Per-package destination paths, kept alive for the whole download. */
+    char **dests = pm_calloc(reqs->count, sizeof(char *));
+    DownloadJob *jobs = pm_calloc(reqs->count, sizeof(DownloadJob));
+    Package **job_pkg = pm_calloc(reqs->count, sizeof(Package *));
+    size_t njobs = 0;
+
+    for (size_t i = 0; i < reqs->count; i++) {
+        Package *pkg = reqs->items[i];
+        if (pkg->state != PKG_RESOLVED)
+            continue;
+
+        /* Defense in depth: the backends already basename their filenames,
+         * but never trust a registry-supplied name with path components. */
+        dests[i] = pm_asprintf("%s/%s", output_dir, pm_basename(pkg->filename));
+
+        /* Verified cache: if the file is already on disk and matches the
+         * expected digest, skip the download — re-runs become resumable and
+         * idempotent.  A missing, truncated, or stale file falls through to a
+         * fresh download that overwrites it. */
+        struct stat cst;
+        if (stat(dests[i], &cst) == 0 &&
+            digest_matches_file(dests[i], &pkg->digest)) {
+            char size_str[16] = "?";
+            pm_human_size((double)cst.st_size, size_str, sizeof(size_str));
+            st.total_bytes += (unsigned long long)cst.st_size;
+            printf("  %s✓%s %s  (%s, cached)\n",
+                   ui.grn, ui.rst, pkg->filename, size_str);
+            st.cached++;
+            continue;
+        }
+
+        jobs[njobs].url       = pkg->url;
+        jobs[njobs].dest_path = dests[i];
+        jobs[njobs].label     = pkg->filename;
+        job_pkg[njobs]        = pkg;
+        njobs++;
+    }
+
+    if (njobs > 0) {
+        /* One transfer at a time keeps the familiar per-file progress bar;
+         * beyond that a bar per file would fight over the same line, so the
+         * aggregate counter takes over. */
+        if (jobs_n == 1) {
+            for (size_t j = 0; j < njobs; j++) {
+                jobs[j].rc = download_file(jobs[j].url, jobs[j].dest_path,
+                                           jobs[j].label, ui.tty);
+                ui_clear_line();
+            }
+        } else {
+            download_many(jobs, njobs, jobs_n, on_download_done);
+            ui_clear_line();
+        }
+
+        for (size_t j = 0; j < njobs; j++) {
+            Package *pkg = job_pkg[j];
+
+            if (jobs[j].rc != 0) {
+                printf("  %s✗%s %s -- download failed\n",
+                       ui.red, ui.rst, pkg->name);
+                st.failed++;
+                rc = -1;
+                continue;
+            }
+            if (digest_verify_file(jobs[j].dest_path, &pkg->digest) != 0) {
+                remove(jobs[j].dest_path);
+                printf("  %s✗%s %s -- checksum mismatch\n",
+                       ui.red, ui.rst, pkg->filename);
+                st.failed++;
+                rc = -1;
+                continue;
+            }
+
+            char        size_str[16] = "?";
+            struct stat sb;
+            if (stat(jobs[j].dest_path, &sb) == 0) {
+                pm_human_size((double)sb.st_size, size_str, sizeof(size_str));
+                st.total_bytes += (unsigned long long)sb.st_size;
+            }
+            printf("  %s✓%s %s  (%s)\n",
+                   ui.grn, ui.rst, pkg->filename, size_str);
+            st.downloaded++;
+        }
+    }
+
+    for (size_t i = 0; i < reqs->count; i++)
+        pm_free(dests[i]);
+    pm_free(dests);
+    pm_free(jobs);
+    pm_free(job_pkg);
+
+    *out = st;
+    return rc;
+}
+
+/* ── verify subcommand ──────────────────────────────────────────────────── */
+
+static int cmd_verify(int argc, char *argv[])
+{
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s verify <bundle-dir>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    return bundle_verify_checksums(argv[2]) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
-    const char *manifest_file     = NULL;
-    const char *output_dir        = ".";
-    const char *registry_type     = NULL; /* NULL → auto-detect from filename */
-    const char *repo_url          = NULL;
-    int         dry_run           = 0;
-    int         do_bundle         = 0;
+    ui_init();
+
+    /* Subcommands are dispatched before getopt so their arguments are not
+     * mistaken for option values. */
+    if (argc > 1 && argv[1][0] != '-' && strcmp(argv[1], "verify") == 0)
+        return cmd_verify(argc, argv);
+
+    const char *manifest_file = NULL;
+    const char *output_dir    = ".";
+    const char *registry_type = NULL; /* NULL → auto-detect from filename */
+    const char *repo_url      = NULL;
+    int         dry_run       = 0;
+    int         do_bundle     = 0;
+    int         no_verify     = 0;
+    int         jobs_n        = NETWORK_DEFAULT_JOBS;
+    int         rpm_deps      = 1;   /* --rpm-deps resolve */
 
     /* Detect the current machine architecture as the default target.
      * Sized to hold any platform's utsname.machine (Linux 65, BSD/macOS 256)
@@ -309,38 +417,66 @@ int main(int argc, char *argv[])
             target_os = host_os;
         }
     }
-    char *arch = detected_arch[0] ? detected_arch : NULL;
+    const char *arch = detected_arch[0] ? detected_arch : NULL;
 
     /* Target CPython minor for wheel selection: -1 means "not set yet"; it is
      * resolved below to --python (if given) or the local python3. */
     int py_minor = -1;
 
+    enum { OPT_NO_VERIFY = 1000, OPT_RPM_DEPS };
     static const struct option LONG_OPTS[] = {
-        { "help",     no_argument,       NULL, 'h' },
-        { "manifest", required_argument, NULL, 'f' },
-        { "version",  no_argument,       NULL, 'V' },
-        { "type",     required_argument, NULL, 't' },
-        { "arch",     required_argument, NULL, 'a' },
-        { "os",       required_argument, NULL, 's' },
-        { "python",   required_argument, NULL, 'p' },
-        { "repo-url", required_argument, NULL, 'u' },
-        { "bundle",   no_argument,       NULL, 'b' },
-        { "dry-run",  no_argument,       NULL, 'n' },
-        { NULL,       0,                 NULL,  0  },
+        { "help",      no_argument,       NULL, 'h' },
+        { "manifest",  required_argument, NULL, 'f' },
+        { "version",   no_argument,       NULL, 'V' },
+        { "type",      required_argument, NULL, 't' },
+        { "arch",      required_argument, NULL, 'a' },
+        { "os",        required_argument, NULL, 's' },
+        { "python",    required_argument, NULL, 'p' },
+        { "repo-url",  required_argument, NULL, 'u' },
+        { "bundle",    no_argument,       NULL, 'b' },
+        { "dry-run",   no_argument,       NULL, 'n' },
+        { "jobs",      required_argument, NULL, 'j' },
+        { "no-verify", no_argument,       NULL, OPT_NO_VERIFY },
+        { "rpm-deps",  required_argument, NULL, OPT_RPM_DEPS  },
+        { NULL,        0,                 NULL,  0  },
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hVf:o:t:a:s:p:u:bn", LONG_OPTS, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hVf:o:t:a:s:p:u:j:bn",
+                              LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'h': usage(argv[0]); return EXIT_SUCCESS;
         case 'V': puts("packmule " PACKMULE_VERSION); return EXIT_SUCCESS;
-        case 'f': manifest_file     = optarg; break;
-        case 'o': output_dir        = optarg; break;
-        case 't': registry_type     = optarg; break;
-        case 'a': arch              = optarg; break;
-        case 'u': repo_url          = optarg; break;
-        case 'b': do_bundle         = 1;      break;
-        case 'n': dry_run           = 1;      break;
+        case 'f': manifest_file = optarg; break;
+        case 'o': output_dir    = optarg; break;
+        case 't': registry_type = optarg; break;
+        case 'a': arch          = optarg; break;
+        case 'u': repo_url      = optarg; break;
+        case 'b': do_bundle     = 1;      break;
+        case 'n': dry_run       = 1;      break;
+        case OPT_NO_VERIFY: no_verify = 1; break;
+        case OPT_RPM_DEPS:
+            if      (strcmp(optarg, "resolve") == 0) rpm_deps = 1;
+            else if (strcmp(optarg, "none")    == 0) rpm_deps = 0;
+            else {
+                fprintf(stderr,
+                        "packmule: invalid --rpm-deps value '%s'"
+                        " (expected 'resolve' or 'none')\n", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
+        case 'j': {
+            char *endp = NULL;
+            long  v    = strtol(optarg, &endp, 10);
+            if (!endp || *endp || v < 1 || v > NETWORK_MAX_JOBS) {
+                fprintf(stderr,
+                        "packmule: invalid --jobs value '%s' (expected 1-%d)\n",
+                        optarg, NETWORK_MAX_JOBS);
+                return EXIT_FAILURE;
+            }
+            jobs_n = (int)v;
+            break;
+        }
         case 's':
             if (strcasecmp(optarg, "any") == 0) {
                 target_os = NULL;
@@ -386,6 +522,12 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* "any" is a user-supplied sentinel meaning "no arch preference".
+     * Normalise it before anything reads it, so no code path can observe the
+     * literal string. */
+    if (arch && strcmp(arch, "any") == 0)
+        arch = NULL;
+
     /* Resolve the backend: an explicit --type wins; otherwise infer it from
      * the manifest filename (requirements.txt → pypi, package.json → npm, …),
      * falling back to pypi when the name is unrecognised. */
@@ -409,12 +551,21 @@ int main(int argc, char *argv[])
 
     /* Shallow-copy the static registry so we can inject runtime config without
      * mutating the shared constant. */
-    Registry       reg_inst  = *base_reg;
-    reg_inst.ctx             = (void *)arch;
-    reg_inst.repo_url        = repo_url;
-    reg_inst.py_minor        = py_minor;
-    reg_inst.target_os       = target_os;
-    const Registry *reg      = &reg_inst;
+    Registry  reg_inst = *base_reg;
+    RpmConfig rpm_cfg  = { arch, rpm_deps, NULL };
+    int       is_rpm   = (strcmp(reg_inst.name, "rpm") == 0);
+
+    /* ctx is the backend's own configuration.  pypi and npm need only the
+     * target architecture; rpm needs a struct (see RpmConfig). */
+    if (is_rpm)
+        reg_inst.ctx = &rpm_cfg;
+    else
+        memcpy(&reg_inst.ctx, &arch, sizeof(arch));  /* const char* → void* */
+
+    reg_inst.repo_url   = repo_url;
+    reg_inst.py_minor   = py_minor;
+    reg_inst.target_os  = target_os;
+    const Registry *reg = &reg_inst;
 
     if (network_init() != 0) {
         fprintf(stderr, "packmule: failed to initialise libcurl\n");
@@ -425,12 +576,6 @@ int main(int argc, char *argv[])
     if (!reqs) {
         network_cleanup();
         return EXIT_FAILURE;
-    }
-
-    /* "any" is a user-supplied sentinel meaning "no arch preference". */
-    if (arch && strcmp(arch, "any") == 0) {
-        arch          = NULL;
-        reg_inst.ctx  = NULL;
     }
 
     printf("packmule: backend   : %s%s\n",
@@ -479,154 +624,55 @@ int main(int argc, char *argv[])
         }
     }
 
-    int    exit_code = EXIT_SUCCESS;
-    size_t resolved   = 0;
-    size_t downloaded = 0;
-    size_t cached     = 0;
-    unsigned long long total_bytes = 0;
+    /* ── Phase 1: resolve to a fixed point ───────────────────────────────── */
 
-    /* Colour and in-place redraws only make sense on a terminal; when stdout
-     * is a pipe or CI log we emit plain, permanent lines only. */
-    int         tty   = isatty(fileno(stdout));
-    const char *c_grn = tty ? "\033[32m" : "";
-    const char *c_red = tty ? "\033[31m" : "";
-    const char *c_rst = tty ? "\033[0m"  : "";
-
-    /* Iterate with reqs->count as the upper bound so that transitive deps
-     * appended inside the loop are picked up automatically. */
-    for (size_t i = 0; i < reqs->count; i++) {
-        Package *pkg    = reqs->items[i];
-        int  was_pinned = (pkg->version != NULL);
-
-        /* In download mode show a transient "resolving" line (terminal only)
-         * that the download bar / result line overwrites.  In dry-run mode let
-         * output flow freely since the user is reviewing the full list. */
-        if (dry_run) {
-            printf("  [%zu/%zu] %s", i + 1, reqs->count, pkg->name);
-            if (pkg->version)
-                printf("==%s", pkg->version);
-            else if (pkg->constraint)
-                printf("%s", pkg->constraint);
-            fflush(stdout);
-        } else if (tty) {
-            printf("\r  [%zu/%zu] resolving %-.50s\033[K",
-                   i + 1, reqs->count, pkg->name);
-            fflush(stdout);
-        }
-
-        if (reg->resolve(reg, pkg) != 0) {
-            if (dry_run) {
-                printf(" -- FAILED\n");
-            } else {
-                if (tty) fputs("\r\033[K", stdout);
-                printf("  %s✗%s [%zu/%zu] %s -- could not resolve\n",
-                       c_red, c_rst, i + 1, reqs->count, pkg->name);
-            }
-            fprintf(stderr, "  packmule: could not resolve %s\n", pkg->name);
-            exit_code = EXIT_FAILURE;
-            continue;
-        }
-
-        /* Enqueue transitive deps via the registry's own get_deps hook.
-         * All format-specific filtering is the registry's responsibility.
-         * A negative return means a dependency that cannot be bundled at
-         * all (e.g. an npm git/URL dep) — fail the build now, while there
-         * is still a network to fix it with. */
-        if (reg->get_deps && reg->get_deps(reg, pkg, reqs, reqs) < 0)
-            exit_code = EXIT_FAILURE;
-
-        if (dry_run) {
-            if (!was_pinned && pkg->version)
-                printf(" (resolved: %s)", pkg->version);
-            putchar('\n');
-            printf("         file  : %s\n"
-                   "         url   : %s\n"
-                   "         sha256: %s\n\n",
-                   pkg->filename, pkg->url, pkg->sha256);
-            ++resolved;
-            continue;
-        }
-
-        char dest[4096];
-        /* Defense in depth: the backends already basename their filenames,
-         * but never trust a registry-supplied name with path components. */
-        int nw = snprintf(dest, sizeof(dest), "%s/%s",
-                          output_dir, pm_basename(pkg->filename));
-        if (nw < 0 || nw >= (int)sizeof(dest)) {
-            if (tty) fputs("\r\033[K", stdout);
-            printf("  %s✗%s [%zu/%zu] %s -- destination path too long\n",
-                   c_red, c_rst, i + 1, reqs->count, pkg->filename);
-            exit_code = EXIT_FAILURE;
-            ++resolved;
-            continue;
-        }
-
-        /* Verified cache: if the file is already on disk and matches the
-         * expected hash, skip the download — re-runs become resumable and
-         * idempotent.  A missing, truncated, or stale file (hash mismatch, or
-         * no hash to check against) falls through to a fresh download that
-         * overwrites it. */
-        struct stat cst;
-        if (stat(dest, &cst) == 0 && file_matches_hash(dest, pkg->sha256)) {
-            char size_str[16] = "?";
-            pm_human_size((double)cst.st_size, size_str, sizeof(size_str));
-            total_bytes += (unsigned long long)cst.st_size;
-            if (tty) fputs("\r\033[K", stdout); /* erase the transient line */
-            printf("  %s✓%s [%zu/%zu] %s  (%s, cached)\n",
-                   c_grn, c_rst, i + 1, reqs->count, pkg->filename, size_str);
-            ++cached;
-            ++resolved;
-            continue;
-        }
-
-        int dl_rc = download_file(pkg->url, dest, pkg->filename, tty);
-        if (tty) fputs("\r\033[K", stdout); /* erase the transient progress bar */
-
-        if (dl_rc != 0) {
-            printf("  %s✗%s [%zu/%zu] %s -- download failed\n",
-                   c_red, c_rst, i + 1, reqs->count, pkg->name);
-            exit_code = EXIT_FAILURE;
-            ++resolved;
-            continue;
-        }
-
-        if (verify_file(dest, pkg->sha256) != 0) {
-            remove(dest);
-            printf("  %s✗%s [%zu/%zu] %s -- checksum mismatch\n",
-                   c_red, c_rst, i + 1, reqs->count, pkg->filename);
-            exit_code = EXIT_FAILURE;
-            ++resolved;
-            continue;
-        }
-
-        /* Success: leave a permanent record with the on-disk size. */
-        char        size_str[16] = "?";
-        struct stat st;
-        if (stat(dest, &st) == 0) {
-            pm_human_size((double)st.st_size, size_str, sizeof(size_str));
-            total_bytes += (unsigned long long)st.st_size;
-        }
-        printf("  %s✓%s [%zu/%zu] %s  (%s)\n",
-               c_grn, c_rst, i + 1, reqs->count, pkg->filename, size_str);
-
-        ++downloaded;
-        ++resolved;
-    }
+    g_dry_run = dry_run;
+    ResolveStats rs;
+    int resolve_rc = resolve_all(reg, reqs, on_resolve_progress, &rs);
+    ui_clear_line();
 
     if (dry_run) {
-        printf("\npackmule: dry run complete -- %zu/%zu package(s) resolved"
-               ", 0 downloaded\n", resolved, reqs->count);
-    } else {
-        char total_str[16];
-        pm_human_size((double)total_bytes, total_str, sizeof(total_str));
-        printf("\npackmule: %zu/%zu package(s) ready in %s (%s)",
-               downloaded + cached, reqs->count, output_dir, total_str);
-        if (cached)
-            printf(" -- %zu downloaded, %zu cached", downloaded, cached);
-        putchar('\n');
+        print_dry_run(reqs);
+        printf("\npackmule: dry run complete -- %zu/%zu package(s) resolved "
+               "in %d round(s), 0 downloaded\n",
+               rs.resolved, reqs->count, rs.rounds);
+        package_list_destroy(reqs);
+        network_cleanup();
+        return resolve_rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
-    if (do_bundle && !dry_run) {
+    if (resolve_rc != 0) {
+        fprintf(stderr,
+                "\npackmule: resolution failed -- %zu of %zu package(s) could "
+                "not be resolved.\n"
+                "          No files were downloaded.\n",
+                rs.failed, reqs->count);
+        package_list_destroy(reqs);
+        network_cleanup();
+        return EXIT_FAILURE;
+    }
+
+    printf("packmule: resolved %zu package(s) in %d round(s)\n\n",
+           rs.resolved, rs.rounds);
+
+    /* ── Phase 2: download ───────────────────────────────────────────────── */
+
+    DownloadStats ds;
+    int dl_rc = download_all(reqs, output_dir, jobs_n, &ds);
+
+    char total_str[16];
+    pm_human_size((double)ds.total_bytes, total_str, sizeof(total_str));
+    printf("\npackmule: %zu/%zu package(s) ready in %s (%s)",
+           ds.downloaded + ds.cached, reqs->count, output_dir, total_str);
+    if (ds.cached)
+        printf(" -- %zu downloaded, %zu cached", ds.downloaded, ds.cached);
+    putchar('\n');
+
+    int exit_code = (dl_rc == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+
+    /* ── Phase 3: bundle ─────────────────────────────────────────────────── */
+
+    if (do_bundle) {
         if (exit_code != EXIT_SUCCESS) {
             fprintf(stderr,
                     "packmule: skipping bundle -- one or more packages failed\n");
@@ -647,18 +693,43 @@ int main(int argc, char *argv[])
                 bopts.aux_name = "package-lock.json";
             }
 
-            if (bundle_create(&bopts) != 0)
+            if (bundle_create(&bopts) != 0) {
                 exit_code = EXIT_FAILURE;
-            else if (strcmp(reg->name, "pypi") == 0)
-                verify_pypi_bundle(output_dir, arch, detected_arch,
-                                   target_os, host_os, py_minor);
-            else if (strcmp(reg->name, "npm") == 0)
-                verify_npm_bundle(output_dir);
+            } else if (!no_verify) {
+                BundleCheckResult cr = BUNDLE_CHECK_SKIPPED;
+                if (strcmp(reg->name, "pypi") == 0)
+                    cr = bundle_check_pypi(output_dir, arch, detected_arch,
+                                           target_os, host_os, py_minor);
+                else if (strcmp(reg->name, "npm") == 0)
+                    cr = bundle_check_npm(output_dir);
+
+                /*
+                 * A failed check means the package manager itself rejected
+                 * this closure.  That bundle will not install on the target,
+                 * so the build fails here rather than shipping it — SKIPPED
+                 * (prerequisites missing) is a different answer and is not
+                 * treated as a failure.
+                 */
+                if (cr == BUNDLE_CHECK_PASSED) {
+                    printf("packmule: offline install check PASSED\n");
+                } else if (cr == BUNDLE_CHECK_FAILED) {
+                    fprintf(stderr,
+                            "packmule: offline install check FAILED -- the "
+                            "package manager could not install this bundle "
+                            "without an index.\n"
+                            "          The bundle would not install on the "
+                            "target machine.  Re-run with --no-verify to "
+                            "build it anyway.\n");
+                    exit_code = EXIT_FAILURE;
+                }
+            }
             pm_free(npm_lock);
         }
     }
 
     package_list_destroy(reqs);
+    if (is_rpm)
+        rpm_backend_cleanup(&rpm_cfg);
     network_cleanup();
 
     return exit_code;

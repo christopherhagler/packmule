@@ -13,6 +13,14 @@ add_executable(test_registry test_registry.c)
 target_link_libraries(test_registry PRIVATE packmule_core)
 add_test(NAME test_registry COMMAND test_registry)
 
+add_executable(test_resolve test_resolve.c)
+target_link_libraries(test_resolve PRIVATE packmule_core)
+add_test(NAME test_resolve COMMAND test_resolve)
+
+add_executable(test_rpm_repo test_rpm_repo.c)
+target_link_libraries(test_rpm_repo PRIVATE packmule_core)
+add_test(NAME test_rpm_repo COMMAND test_rpm_repo)
+
 add_executable(test_semver test_semver.c)
 target_link_libraries(test_semver PRIVATE packmule_core)
 add_test(NAME test_semver COMMAND test_semver)

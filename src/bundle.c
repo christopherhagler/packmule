@@ -37,6 +37,40 @@ static int file_exists(const char *dir, const char *filename)
     return stat(path, &st) == 0;
 }
 
+/*
+ * write_text_file — write `len` bytes plus a trailing newline to `path`,
+ * checking every step.
+ *
+ * A short write or a failed close is how a full disk manifests, and both are
+ * invisible if only fopen() is checked: the bundle would be announced as
+ * ready while carrying a truncated manifest.  fclose() is where buffered data
+ * actually reaches the filesystem, so its return value is the one that
+ * matters most.  Returns 0 on success, -1 on any failure.
+ */
+static int write_text_file(const char *path, const char *data, size_t len)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "packmule: cannot write %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    int ok = (len == 0 || fwrite(data, 1, len, fp) == len) &&
+             fputc('\n', fp) != EOF;
+
+    if (fclose(fp) != 0)
+        ok = 0;
+
+    if (!ok) {
+        fprintf(stderr, "packmule: failed writing %s: %s\n",
+                path, strerror(errno));
+        remove(path);
+        return -1;
+    }
+    return 0;
+}
+
 /* ── Manifest ─────────────────────────────────────────────────────────────── */
 
 static int write_manifest(const BundleOptions *opts)
@@ -52,7 +86,10 @@ static int write_manifest(const BundleOptions *opts)
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", utc);
     cJSON_AddStringToObject(root, "created", ts);
 
+    /* Attach the array up front so an early return frees it with the root. */
     cJSON *pkgs = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "packages", pkgs);
+
     for (size_t i = 0; i < opts->packages->count; i++) {
         const Package *p = opts->packages->items[i];
         if (!p->filename || !file_exists(opts->output_dir, p->filename))
@@ -62,10 +99,26 @@ static int write_manifest(const BundleOptions *opts)
         cJSON_AddStringToObject(obj, "name",     p->name);
         cJSON_AddStringToObject(obj, "version",  p->version  ? p->version  : "");
         cJSON_AddStringToObject(obj, "filename", p->filename);
-        cJSON_AddStringToObject(obj, "sha256",   p->sha256   ? p->sha256   : "");
+
+        /* Record the digest as it was published upstream (algorithm and all)
+         * for provenance, plus the SHA-256 of the file as it sits in the
+         * bundle, which is what SHA256SUMS and `packmule verify` check. */
+        char *published = digest_to_string(&p->digest);
+        cJSON_AddStringToObject(obj, "published_digest",
+                                published ? published : "");
+        pm_free(published);
+
+        char path[4096], hex[DIGEST_HEX_MAX];
+        snprintf(path, sizeof(path), "%s/%s", opts->output_dir, p->filename);
+        if (digest_file_hex(path, DIGEST_SHA256, hex, sizeof(hex)) != 0) {
+            fprintf(stderr, "packmule: cannot hash %s for the manifest\n", path);
+            cJSON_Delete(obj);
+            cJSON_Delete(root);
+            return -1;
+        }
+        cJSON_AddStringToObject(obj, "sha256", hex);
         cJSON_AddItemToArray(pkgs, obj);
     }
-    cJSON_AddItemToObject(root, "packages", pkgs);
 
     char *json = cJSON_Print(root);
     cJSON_Delete(root);
@@ -76,18 +129,9 @@ static int write_manifest(const BundleOptions *opts)
 
     char path[4096];
     snprintf(path, sizeof(path), "%s/manifest.json", opts->output_dir);
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        fprintf(stderr, "packmule: cannot write manifest.json: %s\n",
-                strerror(errno));
-        free(json);
-        return -1;
-    }
-    fputs(json, fp);
-    fputc('\n', fp);
-    fclose(fp);
+    int rc = write_text_file(path, json, strlen(json));
     free(json);   /* cJSON_Print allocates with malloc, not pm_malloc */
-    return 0;
+    return rc;
 }
 
 /* ── Requirements file (pypi only) ────────────────────────────────────────── */
@@ -99,28 +143,84 @@ static int write_manifest(const BundleOptions *opts)
  */
 static int write_requirements_txt(const BundleOptions *opts)
 {
+    char  *body = pm_strdup("");
+    for (size_t i = 0; i < opts->packages->count; i++) {
+        const Package *p = opts->packages->items[i];
+        if (!p->filename || !file_exists(opts->output_dir, p->filename))
+            continue;
+        char *next = p->version
+            ? pm_asprintf("%s%s==%s\n", body, p->name, p->version)
+            : pm_asprintf("%s%s\n",     body, p->name);
+        pm_free(body);
+        body = next;
+    }
+
     char path[4096];
     snprintf(path, sizeof(path), "%s/requirements.txt", opts->output_dir);
+    int rc = write_text_file(path, body, strlen(body));
+    pm_free(body);
+    return rc;
+}
 
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        fprintf(stderr, "packmule: cannot write requirements.txt: %s\n",
-                strerror(errno));
-        return -1;
-    }
+/* ── Transport checksums ─────────────────────────────────────────────────── */
+
+/*
+ * write_checksums — emit SHA256SUMS in coreutils format over every file the
+ * bundle contains.
+ *
+ * The registry digest was already verified at download time; this covers a
+ * different risk, the one a bundle is actually exposed to: the trip to the
+ * air-gapped machine on removable media.  Plain `sha256sum -c` format means
+ * the target needs nothing but coreutils to check it, and install.sh runs
+ * that check before handing anything to pip/npm/dnf.
+ */
+static int write_checksums(const BundleOptions *opts, const char *const *meta,
+                           size_t meta_n)
+{
+    char *body = pm_strdup("");
 
     for (size_t i = 0; i < opts->packages->count; i++) {
         const Package *p = opts->packages->items[i];
         if (!p->filename || !file_exists(opts->output_dir, p->filename))
             continue;
-        if (p->version)
-            fprintf(fp, "%s==%s\n", p->name, p->version);
-        else
-            fprintf(fp, "%s\n", p->name);
+
+        char path[4096], hex[DIGEST_HEX_MAX];
+        snprintf(path, sizeof(path), "%s/%s", opts->output_dir, p->filename);
+        if (digest_file_hex(path, DIGEST_SHA256, hex, sizeof(hex)) != 0) {
+            pm_free(body);
+            return -1;
+        }
+        char *next = pm_asprintf("%s%s  %s\n", body, hex, p->filename);
+        pm_free(body);
+        body = next;
     }
 
-    fclose(fp);
-    return 0;
+    /* Generated metadata is covered too — a tampered requirements.txt or
+     * package-lock.json redirects the install just as effectively as a
+     * tampered tarball.  SHA256SUMS itself obviously cannot cover itself. */
+    for (size_t i = 0; i < meta_n; i++) {
+        if (!meta[i] || !file_exists(opts->output_dir, meta[i]))
+            continue;
+        char path[4096], hex[DIGEST_HEX_MAX];
+        snprintf(path, sizeof(path), "%s/%s", opts->output_dir, meta[i]);
+        if (digest_file_hex(path, DIGEST_SHA256, hex, sizeof(hex)) != 0) {
+            pm_free(body);
+            return -1;
+        }
+        char *next = pm_asprintf("%s%s  %s\n", body, hex, meta[i]);
+        pm_free(body);
+        body = next;
+    }
+
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/SHA256SUMS", opts->output_dir);
+    /* The trailing newline write_text_file adds would be a blank line here,
+     * since every entry already ends in one; trim it. */
+    size_t len = strlen(body);
+    if (len > 0) body[len - 1] = '\0';
+    int rc = write_text_file(path, body, len > 0 ? len - 1 : 0);
+    pm_free(body);
+    return rc;
 }
 
 /* ── Aux file (npm: the project's package-lock.json) ─────────────────────── */
@@ -193,25 +293,20 @@ static int write_install_script(const BundleOptions *opts)
     char path[4096];
     snprintf(path, sizeof(path), "%s/install.sh", opts->output_dir);
 
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        fprintf(stderr, "packmule: cannot write install.sh: %s\n",
-                strerror(errno));
-        return -1;
-    }
-
     const char *script = script_for(opts->registry_name);
-    if (script) {
-        fputs(script, fp);
-    } else {
-        fprintf(fp,
-                "#!/bin/sh\n"
-                "echo 'packmule: no install script for registry: %s' >&2\n"
-                "exit 1\n",
-                opts->registry_name);
+    char *fallback = NULL;
+    if (!script) {
+        fallback = pm_asprintf(
+            "#!/bin/sh\n"
+            "echo 'packmule: no install script for registry: %s' >&2\n"
+            "exit 1\n", opts->registry_name);
+        script = fallback;
     }
 
-    fclose(fp);
+    int rc = write_text_file(path, script, strlen(script));
+    pm_free(fallback);
+    if (rc != 0)
+        return -1;
 
     if (chmod(path, 0755) != 0) {
         fprintf(stderr, "packmule: cannot make install.sh executable: %s\n",
@@ -290,8 +385,9 @@ done:
  * unrelated files out of the bundle and makes `-o .` safe: the archive lists
  * only the files we wrote, so it can never try to add itself.
  */
-static int create_tarball(const BundleOptions *opts,
-                          const char *archive_path, const char *prefix)
+static int create_tarball(const BundleOptions *opts, const char *archive_path,
+                          const char *prefix, const char *const *meta,
+                          size_t meta_n)
 {
     struct archive *a = archive_write_new();
     archive_write_add_filter_gzip(a);
@@ -309,13 +405,8 @@ static int create_tarball(const BundleOptions *opts,
 
     int ret = 0;
 
-    /* Metadata files first, then the package payloads.  requirements.txt is
-     * pypi-only, so it is skipped here when absent.  The aux file (npm's
-     * package-lock.json) is added only when this bundle wrote it — a stray
-     * same-named file in the output dir must not ride along. */
-    const char *meta[] = { "manifest.json", "install.sh", "requirements.txt",
-                           opts->aux_name };
-    for (size_t i = 0; i < sizeof(meta) / sizeof(meta[0]) && ret == 0; i++) {
+    /* Metadata files first, then the package payloads. */
+    for (size_t i = 0; i < meta_n && ret == 0; i++) {
         if (!meta[i] || !file_exists(opts->output_dir, meta[i]))
             continue;
         char disk_path[4096], arcname[4096];
@@ -335,8 +426,21 @@ static int create_tarball(const BundleOptions *opts,
     }
 
     archive_read_free(disk);
-    archive_write_close(a);
+
+    /*
+     * archive_write_close() is where the gzip stream is flushed and the tar
+     * trailer written; a full disk fails here and nowhere else.  Ignoring it
+     * — as this once did — reports "bundle ready" for a truncated archive.
+     */
+    if (archive_write_close(a) != ARCHIVE_OK) {
+        fprintf(stderr, "packmule: failed to finalise '%s': %s\n",
+                archive_path, archive_error_string(a));
+        ret = -1;
+    }
     archive_write_free(a);
+
+    if (ret != 0)
+        remove(archive_path);   /* never leave a half-written bundle behind */
     return ret;
 }
 
@@ -363,6 +467,24 @@ int bundle_create(const BundleOptions *opts)
     printf("packmule: writing install.sh ...\n");
     if (write_install_script(opts) != 0)
         return -1;
+
+    /*
+     * Everything the bundle carries, in the order it is archived.  install.sh
+     * and SHA256SUMS come last for a reason: SHA256SUMS covers the metadata
+     * written before it, so it has to be generated once those files are
+     * final.  (It cannot cover itself, and install.sh is what runs the check,
+     * so neither is listed in `meta`.)
+     */
+    const char *meta[] = { "manifest.json", "requirements.txt",
+                           opts->aux_name };
+    const size_t meta_n = sizeof(meta) / sizeof(meta[0]);
+
+    printf("packmule: writing SHA256SUMS ...\n");
+    if (write_checksums(opts, meta, meta_n) != 0)
+        return -1;
+
+    const char *archived[] = { "manifest.json", "requirements.txt",
+                               opts->aux_name, "SHA256SUMS", "install.sh" };
 
     /* Archive path: strip any trailing slashes from output_dir, append .tar.gz */
     const char *dir  = opts->output_dir;
@@ -399,7 +521,8 @@ int bundle_create(const BundleOptions *opts)
     }
 
     printf("packmule: creating %s ...\n", archive_path);
-    int ret = create_tarball(opts, archive_path, prefix);
+    int ret = create_tarball(opts, archive_path, prefix, archived,
+                             sizeof(archived) / sizeof(archived[0]));
     if (ret == 0)
         printf("packmule: bundle ready: %s\n\n", archive_path);
 

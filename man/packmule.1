@@ -1,4 +1,4 @@
-.TH PACKMULE 1 "2026-07-03" "packmule 0.2.0" "User Commands"
+.TH PACKMULE 1 "2026-07-26" "packmule 0.2.0" "User Commands"
 .\"
 .\" packmule.1 \(em manual page for packmule(1)
 .\"
@@ -21,8 +21,13 @@ packmule \- resolve, download, and bundle packages for air-gapped environments
 .IR ver ]
 .RB [ \-u
 .IR url ]
+.RB [ \-j
+.IR n ]
 .RB [ \-b ]
 .RB [ \-n ]
+.br
+.B packmule verify
+.I bundle_dir
 .br
 .B packmule
 .BR \-V | \-\-version
@@ -41,7 +46,9 @@ With
 .B packmule
 also writes a
 .I manifest.json
-index and a ready-to-run
+index, a
+.I SHA256SUMS
+file, and a ready-to-run
 .I install.sh
 script into the output directory, then compresses the entire directory to a
 single
@@ -50,9 +57,27 @@ archive.
 The archive can then be transported to a network-isolated machine and
 installed without any outbound internet access.
 .PP
+Dependency resolution runs to a fixed point rather than in a single pass:
+when a requirement discovered later narrows what an already-resolved package
+must satisfy, that package is resolved again.
+The result therefore does not depend on the order entries appear in the
+manifest, and a requirement that cannot be satisfied fails the run before
+anything is downloaded.
+.PP
 Packages that fail integrity verification are removed from the output
 directory and reported on standard error.
 The exit status reflects whether all packages were obtained successfully.
+.\"
+.SH COMMANDS
+.TP
+.BI verify " bundle_dir"
+Re-check an extracted bundle against its
+.I SHA256SUMS
+file and exit non-zero if any file is missing or does not match.
+This is the same check
+.I install.sh
+performs before installing anything; it verifies that the bundle survived the
+trip to the target intact.
 .\"
 .SH OPTIONS
 .TP
@@ -174,7 +199,9 @@ Examples:
 .TP
 .BR \-b ", " \-\-bundle
 After all packages are downloaded successfully, write a
-.I manifest.json
+.IR manifest.json ,
+a
+.IR SHA256SUMS ,
 and an
 .I install.sh
 into the output directory and then compress the entire directory to
@@ -183,7 +210,14 @@ into the output directory and then compress the entire directory to
 .RS
 .PP
 The manifest is a JSON file listing each downloaded package with its resolved
-version, filename, and SHA\-256 digest.
+version, filename, the digest published upstream, and the SHA\-256 of the
+file as bundled.
+.I SHA256SUMS
+carries the same SHA\-256 digests in
+.BR sha256sum (1)
+format, covering the package files and the generated metadata;
+.I install.sh
+verifies it before installing anything.
 .PP
 The install script is pre-configured for the active registry backend:
 .B pip install \-\-no\-index \-\-find\-links
@@ -209,6 +243,16 @@ for
 Bundling is skipped in dry-run mode and skipped if any package failed to
 download.
 The output directory is left intact alongside the archive.
+.PP
+After bundling, packmule checks that the result actually installs offline: for
+.B pypi
+by running pip's resolver against only the bundled files, and for
+.B npm
+by running the generated
+.I install.sh
+against an unroutable registry with an empty cache.
+A bundle the package manager rejects is a build failure; see
+.BR \-\-no\-verify .
 .RE
 .TP
 .BR \-n ", " \-\-dry\-run
@@ -217,6 +261,42 @@ but do not write any files to disk.
 The registry is still queried, so the output reflects real resolved
 versions, download URLs, and digests.
 Useful for auditing a manifest before committing to a download.
+.TP
+.BR \-j " n" ", " \-\-jobs " n"
+Number of downloads to run concurrently, from 1 to 16 (default 4).
+Registry CDNs are latency-bound for the small files that dominate a
+dependency closure, so overlapping transfers helps more than a faster single
+stream.
+.B \-j 1
+downloads serially and restores the per-file progress bar.
+.TP
+.B \-\-no\-verify
+Skip the post-bundle offline install check.
+The check runs the real package manager against the bundle, so it needs that
+package manager present and a target platform matching this machine; use this
+flag to build a bundle without it.
+.TP
+.BI \-\-rpm\-deps " mode"
+.RB ( rpm
+backend only) whether to follow transitive dependencies:
+.B resolve
+(the default) walks
+.I <rpm:requires>
+in the repository metadata and bundles a provider for each capability, while
+.B none
+bundles only the packages named in the manifest.
+.RS
+.PP
+.B resolve
+bundles the full closure within the repository, which includes base-system
+packages the target probably already has.
+That is deliberate:
+.BR dnf (8)
+skips what is already installed, and a redundant package costs only disk
+whereas a missing one cannot be fixed on an air-gapped machine.
+Capabilities nothing in the repository provides are reported as warnings.
+Boolean and rich dependency expressions are reported but not evaluated.
+.RE
 .TP
 .BR \-V ", " \-\-version
 Print the version banner and exit with status 0.
@@ -230,9 +310,12 @@ Print a brief usage summary to standard error and exit with status 0.
 All packages were resolved and downloaded successfully.
 .TP
 .B 1
-One or more packages could not be resolved, downloaded, or verified.
-Successfully downloaded packages are still written to the output directory;
-consult standard error for a per-package diagnosis.
+One or more packages could not be resolved, downloaded, or verified, or a
+bundle failed its offline install check.
+Resolution failures are reported before anything is downloaded.
+Packages that did download successfully are left in the output directory, so
+a re-run resumes rather than starting over; consult standard error for a
+per-package diagnosis.
 .\"
 .SH EXAMPLES
 Preview what would be downloaded without writing any files:

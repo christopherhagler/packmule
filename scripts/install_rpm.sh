@@ -3,8 +3,16 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Prefer dnf for automatic dependency ordering within the bundle; fall back to
-# the low-level rpm tool when dnf is unavailable.
+#__PACKMULE_VERIFY__
+
+[ "${PACKMULE_SKIP_VERIFY:-0}" = "1" ] || packmule_verify "$DIR" || exit 1
+
+# packmule verifies each .rpm against the checksum published in the
+# repository's signed-by-convention repodata, and the check above confirms the
+# files survived the trip intact.  Neither is a substitute for the package
+# signature itself: leave dnf's gpgcheck alone so rpm validates the vendor key
+# as it normally would.  If the target does not have that key imported, import
+# it (rpm --import) rather than reaching for --nogpgcheck.
 if command -v dnf >/dev/null 2>&1; then
   dnf install -y --disablerepo='*' "$DIR"/*.rpm
 else

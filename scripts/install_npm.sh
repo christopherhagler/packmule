@@ -3,6 +3,10 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+#__PACKMULE_VERIFY__
+
+[ "${PACKMULE_SKIP_VERIFY:-0}" = "1" ] || packmule_verify "$DIR" || exit 1
+
 # ── Lockfile bundle ─────────────────────────────────────────────────────────
 # The bundle carries the project's package-lock.json: replay its exact tree
 # (including nested duplicate versions npm cannot hoist) with `npm ci`,
@@ -18,11 +22,17 @@ if [ -f "$DIR/package-lock.json" ]; then
         exit 1
     }
 
+    # The trap covers INT/TERM/HUP as well as EXIT.  A plain EXIT trap does
+    # not run when the shell is killed by a signal, so a Ctrl-C during
+    # `npm ci` would leave the user's own lockfile rewritten to file: URLs
+    # pointing into this bundle -- a lasting mess made by a tool that is only
+    # supposed to be installing things.
     if [ -f package-lock.json ]; then
         cp package-lock.json .packmule-package-lock.json.bak
-        trap 'mv .packmule-package-lock.json.bak package-lock.json' EXIT
+        trap 'mv .packmule-package-lock.json.bak package-lock.json' \
+             EXIT INT TERM HUP
     else
-        trap 'rm -f package-lock.json' EXIT
+        trap 'rm -f package-lock.json' EXIT INT TERM HUP
     fi
 
     # Rewrite each entry's resolved URL to its bundled file.  The filename
@@ -56,12 +66,13 @@ set -- "$DIR"/*.tgz
 # npm resolves devDependencies from the registry even with --omit=dev (they
 # are recorded in the lockfile despite not being installed), which fails on
 # an air-gapped machine.  They are not bundled, so hide them from npm for the
-# duration of the install; the original package.json is restored on exit.
+# duration of the install; the original package.json is restored on exit --
+# on a signal too, for the same reason as above.
 if [ -f package.json ] && \
    node -e 'process.exit(require("./package.json").devDependencies ? 0 : 1)' \
         2>/dev/null; then
     cp package.json .packmule-package.json.bak
-    trap 'mv .packmule-package.json.bak package.json' EXIT
+    trap 'mv .packmule-package.json.bak package.json' EXIT INT TERM HUP
     node -e '
         const fs = require("fs");
         const p = JSON.parse(fs.readFileSync("package.json", "utf8"));

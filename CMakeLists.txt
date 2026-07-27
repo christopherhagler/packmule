@@ -96,6 +96,7 @@ add_custom_command(
     DEPENDS scripts/install_pypi.sh
             scripts/install_npm.sh
             scripts/install_rpm.sh
+            scripts/verify_bundle.sh
             cmake/embed_scripts.cmake
     COMMENT "Embedding install scripts -> bundle_scripts.h"
     VERBATIM
@@ -119,7 +120,10 @@ add_library(packmule_core OBJECT
     src/registry_pypi.c
     src/registry_npm.c
     src/registry_rpm.c
+    src/rpm_repo.c
+    src/resolve.c
     src/bundle.c
+    src/verify.c
 )
 
 target_include_directories(packmule_core PUBLIC

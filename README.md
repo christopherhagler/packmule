@@ -109,7 +109,8 @@ cmake --build build --parallel
 ## Usage
 
 ```
-packmule -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-s <os>] [-p <ver>] [-u <url>] [-b] [-n]
+packmule -f <manifest> [-o <dir>] [-t <type>] [-a <arch>] [-s <os>] [-p <ver>] [-u <url>] [-j <n>] [-b] [-n]
+packmule verify <bundle-dir>
 packmule -V | --version
 packmule -h | --help
 ```
@@ -123,10 +124,17 @@ packmule -h | --help
 | `-s <os>`, `--os` | *(pypi only)* Target OS for wheel selection: `linux`, `macos`, `windows`, or `any` (default: the host OS) |
 | `-p <ver>`, `--python` | *(pypi only)* Target CPython version for wheel selection and environment markers, e.g. `3.12` (default: the local `python3`) |
 | `-u <url>`, `--repo-url` | Repository base URL — required for `rpm`; optional for `pypi`/`npm` (overrides public endpoint) |
-| `-b`, `--bundle` | Write `manifest.json` and `install.sh`, then compress output to `<dir>.tar.gz` |
+| `-b`, `--bundle` | Write `manifest.json`, `SHA256SUMS` and `install.sh`, then compress output to `<dir>.tar.gz` |
 | `-n`, `--dry-run` | Resolve and print what would be downloaded — no files written |
+| `-j <n>`, `--jobs` | Parallel downloads, 1–16 (default 4). `-j 1` restores the per-file progress bar |
+| `--no-verify` | Skip the post-bundle offline install check |
+| `--rpm-deps <mode>` | *(rpm only)* `resolve` (default) follows transitive dependencies; `none` bundles only what the manifest names |
 | `-V`, `--version` | Print version and exit |
 | `-h`, `--help` | Print usage and exit |
+
+| Command | Description |
+|---|---|
+| `verify <dir>` | Re-check an extracted bundle against its `SHA256SUMS` |
 
 ### Architecture selection
 
@@ -205,9 +213,11 @@ packmule: bundle ready: ./vendor.tar.gz
 | File | Description |
 |---|---|
 | `*.whl` / `*.tgz` / `*.rpm` | Downloaded package files |
-| `manifest.json` | Name, version, filename, and SHA-256 for every package |
+| `manifest.json` | Name, version, filename, upstream digest, and SHA-256 for every package |
+| `SHA256SUMS` | `sha256sum`-format digests of every file in the bundle |
 | `install.sh` | Pre-configured install script for the active backend |
 | `requirements.txt` | *(pypi only)* pip-compatible requirements file used by `install.sh` |
+| `package-lock.json` | *(npm lockfile bundles only)* the tree `npm ci` replays |
 
 On the air-gapped machine:
 
@@ -216,6 +226,21 @@ tar -xzf vendor.tar.gz
 cd vendor
 ./install.sh
 ```
+
+`install.sh` verifies `SHA256SUMS` before installing anything and refuses to
+continue if a file does not match. The digests packmule checked at download
+time were about the registry; this one is about the trip here, which is the
+only link in the chain nothing else validates. It needs nothing on the target
+beyond `sha256sum` (or `shasum`).
+
+You can also run the check on its own, without installing:
+
+```bash
+packmule verify ./vendor
+```
+
+Set `PACKMULE_SKIP_VERIFY=1` to bypass it — only reasonable on a target with
+no coreutils at all.
 
 Install scripts by backend:
 
@@ -237,6 +262,13 @@ cannot install offline fails **here**, not on the air-gapped machine:
 - **npm** — runs the generated `install.sh` in a scratch project with the
   registry pointed at an unroutable address and an empty npm cache, with
   scripts disabled.
+
+A failed check is a **build failure**: the package manager itself has said it
+cannot install this closure offline, and shipping it anyway just moves the
+failure somewhere it cannot be fixed. When the check cannot run at all —
+cross-targeting a different platform, no local pip/npm, pip older than 22.2 —
+packmule says so and does not treat it as a pass. Use `--no-verify` to build
+without the check.
 
 ### Private registries
 
@@ -265,8 +297,13 @@ registries, so no response parsing changes are needed.
 
 | Code | Meaning |
 |---|---|
-| `0` | All packages resolved and downloaded successfully |
-| `1` | One or more packages failed; successful ones are still written to disk |
+| `0` | Everything resolved, downloaded, verified — and, with `--bundle`, proven to install offline |
+| `1` | Something failed: an unsatisfiable requirement, a download or digest failure, or a bundle the package manager rejected |
+
+Resolution failures are reported before anything is downloaded, so a manifest
+that cannot be satisfied costs nothing but the metadata requests. Download
+failures leave the packages that did succeed on disk, so a re-run resumes
+rather than starting over.
 
 ---
 
@@ -291,10 +328,16 @@ the run rather than producing a silently incomplete bundle.
 
 Transitive dependencies are resolved automatically by following
 `requires_dist` from each package's registry metadata, honouring PEP 440
-version ranges (`>=`, `<`, `~=`, `!=`, `==x.*`) so the bundle is mutually
-installable. The queue grows breadth-first and deduplicates by name
-(case-insensitive, with `-`, `_`, and `.` treated as equivalent per PEP 503);
-ranges from multiple dependents are intersected.
+version ranges (`>=`, `<`, `~=`, `!=`, `==x.*`). Packages are deduplicated by
+name (case-insensitive, with `-`, `_`, and `.` treated as equivalent per
+PEP 503), and ranges from multiple dependents are intersected.
+
+Resolution runs to a fixed point rather than in a single pass: when a
+requirement discovered later narrows what an already-resolved package has to
+satisfy, that package is resolved again with the fuller picture. The result
+does not depend on the order entries appear in your manifest, and a
+requirement that genuinely cannot be satisfied fails the build instead of
+producing a bundle that will not install.
 
 Extras-gated dependencies (e.g. `; extra == 'security'`) are followed only
 when the parent was requested with that extra, and are never bundled
@@ -380,14 +423,33 @@ Resolution pipeline: fetch `repodata/repomd.xml` → locate `primary.xml.gz` →
 download and decompress with libarchive → scan XML for the package by name and
 arch (also matches `noarch` packages regardless of `-a`).
 
-Integrity: SHA-256 hex digest from the `<checksum type="sha256">` element in
-the primary database.
+Integrity: the digest published in the primary database's `<checksum>`
+element, in whichever algorithm the repository uses (sha1, sha256 or sha512).
+`primary.xml` is itself verified against the checksum recorded in
+`repomd.xml` before any package digest is read from it — otherwise every
+package digest would come from an unauthenticated document.
 
-> **Note:** The RPM backend resolves packages individually as listed in the
-> manifest. Unlike PyPI and npm, it does not follow transitive dependencies
-> automatically — list every required package explicitly. On the target machine,
-> `install.sh` uses `dnf install --disablerepo='*'`, which handles dependency
-> ordering within the bundle.
+Transitive dependencies are resolved from `<rpm:requires>` / `<rpm:provides>`
+in the primary database, including capabilities named by file path
+(`/bin/sh`) and by soname (`libssl.so.3()(64bit)`). Version flags on a
+requirement (`>=`, `=`, …) are honoured against the provider's EVR, and a
+package whose own name is the requested capability is preferred over one that
+merely provides it.
+
+```bash
+packmule -f packages.txt -t rpm -u <repo> --rpm-deps resolve   # default
+packmule -f packages.txt -t rpm -u <repo> --rpm-deps none      # manifest only
+```
+
+> **Scope:** `--rpm-deps resolve` bundles the full closure *within the
+> repository you point it at*, which includes base-system packages the target
+> almost certainly already has (glibc, bash, systemd). That is the safe
+> default: `dnf` skips whatever is already installed, a redundant package only
+> costs disk, and a missing one cannot be fixed on an air-gapped machine.
+> Capabilities no package in the repository provides are reported as warnings
+> rather than errors, since the target usually already satisfies them. Boolean
+> and rich dependencies (`(a or b)`) are counted and reported but not
+> evaluated — packmule is not a SAT solver.
 
 ---
 
@@ -401,16 +463,18 @@ The unit suites are fully offline — no network access required:
 
 | Suite | Coverage |
 |---|---|
-| `test_package` | Package lifecycle, PackageList grow, name-based dedup, PEP 503 name normalisation |
-| `test_registry` | Registry dispatch table, name lookup, vtable integrity, `get_deps` slot |
+| `test_package` | Package lifecycle, PackageList grow, per-registry name equality, constraint/extras merging and dirty marking |
+| `test_registry` | Registry dispatch table, name lookup, vtable integrity, `get_deps` and `name_equal` slots |
+| `test_resolve` | Fixpoint resolution: late constraints, order independence, termination, pinned packages, failure handling |
+| `test_rpm_repo` | primary.xml indexing: capability and file provides, requires filtering, EVR flag satisfaction |
 | `test_semver` | node-semver ranges: `^`, `~`, comparators, x-ranges, hyphen ranges, `\|\|`, prereleases |
 | `test_pep440` | PEP 440 ordering (dev/pre/post/epoch) and specifiers (`==`, `!=`, `<=`, `>=`, `~=`, `==x.*`) |
 | `test_pep508` | Dependency-spec parsing (name/extras/pin/constraint) and environment-marker evaluation |
 | `test_wheeltag` | Wheel filename classification, platform/arch/python tag matching, manylinux glibc floors |
 | `test_registry_pypi` | requirements.txt parsing (includes, extras, constraints) and `get_deps`; wheel selection via `pypi_parse_response` |
 | `test_registry_npm` | npm manifest/lockfile parsing and `get_deps`: aliases, peers, range intersection, dedup |
-| `test_registry_rpm` | RPM manifest parsing: name-only, name-version, hyphenated names |
-| `test_hash` | `sha256_file`, `verify_file` — SHA-256 hex and SHA-512 SRI paths |
+| `test_registry_rpm` | RPM manifest parsing: name-only, name-version, hyphenated names; EVR pins and selection |
+| `test_hash` | Digest typing, sha1/sha256/sha512 hex and SHA-512 SRI, unset-digest refusal |
 | `test_bundle` | Bundle creation for all three backends; skips packages missing from disk |
 
 ### End-to-end tests
@@ -470,15 +534,24 @@ mock --rebuild ~/rpmbuild/SRPMS/packmule-${version}-*.src.rpm
 
 ```
 src/
-  main.c              CLI argument parsing; resolve/download/bundle loop;
-                      post-bundle offline install check
-  network.c           libcurl wrappers — fetch_json(), download_file()
-  hash.c              SHA-256 and SHA-512 file digest via OpenSSL EVP
+  main.c              CLI argument parsing; the resolve → download → bundle
+                      pipeline
+  resolve.c           Fixpoint dependency resolution: re-resolves any package
+                      whose requirements changed, until nothing changes
+  verify.c            SHA256SUMS verification and the post-bundle offline
+                      install checks
+  network.c           libcurl wrappers — fetch_json() with connection reuse,
+                      download_file(), download_many() (curl_multi)
+  hash.c              Typed digests (algorithm + encoding) over OpenSSL EVP
   registry.c          Registry dispatch table and name lookup
   registry_pypi.c     PyPI backend — requirements.txt parser, distribution
                       selection, constraint-aware resolver, get_deps
-  registry_npm.c      npm backend — package.json parser, tarball resolution
-  registry_rpm.c      RPM backend — packages.txt parser, repomd/primary.xml resolve
+  registry_npm.c      npm backend — package.json / package-lock.json parser,
+                      tarball resolution
+  registry_rpm.c      RPM backend — packages.txt parser, repomd/primary.xml
+                      resolve, capability-based depsolving
+  rpm_repo.c          Indexed view of primary.xml: package blocks and a
+                      capability → provider hash index
   semver.c            node-semver comparison and range matching (npm)
   pep440.c            PEP 440 version ordering and specifier matching (pypi)
   pep508.c            PEP 508 dependency-spec parsing and environment markers (pypi)
@@ -491,12 +564,14 @@ src/
                       helpers (pm_strtrim, pm_asprintf, pm_human_size)
 include/
   network.h
-  hash.h
-  registry.h          Registry vtable (name, manifest_name, parse_manifest,
-                      resolve, get_deps, ctx, repo_url)
+  hash.h              Digest type, algorithms, and file verification
+  registry.h          Registry vtable (name, manifest_name, name_equal,
+                      parse_manifest, resolve, get_deps, ctx, repo_url)
   registry_internal.h Backend internals exposed to the test suite only
+  resolve.h / verify.h
+  rpm_repo.h          primary.xml index API
   semver.h / pep440.h / pep508.h / wheeltag.h
-  package.h           Package / PackageList types
+  package.h           Package / PackageList types and state machine
   bundle.h            BundleOptions struct and bundle_create()
   version.h           PACKMULE_VERSION constant
   utils.h             Allocator wrappers and string helpers
@@ -504,6 +579,8 @@ scripts/
   install_pypi.sh     Per-backend offline install scripts (real, shellcheck-able);
   install_npm.sh        embedded into the binary at build time as byte arrays
   install_rpm.sh        (build/generated/bundle_scripts.h) and written verbatim
+  verify_bundle.sh    Shared SHA256SUMS check, spliced into each install.sh
+                      at its #__PACKMULE_VERIFY__ marker
                         into the bundle by bundle.c
 cmake/
   embed_scripts.cmake   Build-time codegen: scripts/*.sh → bundle_scripts.h
@@ -524,12 +601,13 @@ Implement the `Registry` vtable from `include/registry.h`:
 struct Registry {
     const char  *name;           /* identifier passed to -t */
     const char  *manifest_name;  /* default manifest filename, shown in --help */
+    package_name_equal_fn name_equal;  /* this registry's name identity rule */
     PackageList *(*parse_manifest)(const Registry *self, const char *path);
     int          (*detect)        (const char *basename);
     int          (*resolve)       (const Registry *self, Package *pkg);
     int          (*get_deps)      (const Registry *self, const Package *pkg,
                                    const PackageList *seen, PackageList *out);
-    void        *ctx;            /* arch string, injected by main.c */
+    void        *ctx;            /* backend-specific config, injected by main.c */
     const char  *repo_url;       /* base URL, set from -u flag by main.c */
 };
 ```
@@ -538,12 +616,27 @@ struct Registry {
 2. Implement `parse_manifest` and `resolve`. Optionally implement `detect` (for
    filename auto-detection) and `get_deps` (transitive resolution); set either to
    `NULL` if not needed.
-3. Add an `extern` declaration and pointer entry in `src/registry.c`.
-4. The new backend — and its `manifest_name` — appears automatically in `--help`
+3. Set `name_equal`. Name identity is a registry rule, not a universal one —
+   PyPI folds case and `-`/`_`/`.` (PEP 503), npm folds case only, RPM folds
+   nothing. Pick `package_name_equal_pep503`, `..._casefold`, `..._exact`, or
+   supply your own; there is no default, because inheriting another
+   registry's rule silently merges packages that are not the same package.
+4. Add an `extern` declaration and pointer entry in `src/registry.c`.
+5. The new backend — and its `manifest_name` — appears automatically in `--help`
    and `--type`; `registry_names()` is derived from the dispatch table.
-5. To support `--bundle`, add `scripts/install_<name>.sh` and a one-line entry in
-   `script_for()` (`src/bundle.c`). The script is embedded into the binary at
-   build time, so no runtime resource files are needed.
+6. To support `--bundle`, add `scripts/install_<name>.sh` (with a
+   `#__PACKMULE_VERIFY__` marker line) and a one-line entry in `script_for()`
+   (`src/bundle.c`). The script is embedded into the binary at build time, so
+   no runtime resource files are needed.
+
+**Contract for `resolve`.** The resolver calls it again whenever a package is
+marked dirty, so it must be idempotent and must honour `pkg->constraint` on
+every call. Two invariants matter: `pkg->version` only ever holds a single
+concrete version (ranges belong in `constraint`), and a package with
+`user_pinned` set must never have its version changed. `get_deps` records what
+it discovers by merging into existing entries — use `package_set_constraint()`
+and `package_add_extras()`, which mark a resolved package dirty when the
+requirement actually widens.
 
 ### Memory convention
 
@@ -557,9 +650,6 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 
 ### Next up
 
-- [ ] RPM transitive dependency resolution — follow `<rpm:requires>` /
-      `<rpm:provides>` in `primary.xml` so the RPM backend resolves
-      dependencies automatically like PyPI and npm
 - [ ] PyPI lockfile mode — exact-tree bundling from `uv.lock`, `poetry.lock`,
       and PEP 751 `pylock.toml`, mirroring the npm lockfile mode
 - [ ] Registry authentication — `~/.netrc`, token via flag/environment
@@ -568,10 +658,8 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 
 ### Planned
 
-- [ ] `verify` subcommand — re-check an existing bundle against its
-      `manifest.json`, and hash-verify inside `install.sh` before installing
 - [ ] SBOM output — emit CycloneDX/SPDX from the resolved package set
-- [ ] Parallel downloads with retry/backoff and HTTP Range resume
+- [ ] HTTP Range resume for interrupted downloads
 - [ ] Debian/apt backend
 
 ### Later

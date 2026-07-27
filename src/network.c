@@ -1,5 +1,6 @@
 #include "network.h"
 #include "utils.h"
+#include "version.h"
 
 #include <curl/curl.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 typedef struct {
     char  *data;
     size_t size;
+    int    overflow;   /* set when the body exceeded the response cap */
 } WriteBuffer;
 
 /* ── libcurl callbacks ────────────────────────────────────────────────────── */
@@ -30,6 +32,12 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
     if (buf->size + realsize + 1 < buf->size)
         return 0;
 
+    /* Refuse to keep growing for a server that will not stop talking. */
+    if (buf->size + realsize > NETWORK_MAX_RESPONSE_BYTES) {
+        buf->overflow = 1;
+        return 0;      /* aborts the transfer with CURLE_WRITE_ERROR */
+    }
+
     buf->data = pm_realloc(buf->data, buf->size + realsize + 1);
     memcpy(buf->data + buf->size, contents, realsize);
     buf->size           += realsize;
@@ -42,10 +50,35 @@ static size_t write_file_callback(void *contents, size_t size, size_t nmemb,
                                    void *userp)
 {
     FILE *fp = (FILE *)userp;
-    return fwrite(contents, size, nmemb, fp);
+    /* curl compares the return against size*nmemb; returning the item count
+     * is only equal to that because curl always calls with size == 1.  Return
+     * bytes explicitly so a short write is reported as one. */
+    size_t items = fwrite(contents, size, nmemb, fp);
+    return items * size;
 }
 
 /* ── Shared curl configuration ────────────────────────────────────────────── */
+
+/*
+ * restrict_protocols — allow http and https only, for the request itself and
+ * for anything a redirect points at.
+ *
+ * libcurl's defaults are broader than this tool ever needs, and the URLs
+ * being fetched are supplied by the registry rather than by the user.  Left
+ * unrestricted, an index could name file:// or scp:// and turn "download a
+ * package" into something else entirely.
+ */
+static void restrict_protocols(CURL *curl)
+{
+#if LIBCURL_VERSION_NUM >= 0x075500   /* 7.85.0 */
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    long allowed = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS,       allowed);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, allowed);
+#endif
+}
 
 static void configure_common(CURL *curl, char *error_buf)
 {
@@ -53,8 +86,10 @@ static void configure_common(CURL *curl, char *error_buf)
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  15L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
-                     "packmule/0.1 libcurl/" LIBCURL_VERSION);
+                     "packmule/" PACKMULE_VERSION " libcurl/" LIBCURL_VERSION);
+    restrict_protocols(curl);
 }
 
 /*
@@ -77,63 +112,85 @@ static void configure_download(CURL *curl, char *error_buf)
     configure_common(curl, error_buf);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE,
+                     (curl_off_t)NETWORK_MAX_DOWNLOAD_BYTES);
 }
 
 /* ── Retry policy ─────────────────────────────────────────────────────────── */
 
 #define MAX_ATTEMPTS 3
 
+/* Is this failure worth another attempt? */
+static int is_transient(CURLcode res, long http_code)
+{
+    /* 429 (rate limited) is transient too: PyPI and npm both rate-limit, and
+     * a large manifest can trip it mid-run. */
+    return (res != CURLE_OK) || http_code >= 500 || http_code == 429;
+}
+
 /*
  * attempt_should_retry — decide whether a finished curl attempt failed
- * transiently (worth retrying) and sleep with backoff if another attempt
- * remains.  Permanent failures (HTTP 4xx) and success return 0.
+ * transiently and sleep with backoff if another attempt remains.
  * `attempt` is 0-based; backoff is 1s then 3s.
  */
 static int attempt_should_retry(CURLcode res, long http_code, int attempt)
 {
-    /* 429 (rate limited) is transient too: PyPI and npm both rate-limit, and
-     * a large manifest can trip it mid-run. */
-    int transient = (res != CURLE_OK) || http_code >= 500 || http_code == 429;
-    if (!transient || attempt + 1 >= MAX_ATTEMPTS)
+    if (!is_transient(res, http_code) || attempt + 1 >= MAX_ATTEMPTS)
         return 0;
     sleep(attempt == 0 ? 1 : 3);
     return 1;
 }
 
-/* ── Public API ───────────────────────────────────────────────────────────── */
+/* ── Global state ─────────────────────────────────────────────────────────── */
+
+/*
+ * A single reusable handle for metadata requests.  Resolution makes one
+ * request per package, and a fresh connection (DNS + TCP + TLS) for each of
+ * several hundred packages costs more than everything else in the run put
+ * together.  packmule is single-threaded, so one handle is enough.
+ */
+static CURL *g_meta_handle;
 
 int network_init(void)
 {
     CURLcode rc = curl_global_init(CURL_GLOBAL_DEFAULT);
-    return (rc == CURLE_OK) ? 0 : -1;
+    if (rc != CURLE_OK)
+        return -1;
+    g_meta_handle = curl_easy_init();
+    if (!g_meta_handle) {
+        curl_global_cleanup();
+        return -1;
+    }
+    return 0;
 }
 
 void network_cleanup(void)
 {
+    if (g_meta_handle) {
+        curl_easy_cleanup(g_meta_handle);
+        g_meta_handle = NULL;
+    }
     curl_global_cleanup();
 }
 
-/*
- * fetch_json — GET `url` and return the response body as a heap-allocated
- * NUL-terminated string.
- *
- * CALLER OWNS the returned buffer and must free it with pm_free().
- * Returns NULL on network error or non-200 HTTP response.
- */
+/* ── Metadata fetch ───────────────────────────────────────────────────────── */
+
 char *fetch_json(const char *url)
 {
-    CURL        *curl = NULL;
-    CURLcode     res;
-    WriteBuffer  buf  = { NULL, 0 };
+    if (!g_meta_handle) {
+        fprintf(stderr, "packmule: network not initialised\n");
+        return NULL;
+    }
+
+    CURL        *curl = g_meta_handle;
+    CURLcode     res  = CURLE_OK;
+    WriteBuffer  buf  = { NULL, 0, 0 };
     char         curl_error[CURL_ERROR_SIZE];
 
     curl_error[0] = '\0';
 
-    curl = curl_easy_init();
-    if (!curl) {
-        fprintf(stderr, "packmule: curl_easy_init() failed\n");
-        return NULL;
-    }
+    /* Reset per-request options but keep the connection cache. */
+    curl_easy_reset(curl);
 
     buf.data    = pm_malloc(1);
     buf.data[0] = '\0';
@@ -147,34 +204,38 @@ char *fetch_json(const char *url)
     long http_code = 0;
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         /* Discard any partial body from a failed previous attempt. */
-        buf.size    = 0;
-        buf.data[0] = '\0';
-        http_code   = 0;
+        buf.size     = 0;
+        buf.data[0]  = '\0';
+        buf.overflow = 0;
+        http_code    = 0;
 
         res = curl_easy_perform(curl);
         if (res == CURLE_OK)
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-        if (res == CURLE_OK && http_code == 200) {
-            curl_easy_cleanup(curl);
+        if (res == CURLE_OK && http_code == 200)
             return buf.data;
-        }
+
+        if (buf.overflow)
+            break;   /* a too-large body will be too large next time too */
         if (!attempt_should_retry(res, http_code, attempt))
             break;
         fprintf(stderr, "packmule: retrying %s ...\n", url);
     }
 
-    if (res != CURLE_OK)
+    if (buf.overflow)
+        fprintf(stderr,
+                "packmule: response from %s exceeds %zu MB; refusing it\n",
+                url, NETWORK_MAX_RESPONSE_BYTES / ((size_t)1024 * 1024));
+    else if (res != CURLE_OK)
         fprintf(stderr, "packmule: network error fetching %s: %s\n",
-                url,
-                curl_error[0] ? curl_error : curl_easy_strerror(res));
+                url, curl_error[0] ? curl_error : curl_easy_strerror(res));
     else if (http_code == 404)
         fprintf(stderr, "packmule: 404 not found: %s\n", url);
     else
         fprintf(stderr, "packmule: HTTP %ld for %s\n", http_code, url);
 
     pm_free(buf.data);
-    curl_easy_cleanup(curl);
     return NULL;
 }
 
@@ -275,7 +336,7 @@ static int progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     return 0;
 }
 
-/* ── Download ─────────────────────────────────────────────────────────────── */
+/* ── Single download ──────────────────────────────────────────────────────── */
 
 int download_file(const char *url, const char *dest_path,
                   const char *label, int show_progress)
@@ -308,6 +369,8 @@ int download_file(const char *url, const char *dest_path,
     }
 
     long http_code = 0;
+    int  io_error  = 0;
+
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         /* (Re)open with "wb" so a retry truncates the failed attempt's bytes. */
         FILE *fp = fopen(dest_path, "wb");
@@ -326,23 +389,29 @@ int download_file(const char *url, const char *dest_path,
 
         http_code = 0;
         res = curl_easy_perform(curl);
-        fclose(fp);
+
+        /* fclose is where buffered bytes actually reach the disk; a full disk
+         * surfaces here and nowhere else. */
+        io_error = (fclose(fp) != 0);
         if (res == CURLE_OK)
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-        if (res == CURLE_OK && http_code == 200) {
+        if (res == CURLE_OK && http_code == 200 && !io_error) {
             curl_easy_cleanup(curl);
             return 0;
         }
+        if (io_error)
+            break;
         if (!attempt_should_retry(res, http_code, attempt))
             break;
         fprintf(stderr, "packmule: retrying %s ...\n", url);
     }
 
-    if (res != CURLE_OK)
+    if (io_error)
+        fprintf(stderr, "packmule: write error saving %s\n", dest_path);
+    else if (res != CURLE_OK)
         fprintf(stderr, "packmule: download error for %s: %s\n",
-                url,
-                curl_error[0] ? curl_error : curl_easy_strerror(res));
+                url, curl_error[0] ? curl_error : curl_easy_strerror(res));
     else
         fprintf(stderr, "packmule: HTTP %ld downloading %s\n", http_code, url);
 
@@ -350,4 +419,175 @@ int download_file(const char *url, const char *dest_path,
     remove(dest_path);
     curl_easy_cleanup(curl);
     return -1;
+}
+
+/* ── Parallel downloads ───────────────────────────────────────────────────── */
+
+typedef struct {
+    DownloadJob *job;
+    FILE        *fp;
+    CURL        *easy;
+    int          attempt;      /* 0-based */
+    char         error[CURL_ERROR_SIZE];
+} Transfer;
+
+/* start_transfer — open the destination and hand the easy handle to `multi`. */
+static int start_transfer(CURLM *multi, Transfer *t)
+{
+    t->fp = fopen(t->job->dest_path, "wb");
+    if (!t->fp) {
+        fprintf(stderr, "packmule: cannot open %s for writing\n",
+                t->job->dest_path);
+        return -1;
+    }
+
+    t->error[0] = '\0';
+    if (!t->easy)
+        t->easy = curl_easy_init();
+    if (!t->easy) {
+        fclose(t->fp);
+        t->fp = NULL;
+        return -1;
+    }
+
+    curl_easy_reset(t->easy);
+    configure_download(t->easy, t->error);
+    curl_easy_setopt(t->easy, CURLOPT_URL,           t->job->url);
+    curl_easy_setopt(t->easy, CURLOPT_WRITEFUNCTION, write_file_callback);
+    curl_easy_setopt(t->easy, CURLOPT_WRITEDATA,     t->fp);
+    curl_easy_setopt(t->easy, CURLOPT_NOPROGRESS,    1L);
+    curl_easy_setopt(t->easy, CURLOPT_PRIVATE,       t);
+
+    curl_multi_add_handle(multi, t->easy);
+    return 0;
+}
+
+/* finish_transfer — close the file and decide success, failure, or retry. */
+static int finish_transfer(Transfer *t, CURLcode res)
+{
+    long http_code = 0;
+    int  io_error  = (t->fp && fclose(t->fp) != 0);
+    t->fp = NULL;
+
+    if (res == CURLE_OK)
+        curl_easy_getinfo(t->easy, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (res == CURLE_OK && http_code == 200 && !io_error)
+        return 0;                       /* done, succeeded */
+
+    if (!io_error && is_transient(res, http_code) &&
+        t->attempt + 1 < MAX_ATTEMPTS)
+        return 1;                       /* retry */
+
+    if (io_error)
+        fprintf(stderr, "packmule: write error saving %s\n", t->job->dest_path);
+    else if (res != CURLE_OK)
+        fprintf(stderr, "packmule: download error for %s: %s\n",
+                t->job->url,
+                t->error[0] ? t->error : curl_easy_strerror(res));
+    else
+        fprintf(stderr, "packmule: HTTP %ld downloading %s\n",
+                http_code, t->job->url);
+
+    remove(t->job->dest_path);
+    return -1;                          /* done, failed */
+}
+
+int download_many(DownloadJob *jobs, size_t n, int concurrency,
+                  void (*on_done)(const DownloadJob *job, size_t completed,
+                                  size_t total))
+{
+    if (n == 0)
+        return 0;
+    if (concurrency < 1)                  concurrency = 1;
+    if (concurrency > NETWORK_MAX_JOBS)   concurrency = NETWORK_MAX_JOBS;
+    if ((size_t)concurrency > n)          concurrency = (int)n;
+
+    CURLM *multi = curl_multi_init();
+    if (!multi) {
+        fprintf(stderr, "packmule: curl_multi_init() failed\n");
+        return -1;
+    }
+
+    Transfer *slots = pm_calloc((size_t)concurrency, sizeof(Transfer));
+    size_t next = 0, completed = 0;
+    int    failures = 0;
+
+    /* Prime the pipeline. */
+    for (int i = 0; i < concurrency && next < n; i++) {
+        slots[i].job     = &jobs[next++];
+        slots[i].attempt = 0;
+        if (start_transfer(multi, &slots[i]) != 0) {
+            slots[i].job->rc = -1;
+            failures++;
+            completed++;
+            slots[i].job = NULL;
+        }
+    }
+
+    int running = 0;
+    do {
+        CURLMcode mc = curl_multi_perform(multi, &running);
+        if (mc == CURLM_OK && running)
+            mc = curl_multi_poll(multi, NULL, 0, 200, NULL);
+        if (mc != CURLM_OK) {
+            fprintf(stderr, "packmule: curl_multi error: %s\n",
+                    curl_multi_strerror(mc));
+            break;
+        }
+
+        CURLMsg *msg;
+        int      left = 0;
+        while ((msg = curl_multi_info_read(multi, &left)) != NULL) {
+            if (msg->msg != CURLMSG_DONE)
+                continue;
+
+            Transfer *t = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&t);
+            curl_multi_remove_handle(multi, msg->easy_handle);
+
+            int verdict = finish_transfer(t, msg->data.result);
+
+            if (verdict == 1) {
+                /* Transient: back off briefly and re-arm the same slot. */
+                t->attempt++;
+                sleep(t->attempt == 1 ? 1 : 3);
+                fprintf(stderr, "packmule: retrying %s ...\n", t->job->url);
+                if (start_transfer(multi, t) == 0)
+                    continue;
+                verdict = -1;
+            }
+
+            t->job->rc = (verdict == 0) ? 0 : -1;
+            if (verdict != 0)
+                failures++;
+            completed++;
+            if (on_done)
+                on_done(t->job, completed, n);
+
+            /* Feed the slot its next job. */
+            if (next < n) {
+                t->job     = &jobs[next++];
+                t->attempt = 0;
+                if (start_transfer(multi, t) != 0) {
+                    t->job->rc = -1;
+                    failures++;
+                    completed++;
+                    if (on_done)
+                        on_done(t->job, completed, n);
+                    t->job = NULL;
+                }
+            } else {
+                t->job = NULL;
+            }
+        }
+    } while (running > 0 || next < n);
+
+    for (int i = 0; i < concurrency; i++)
+        if (slots[i].easy)
+            curl_easy_cleanup(slots[i].easy);
+    pm_free(slots);
+    curl_multi_cleanup(multi);
+
+    return failures == 0 ? 0 : -1;
 }

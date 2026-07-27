@@ -89,7 +89,7 @@ static Package *make_pkg(const char *name, const char *version,
 {
     Package *pkg    = package_create(name, version);
     pkg->filename   = pm_strdup(filename);
-    pkg->sha256     = pm_strdup(sha256);
+    digest_set(&pkg->digest, DIGEST_SHA256, DIGEST_ENC_HEX, sha256);
     pkg->url        = pm_strdup("https://example.com/placeholder");
     return pkg;
 }

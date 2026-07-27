@@ -110,6 +110,9 @@ static Package *parse_line(const char *line, int *fatal)
     Package *pkg    = package_create(name, version_str);
     pkg->constraint = constraint;
     pkg->extras     = extras;
+    /* An exact "==" pin in the manifest is the user's decision; resolution
+     * must never move off it. */
+    pkg->user_pinned = (version_str != NULL);
     pm_free(version_str);
     pm_free(name);
     pm_free(work);
@@ -118,17 +121,47 @@ static Package *parse_line(const char *line, int *fatal)
 
 /*
  * merge_constraint — AND another PEP 440 range into pkg->constraint (comma is
- * conjunction), so the eventual resolution honours every requester.
+ * conjunction), so the eventual resolution honours every requester.  Returns
+ * 1 when this actually narrowed the requirement.
+ *
+ * Clauses are deduplicated: the fixpoint resolver re-runs get_deps on every
+ * round, and without this the constraint string would grow without bound and
+ * never reach a stable value.
  */
-static void merge_constraint(Package *pkg, const char *constraint)
+static int merge_constraint(Package *pkg, const char *constraint)
 {
-    if (pkg->constraint) {
-        char *merged = pm_asprintf("%s,%s", pkg->constraint, constraint);
-        pm_free(pkg->constraint);
-        pkg->constraint = merged;
-    } else {
-        pkg->constraint = pm_strdup(constraint);
+    if (!constraint || !*constraint)
+        return 0;
+
+    if (!pkg->constraint)
+        return package_set_constraint(pkg, pm_strdup(constraint));
+
+    /* Append only the clauses we do not already carry. */
+    char *merged = pm_strdup(pkg->constraint);
+    for (const char *p = constraint; *p; ) {
+        const char *comma  = strchr(p, ',');
+        size_t      len    = comma ? (size_t)(comma - p) : strlen(p);
+
+        if (len > 0) {
+            int have = 0;
+            for (const char *q = merged; *q && !have; ) {
+                const char *qc = strchr(q, ',');
+                size_t      qn = qc ? (size_t)(qc - q) : strlen(q);
+                have = (qn == len && strncmp(q, p, len) == 0);
+                if (!qc) break;
+                q = qc + 1;
+            }
+            if (!have) {
+                char *next = pm_asprintf("%s,%.*s", merged, (int)len, p);
+                pm_free(merged);
+                merged = next;
+            }
+        }
+        if (!comma)
+            break;
+        p = comma + 1;
     }
+    return package_set_constraint(pkg, merged);
 }
 
 #define MAX_INCLUDE_DEPTH 8
@@ -245,30 +278,28 @@ static int parse_requirements_file(const Registry *self, const char *path,
          * "requests" plus "requests[socks]==2.31.0"): keep one entry, letting
          * a pinned version win over an unpinned one so we don't bundle two
          * conflicting wheels.  pip unifies these the same way. */
-        Package *existing = package_list_find_name(list, pkg->name);
+        Package *existing = package_list_find_name(list, pkg->name,
+                                                   package_name_equal_pep503);
         if (existing) {
             if (pkg->version && !existing->version) {
-                existing->version = pm_strdup(pkg->version);
+                existing->version     = pm_strdup(pkg->version);
+                existing->user_pinned = 1;
             } else if (pkg->version && existing->version &&
                        strcmp(pkg->version, existing->version) != 0) {
+                /* Two different exact pins in one manifest is a contradiction
+                 * the user has to resolve; guessing would ship a bundle that
+                 * does not match what they asked for. */
                 fprintf(stderr,
-                        "packmule: %s requested at both %s and %s; keeping %s\n",
-                        existing->name, existing->version, pkg->version,
-                        existing->version);
+                        "packmule: %s is pinned to both %s and %s in the "
+                        "manifest.\n          Remove one of the two lines.\n",
+                        existing->name, existing->version, pkg->version);
+                package_destroy(pkg);
+                fclose(fp);
+                return -1;
             }
             if (!existing->version && pkg->constraint)
                 merge_constraint(existing, pkg->constraint);
-            /* Union of requested extras. */
-            if (pkg->extras) {
-                if (!existing->extras) {
-                    existing->extras = pm_strdup(pkg->extras);
-                } else if (!strstr(existing->extras, pkg->extras)) {
-                    char *merged = pm_asprintf("%s,%s", existing->extras,
-                                               pkg->extras);
-                    pm_free(existing->extras);
-                    existing->extras = merged;
-                }
-            }
+            package_add_extras(existing, pkg->extras);
             package_destroy(pkg);
             continue;
         }
@@ -312,7 +343,8 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
         return -1;
     }
 
-    int ret = -1;
+    int ret          = -1;
+    int deps_unknown = 0;
 
     cJSON *info = cJSON_GetObjectItemCaseSensitive(root, "info");
 
@@ -328,19 +360,22 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
         cJSON *req_dist = cJSON_GetObjectItemCaseSensitive(info, "requires_dist");
         if (cJSON_IsArray(req_dist)) {
             int n = cJSON_GetArraySize(req_dist);
-            if (pkg->dep_specs) {
-                for (char **p = pkg->dep_specs; *p; p++)
-                    pm_free(*p);
-                pm_free(pkg->dep_specs);
-            }
-            pkg->dep_specs = pm_malloc(((size_t)n + 1) * sizeof(char *));
+            char **specs = pm_malloc(((size_t)n + 1) * sizeof(char *));
             int k = 0;
             cJSON *item = NULL;
             cJSON_ArrayForEach(item, req_dist) {
                 if (cJSON_IsString(item))
-                    pkg->dep_specs[k++] = pm_strdup(item->valuestring);
+                    specs[k++] = pm_strdup(item->valuestring);
             }
-            pkg->dep_specs[k] = NULL;
+            specs[k] = NULL;
+            package_set_dep_specs(pkg, specs);
+        } else {
+            /* requires_dist is absent or null.  For a wheel that genuinely
+             * means "no dependencies"; for an sdist it usually means PyPI
+             * could not read the metadata without building it, so the
+             * dependency walk stops here and the bundle may be incomplete. */
+            package_set_dep_specs(pkg, NULL);
+            deps_unknown = !cJSON_IsArray(req_dist);
         }
     }
 
@@ -354,6 +389,8 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
     const char *chosen_filename = NULL;
     int         chosen_priority = 0; /* 3=arch wheel, 2=universal wheel, 1=sdist */
     int         chosen_glibc    = 0; /* maj*1000+min for manylinux, 0 otherwise */
+    int         saw_file        = 0; /* any file at all, before filtering */
+    int         all_yanked      = 1;
 
     cJSON *dist = NULL;
     cJSON_ArrayForEach(dist, urls) {
@@ -361,23 +398,36 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
         if (!cJSON_IsString(fn_item))
             continue;
         const char *fn = fn_item->valuestring;
+        saw_file = 1;
 
         /* Never select a yanked file: pip refuses them for unpinned installs. */
         cJSON *yanked = cJSON_GetObjectItemCaseSensitive(dist, "yanked");
         if (cJSON_IsTrue(yanked))
             continue;
+        all_yanked = 0;
 
-        if (dist_is_wheel(fn)) {
-            if (arch && !dist_is_universal_wheel(fn) &&
-                wheel_platform_matches(wheel_platform_tag(fn), target_os, arch) &&
-                wheel_python_matches(fn, py_minor)) {
+        WheelTags tags;
+        if (dist_is_wheel(fn) && wheel_parse_tags(fn, &tags) == 0) {
+            int universal = strcmp(tags.platform, "any") == 0;
+
+            if (universal) {
+                /* Pure-Python, but still only installable on interpreters its
+                 * tag covers: "py39-none-any" is not valid on 3.8. */
+                if (wheel_python_matches(fn, py_minor) && chosen_priority < 2) {
+                    chosen          = dist;
+                    chosen_filename = fn;
+                    chosen_priority = 2;
+                }
+            } else if (arch &&
+                       wheel_platform_matches(tags.platform, target_os, arch) &&
+                       wheel_python_matches(fn, py_minor)) {
                 /* Among matching arch wheels prefer the LOWEST manylinux
                  * glibc floor: a manylinux_2_17 wheel installs everywhere a
                  * manylinux_2_39 one does, but not vice versa — picking the
                  * highest could produce a wheel the target's older glibc
                  * refuses. */
                 int gmaj = 0, gmin = 0;
-                int gl = wheel_manylinux_glibc(wheel_platform_tag(fn), &gmaj, &gmin)
+                int gl = wheel_manylinux_glibc(tags.platform, &gmaj, &gmin)
                        ? gmaj * 1000 + gmin : 0;
                 if (chosen_priority < 3 ||
                     (chosen_priority == 3 && gl < chosen_glibc)) {
@@ -386,10 +436,6 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
                     chosen_priority = 3;
                     chosen_glibc    = gl;
                 }
-            } else if (dist_is_universal_wheel(fn) && chosen_priority < 2) {
-                chosen          = dist;
-                chosen_filename = fn;
-                chosen_priority = 2;
             }
         } else if (dist_is_sdist(fn) && chosen_priority < 1) {
             chosen          = dist;
@@ -412,6 +458,18 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
                 chosen_filename);
 
     if (!chosen) {
+        /* Distinguish "this release was withdrawn" from "nothing matches your
+         * target": the fixes are completely different and the previous single
+         * message sent people looking at the wrong one. */
+        if (saw_file && all_yanked) {
+            fprintf(stderr,
+                    "packmule: %s==%s has been yanked from PyPI; every file "
+                    "for that release is withdrawn.\n"
+                    "          Pin a different version.\n",
+                    pkg->name, pkg->version ? pkg->version : "(latest)");
+            goto done;
+        }
+
         char py_buf[16];
         if (py_minor > 0)
             snprintf(py_buf, sizeof(py_buf), "3.%d", py_minor);
@@ -434,7 +492,7 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
         goto done;
     }
 
-    cJSON *digests    = cJSON_GetObjectItemCaseSensitive(chosen, "digests");
+    cJSON *digests     = cJSON_GetObjectItemCaseSensitive(chosen, "digests");
     cJSON *sha256_item = cJSON_GetObjectItemCaseSensitive(digests, "sha256");
     if (!cJSON_IsString(sha256_item)) {
         fprintf(stderr, "packmule: missing SHA-256 digest for %s\n", chosen_filename);
@@ -442,13 +500,26 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
     }
 
     pm_free(pkg->url);
-    pm_free(pkg->sha256);
     pm_free(pkg->filename);
-    pkg->url      = pm_strdup(url_item->valuestring);
-    pkg->sha256   = pm_strdup(sha256_item->valuestring);
+    pkg->url = pm_strdup(url_item->valuestring);
+    digest_set(&pkg->digest, DIGEST_SHA256, DIGEST_ENC_HEX,
+               sha256_item->valuestring);
     /* The filename came off the wire: keep only its basename so a hostile or
      * broken index serving "a/../../etc/x.whl" cannot escape the output dir. */
     pkg->filename = pm_strdup(pm_basename(chosen_filename));
+
+    /* An sdist whose metadata PyPI could not read means we are flying blind
+     * on its dependencies.  Say so loudly: a bundle missing a transitive dep
+     * fails on the air-gapped machine, where it cannot be fixed. */
+    if (deps_unknown && dist_is_sdist(pkg->filename))
+        fprintf(stderr,
+                "packmule: warning: PyPI publishes no dependency metadata for "
+                "%s==%s.\n"
+                "          Its dependencies were NOT followed and may be "
+                "missing from the bundle.\n"
+                "          Add them to your manifest explicitly if the "
+                "offline install fails.\n",
+                pkg->name, pkg->version ? pkg->version : "(latest)");
     ret = 0;
 
 done:
@@ -541,6 +612,16 @@ static int pypi_resolve(const Registry *self, Package *pkg)
     while (blen > 0 && base_trimmed[blen - 1] == '/')
         base_trimmed[--blen] = '\0';
 
+    /*
+     * A version we chose ourselves on an earlier round is a hypothesis, not a
+     * fact: if a later dependent narrowed the constraint, that choice has to
+     * be made again from scratch.  Only a user pin is fixed.
+     */
+    if (pkg->version && !pkg->user_pinned && pkg->constraint) {
+        pm_free(pkg->version);
+        pkg->version = NULL;
+    }
+
     char *url = pkg->version
         ? pm_asprintf("%s/%s/%s/json", base_trimmed, pkg->name, pkg->version)
         : pm_asprintf("%s/%s/json", base_trimmed, pkg->name);
@@ -548,6 +629,21 @@ static int pypi_resolve(const Registry *self, Package *pkg)
     char *json = fetch_json(url);
     pm_free(url);
     if (!json) {
+        pm_free(base_trimmed);
+        return -1;
+    }
+
+    /* A user pin that contradicts what its dependents need is a real conflict
+     * the bundle cannot paper over. */
+    if (pkg->version && pkg->user_pinned && pkg->constraint &&
+        pep440_satisfies(pkg->version, pkg->constraint) == 0) {
+        fprintf(stderr,
+                "packmule: %s is pinned to %s but other packages require "
+                "'%s'.\n"
+                "          These cannot both hold; adjust the pin in your "
+                "manifest.\n",
+                pkg->name, pkg->version, pkg->constraint);
+        pm_free(json);
         pm_free(base_trimmed);
         return -1;
     }
@@ -615,13 +711,13 @@ static int pypi_get_deps(const Registry *self, const Package *pkg,
      * alongside it (install.sh installs them first, then builds with
      * --no-build-isolation). */
     if (pkg->filename && dist_is_sdist(pkg->filename)) {
-        if (!package_list_find_name(seen, "setuptools")) {
-            package_list_add(out, package_create("setuptools", NULL));
-            added++;
-        }
-        if (!package_list_find_name(seen, "wheel")) {
-            package_list_add(out, package_create("wheel", NULL));
-            added++;
+        static const char *const BUILD_DEPS[] = { "setuptools", "wheel" };
+        for (size_t i = 0; i < sizeof(BUILD_DEPS) / sizeof(BUILD_DEPS[0]); i++) {
+            if (!package_list_find_name(seen, BUILD_DEPS[i],
+                                        package_name_equal_pep503)) {
+                package_list_add(out, package_create(BUILD_DEPS[i], NULL));
+                added++;
+            }
         }
     }
 
@@ -650,41 +746,61 @@ static int pypi_get_deps(const Registry *self, const Package *pkg,
         if (!name[0])
             continue;
 
-        Package *existing = package_list_find_name(seen, name);
-        if (existing) {
-            char *version    = pep508_spec_exact_version(*rd);
-            char *constraint = version ? NULL : pep508_spec_constraint(*rd);
+        char *version    = pep508_spec_exact_version(*rd);
+        char *constraint = pep508_spec_constraint(*rd);
+        char *dep_extras = pep508_spec_extras(*rd);
 
-            if (version && existing->version &&
-                strcmp(version, existing->version) != 0) {
-                /* Two different exact pins: surface the conflict instead of
-                 * silently keeping the first. */
-                fprintf(stderr,
-                        "packmule: %s requires %s==%s but %s is already "
-                        "selected; keeping %s\n",
-                        pkg->name, name, version, existing->version,
-                        existing->version);
-            } else if (constraint && existing->version &&
-                       pep440_satisfies(existing->version, constraint) == 0) {
-                fprintf(stderr,
-                        "packmule: warning: %s requires %s%s but %s is "
-                        "already selected; the offline install may fail\n",
-                        pkg->name, name, constraint, existing->version);
-            } else if (constraint && !existing->version) {
+        Package *existing = package_list_find_name(seen, name,
+                                                   package_name_equal_pep503);
+        if (existing) {
+            /*
+             * Merge this dependent's requirement into the existing entry.
+             * Every merge that widens what the entry has to satisfy marks it
+             * dirty, and the resolver comes back for it — including when it
+             * has already been resolved.  Recording the requirement and
+             * letting resolution re-run is what makes the outcome independent
+             * of the order packages happen to appear in.
+             */
+            if (constraint)
                 merge_constraint(existing, constraint);
+
+            /* An exact "==" from a dependent is a constraint like any other,
+             * not a pin: only the manifest can pin. */
+            if (version && !existing->user_pinned &&
+                (!existing->version ||
+                 strcmp(version, existing->version) != 0)) {
+                char *as_spec = pm_asprintf("==%s", version);
+                merge_constraint(existing, as_spec);
+                pm_free(as_spec);
             }
+
+            /* The bug this replaces: extras requested by a dependent used to
+             * be dropped whenever the package was already queued, silently
+             * omitting every dependency they gate. */
+            package_add_extras(existing, dep_extras);
+
             pm_free(version);
             pm_free(constraint);
+            pm_free(dep_extras);
             continue;
         }
 
-        char    *version = pep508_spec_exact_version(*rd);
-        Package *dep     = package_create(name, version);
-        if (!version)
-            dep->constraint = pep508_spec_constraint(*rd);
-        dep->extras = pep508_spec_extras(*rd);
+        Package *dep = package_create(name, NULL);
+        if (version) {
+            /* Carry an exact requirement as a constraint so a second
+             * dependent asking for a different version is detected as the
+             * conflict it is, rather than silently losing. */
+            dep->constraint = pm_asprintf("==%s", version);
+            if (constraint)
+                merge_constraint(dep, constraint);
+        } else {
+            dep->constraint = constraint;
+            constraint = NULL;
+        }
+        dep->extras = dep_extras;
         package_list_add(out, dep);
         pm_free(version);
+        pm_free(constraint);
         added++;
     }
     return added;
@@ -713,6 +829,7 @@ static int pypi_detect(const char *basename)
 const Registry pypi_registry = {
     .name          = "pypi",
     .manifest_name = "requirements.txt",
+    .name_equal    = package_name_equal_pep503,
     .detect        = pypi_detect,
     .parse_manifest = pypi_parse_manifest,
     .resolve       = pypi_resolve,

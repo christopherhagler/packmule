@@ -10,9 +10,32 @@
 #ifndef PACKMULE_REGISTRY_INTERNAL_H
 #define PACKMULE_REGISTRY_INTERNAL_H
 
+#include "hash.h"
 #include "package.h"
 
 /* ── registry_rpm.c ──────────────────────────────────────────────────────── */
+
+typedef struct RpmRepo RpmRepo;
+
+/*
+ * RpmConfig — the rpm backend's `Registry.ctx`.
+ *
+ * The other backends only need the target architecture there, so ctx used to
+ * be the arch string itself.  rpm needs more (whether to depsolve, and the
+ * indexed repository once it has been fetched), and a struct is the honest
+ * way to say so rather than overloading one pointer differently per backend.
+ *
+ * main.c fills `arch` and `resolve_deps`; the backend fills `repo` after it
+ * has downloaded and indexed primary.xml.
+ */
+typedef struct {
+    const char *arch;
+    int         resolve_deps;   /* --rpm-deps resolve */
+    RpmRepo    *repo;           /* owned by the backend; NULL until indexed */
+} RpmConfig;
+
+/* Release anything the rpm backend cached during the run. */
+void rpm_backend_cleanup(RpmConfig *cfg);
 
 /* find_rpm_package result codes (0 = success). */
 #define RPM_FIND_NOT_FOUND        (-1)
@@ -30,16 +53,17 @@ int rpm_vercmp(const char *a, const char *b);
  * epoch:ver-rel; non-NULL requires an exact EVR match ("ver", "ver-rel",
  * "epoch:ver", or "epoch:ver-rel").
  *
- * On success returns 0 and allocates *out_href, *out_sha256, *out_version
- * (caller frees all three with pm_free()).  Otherwise returns
- * RPM_FIND_NOT_FOUND or RPM_FIND_VERSION_MISMATCH.
+ * On success returns 0, allocates *out_href and *out_version (caller frees
+ * both with pm_free()) and fills *out_digest with whichever checksum the
+ * repository publishes (caller clears it with digest_clear()).  Otherwise
+ * returns RPM_FIND_NOT_FOUND or RPM_FIND_VERSION_MISMATCH.
  */
 int find_rpm_package(const char *primary_xml,
                      const char *name,
                      const char *version,
                      const char *arch,
                      char **out_href,
-                     char **out_sha256,
+                     Digest *out_digest,
                      char **out_version);
 
 /* ── registry_npm.c ──────────────────────────────────────────────────────── */

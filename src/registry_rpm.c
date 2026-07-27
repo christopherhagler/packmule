@@ -25,6 +25,7 @@
 #include "registry_internal.h"
 #include "network.h"
 #include "package.h"
+#include "rpm_repo.h"
 #include "utils.h"
 
 #include <archive.h>
@@ -35,6 +36,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/*
+ * Ceiling on the decompressed size of primary.xml.  Fedora Everything, the
+ * largest repository in common use, is roughly 250 MB decompressed.
+ */
+#define RPM_MAX_PRIMARY_BYTES ((size_t)1024 * 1024 * 1024)
 
 /* ── Manifest parser ─────────────────────────────────────────────────────── */
 
@@ -138,12 +145,21 @@ static char *xml_attr(const char *tag, const char *attr_name)
 /* ── repomd.xml parser ───────────────────────────────────────────────────── */
 
 /*
- * find_primary_href — scan repomd.xml for the <data type="primary"> block
- * and extract the location href.
+ * find_primary_href — scan repomd.xml for the <data type="primary"> block and
+ * extract both the location href and the checksum of the compressed file.
  *
- * Returns 0 and writes the href into `out` on success; -1 on failure.
+ * The checksum is the point of the exercise.  RPM's repodata is a chain:
+ * repomd.xml records a digest for primary.xml, primary.xml records a digest
+ * for every package.  Fetching primary.xml and trusting it without checking
+ * that first link means every package digest packmule goes on to verify came
+ * from an unauthenticated document — the verification looks thorough and
+ * establishes nothing.
+ *
+ * Returns 0 and writes the href into `out` (and the digest into `out_digest`)
+ * on success; -1 on failure.
  */
-static int find_primary_href(const char *repomd, char *out, size_t out_size)
+static int find_primary_href(const char *repomd, char *out, size_t out_size,
+                             Digest *out_digest)
 {
     const char *p = repomd;
 
@@ -177,6 +193,34 @@ static int find_primary_href(const char *repomd, char *out, size_t out_size)
 
         snprintf(out, out_size, "%s", href);
         pm_free(href);
+
+        /*
+         * <checksum> in a repomd <data> block covers the compressed file;
+         * <open-checksum> covers the decompressed one.  We verify what we
+         * downloaded, so it is the former we want — and it must be the first
+         * <checksum> in the block, not an <open-checksum> that strstr for
+         * "<checksum " would also match were the tag not anchored.
+         */
+        const char *cs = p;
+        while ((cs = strstr_bound(cs, block_end, "<checksum ")) != NULL) {
+            const char *cs_tag_end = strchr(cs + 10, '>');
+            if (!cs_tag_end || cs_tag_end >= block_end)
+                break;
+            char      *ty   = xml_attr(cs + 10, "type");
+            DigestAlgo algo = digest_algo_from_name(ty);
+            pm_free(ty);
+            if (algo != DIGEST_NONE) {
+                const char *val = cs_tag_end + 1;
+                const char *end = strstr(val, "</checksum>");
+                if (end && end < block_end) {
+                    char *hex = pm_strndup(val, (size_t)(end - val));
+                    digest_set(out_digest, algo, DIGEST_ENC_HEX, hex);
+                    pm_free(hex);
+                }
+                break;
+            }
+            cs++;
+        }
         return 0;
     }
 
@@ -221,7 +265,7 @@ static char *decompress_to_string(const char *path)
         return NULL;
     }
 
-    size_t capacity = 4 * 1024 * 1024;  /* start at 4 MiB */
+    size_t capacity = (size_t)4 * 1024 * 1024;  /* start at 4 MiB */
     size_t size     = 0;
     char  *buf      = pm_malloc(capacity);
 
@@ -232,9 +276,25 @@ static char *decompress_to_string(const char *path)
 
     while ((r = archive_read_data_block(a, &block, &block_size, &offset))
            == ARCHIVE_OK) {
+        /*
+         * A compressed stream can expand without bound; without a ceiling a
+         * malformed or hostile repository turns into an OOM abort.  Even the
+         * largest real primary.xml (all of Fedora Everything) is well under
+         * this.
+         */
+        if (size + block_size > RPM_MAX_PRIMARY_BYTES) {
+            fprintf(stderr,
+                    "packmule: '%s' expands beyond %zu MB; refusing it\n",
+                    path, RPM_MAX_PRIMARY_BYTES / ((size_t)1024 * 1024));
+            pm_free(buf);
+            archive_read_free(a);
+            return NULL;
+        }
         if (size + block_size + 1 > capacity) {
             capacity = (size + block_size + 1) * 2;
-            buf      = pm_realloc(buf, capacity);
+            if (capacity > RPM_MAX_PRIMARY_BYTES + 1)
+                capacity = RPM_MAX_PRIMARY_BYTES + 1;
+            buf = pm_realloc(buf, capacity);
         }
         memcpy(buf + size, block, block_size);
         size += block_size;
@@ -328,17 +388,17 @@ int rpm_vercmp(const char *a, const char *b)
 
 /* One parsed <package> candidate from primary.xml. */
 typedef struct {
-    char *href;
-    char *sha256;
-    char *ver;      /* <version ver=…>  */
-    char *rel;      /* <version rel=…>  */
-    int   epoch;
+    char  *href;
+    Digest digest;  /* whatever algorithm the repository publishes */
+    char  *ver;     /* <version ver=…>  */
+    char  *rel;     /* <version rel=…>  */
+    int    epoch;
 } RpmCandidate;
 
 static void candidate_free(RpmCandidate *c)
 {
     pm_free(c->href);
-    pm_free(c->sha256);
+    digest_clear(&c->digest);
     pm_free(c->ver);
     pm_free(c->rel);
     memset(c, 0, sizeof(*c));
@@ -400,8 +460,14 @@ static int parse_package_block(const char *p, const char *pkg_end,
     if (!out->href)
         return -1;
 
-    /* Checksum: want the element with type="sha256":
-     *   <checksum type="sha256" pkgid="YES">abc123…</checksum> */
+    /*
+     * Checksum:  <checksum type="sha256" pkgid="YES">abc123…</checksum>
+     *
+     * createrepo_c emits whatever algorithm it was configured with — sha1 on
+     * older repositories, sha512 on some hardened ones.  Take whichever the
+     * repository publishes rather than demanding sha256: insisting on one
+     * algorithm used to surface as a misleading "package not found".
+     */
     const char *cs_search = p;
     while ((cs_search = strstr_bound(cs_search, pkg_end, "<checksum ")) != NULL) {
         const char *cs_tag_end = strchr(cs_search + 10, '>');
@@ -409,19 +475,22 @@ static int parse_package_block(const char *p, const char *pkg_end,
             cs_search++;
             continue;
         }
-        char *cs_type = xml_attr(cs_search + 10, "type");
-        int   is_sha  = cs_type && strcmp(cs_type, "sha256") == 0;
+        char      *cs_type = xml_attr(cs_search + 10, "type");
+        DigestAlgo algo    = digest_algo_from_name(cs_type);
         pm_free(cs_type);
-        if (is_sha) {
+        if (algo != DIGEST_NONE) {
             const char *cs_val = cs_tag_end + 1;
             const char *cs_end = strstr(cs_val, "</checksum>");
-            if (cs_end && cs_end < pkg_end)
-                out->sha256 = pm_strndup(cs_val, (size_t)(cs_end - cs_val));
+            if (cs_end && cs_end < pkg_end) {
+                char *hex = pm_strndup(cs_val, (size_t)(cs_end - cs_val));
+                digest_set(&out->digest, algo, DIGEST_ENC_HEX, hex);
+                pm_free(hex);
+            }
             break;
         }
         cs_search++;
     }
-    if (!out->sha256) {
+    if (!digest_is_set(&out->digest)) {
         candidate_free(out);
         return -1;
     }
@@ -461,7 +530,7 @@ int find_rpm_package(const char *primary_xml,
                      const char *version,
                      const char *arch,
                      char **out_href,
-                     char **out_sha256,
+                     Digest *out_digest,
                      char **out_version)
 {
     /* Build search strings once. */
@@ -547,7 +616,7 @@ int find_rpm_package(const char *primary_xml,
                 : pm_asprintf("%s",    best.ver);
 
     *out_href    = best.href;
-    *out_sha256  = best.sha256;
+    *out_digest  = best.digest;   /* ownership moves to the caller */
     *out_version = ver_str;
     pm_free(best.ver);
     pm_free(best.rel);
@@ -566,13 +635,29 @@ int find_rpm_package(const char *primary_xml,
  * The returned pointer is owned by the cache — the caller must NOT free it.
  * Returns NULL on error.  Single-threaded CLI: freed at process exit.
  */
+static char *g_cached_repo;
+static char *g_cached_xml;
+static RpmRepo *g_index;
+
+void rpm_backend_cleanup(RpmConfig *cfg)
+{
+    if (cfg)
+        cfg->repo = NULL;
+    rpm_repo_free(g_index);
+    g_index = NULL;
+    pm_free(g_cached_xml);
+    g_cached_xml = NULL;
+    pm_free(g_cached_repo);
+    g_cached_repo = NULL;
+}
+
 static char *fetch_primary_xml(const char *repo)
 {
-    static char *cached_repo = NULL;
-    static char *cached_xml  = NULL;
+    char **cached_repo = &g_cached_repo;
+    char **cached_xml  = &g_cached_xml;
 
-    if (cached_repo && strcmp(cached_repo, repo) == 0)
-        return cached_xml;
+    if (*cached_repo && strcmp(*cached_repo, repo) == 0)
+        return *cached_xml;
 
     /* ── Step 1: fetch repomd.xml ─────────────────────────────────────────── */
     char *repomd_url = pm_asprintf("%s/repodata/repomd.xml", repo);
@@ -582,13 +667,24 @@ static char *fetch_primary_xml(const char *repo)
     if (!repomd_xml)
         return NULL;
 
-    /* ── Step 2: locate primary database path ─────────────────────────────── */
-    char primary_href[1024];
-    if (find_primary_href(repomd_xml, primary_href, sizeof(primary_href)) != 0) {
+    /* ── Step 2: locate primary database path (and its expected digest) ──── */
+    char   primary_href[1024];
+    Digest primary_digest = {0};
+    if (find_primary_href(repomd_xml, primary_href, sizeof(primary_href),
+                          &primary_digest) != 0) {
         pm_free(repomd_xml);
         return NULL;
     }
     pm_free(repomd_xml);
+
+    if (!digest_is_set(&primary_digest)) {
+        fprintf(stderr,
+                "packmule: repomd.xml for %s publishes no usable checksum for "
+                "its primary database.\n"
+                "          Refusing to trust package digests read from an "
+                "unverifiable file.\n", repo);
+        return NULL;
+    }
 
     /* ── Step 3: download primary.xml.gz to a temp file ──────────────────── */
     /* Use mkstemp for an unpredictable name: a fixed path in a world-writable
@@ -613,28 +709,55 @@ static char *fetch_primary_xml(const char *repo)
     pm_free(primary_url);
     if (dl_rc != 0) {
         remove(tmp_path);
+        digest_clear(&primary_digest);
         return NULL;
     }
 
-    /* ── Step 4: decompress and cache ─────────────────────────────────────── */
+    /* ── Step 4: verify against repomd.xml, then decompress and cache ────── */
+    if (digest_verify_file(tmp_path, &primary_digest) != 0) {
+        fprintf(stderr,
+                "packmule: %s does not match the checksum in repomd.xml.\n"
+                "          The repository metadata is corrupt or has been "
+                "tampered with.\n", primary_href);
+        remove(tmp_path);
+        digest_clear(&primary_digest);
+        return NULL;
+    }
+    digest_clear(&primary_digest);
+
     char *primary_xml = decompress_to_string(tmp_path);
     remove(tmp_path);
     if (!primary_xml)
         return NULL;
 
-    pm_free(cached_repo);
-    pm_free(cached_xml);
-    cached_repo = pm_strdup(repo);
-    cached_xml  = primary_xml;
-    return cached_xml;
+    rpm_repo_free(g_index);
+    g_index = NULL;
+    pm_free(*cached_repo);
+    pm_free(*cached_xml);
+    *cached_repo = pm_strdup(repo);
+    *cached_xml  = primary_xml;
+    return *cached_xml;
+}
+
+/*
+ * repo_index — the indexed view of the cached primary.xml, built on first use.
+ * Only needed when depsolving is on, so the indexing cost is not paid by runs
+ * that just name their packages explicitly.
+ */
+static RpmRepo *repo_index(const char *primary_xml)
+{
+    if (!g_index)
+        g_index = rpm_repo_index(primary_xml);
+    return g_index;
 }
 
 /* ── Resolver ────────────────────────────────────────────────────────────── */
 
 static int rpm_resolve(const Registry *self, Package *pkg)
 {
-    const char *repo_url = self->repo_url;
-    const char *arch     = self->ctx ? (const char *)self->ctx : NULL;
+    const char      *repo_url = self->repo_url;
+    RpmConfig       *cfg      = (RpmConfig *)self->ctx;
+    const char      *arch     = cfg ? cfg->arch : NULL;
 
     if (!repo_url) {
         fprintf(stderr,
@@ -658,13 +781,17 @@ static int rpm_resolve(const Registry *self, Package *pkg)
         return -1;
     }
 
+    /* Index once, on the first resolve, when depsolving is enabled. */
+    if (cfg && cfg->resolve_deps && !cfg->repo)
+        cfg->repo = repo_index(primary_xml);
+
     /* Find the package in primary.xml. */
-    char *href    = NULL;
-    char *sha256  = NULL;
-    char *version = NULL;
+    char  *href    = NULL;
+    char  *version = NULL;
+    Digest digest  = {0};
 
     int frc = find_rpm_package(primary_xml, pkg->name, pkg->version, arch,
-                               &href, &sha256, &version);
+                               &href, &digest, &version);
     if (frc != 0) {
         if (frc == RPM_FIND_VERSION_MISMATCH)
             fprintf(stderr,
@@ -682,11 +809,11 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     /* Populate pkg fields. */
     pm_free(pkg->version);
     pm_free(pkg->url);
-    pm_free(pkg->sha256);
     pm_free(pkg->filename);
+    digest_clear(&pkg->digest);
 
     pkg->version  = version;
-    pkg->sha256   = sha256;
+    pkg->digest   = digest;      /* ownership moves into pkg */
 
     /* Derive filename from the location href (last path component). */
     const char *slash = strrchr(href, '/');
@@ -698,6 +825,205 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     pm_free(repo);
 
     return 0;
+}
+
+/* ── Transitive dependency resolver ─────────────────────────────────────── */
+
+/*
+ * pick_provider — choose which of `n` candidate blocks should satisfy `req`.
+ *
+ * Preference order:
+ *   1. the requirement's version constraint must hold;
+ *   2. a package whose own <name> IS the capability beats one that merely
+ *      provides it (asking for "bash" should get bash, not something that
+ *      happens to Provides: bash);
+ *   3. the target architecture beats noarch beats anything else;
+ *   4. highest EVR.
+ *
+ * Returns the winning index, or (size_t)-1 when nothing qualifies.
+ */
+static size_t pick_provider(const RpmRepo *repo, const size_t *cands, int n,
+                            const RpmCap *req, const char *cap_name,
+                            const char *arch)
+{
+    size_t best       = (size_t)-1;
+    int    best_score = -1;
+    int    best_epoch = 0;
+    char  *best_ver = NULL, *best_rel = NULL;
+
+    for (int i = 0; i < n; i++) {
+        const RpmBlock *b = rpm_repo_block(repo, cands[i]);
+        if (!b)
+            continue;
+
+        RpmCap prov;
+        int    have_prov = rpm_block_provides_matching(b, cap_name, &prov);
+        if (have_prov) {
+            int ok = rpm_cap_satisfied_by(req, &prov);
+            rpm_cap_clear(&prov);
+            if (!ok)
+                continue;
+        } else if (req->flags[0] && req->ver) {
+            /* File-path capability with a version constraint: nothing to
+             * compare against, so accept it rather than drop the dep. */
+        }
+
+        char *bname = rpm_block_name(b);
+        char *barch = rpm_block_arch(b);
+        int   score = 0;
+        if (bname && strcmp(bname, cap_name) == 0)                score += 4;
+        if (barch && arch && strcmp(barch, arch) == 0)            score += 2;
+        else if (barch && strcmp(barch, "noarch") == 0)           score += 1;
+        else if (barch && arch)                                   score -= 8;
+        pm_free(bname);
+        pm_free(barch);
+
+        int   epoch = 0;
+        char *ver = NULL, *rel = NULL;
+        if (rpm_block_evr(b, &epoch, &ver, &rel) != 0) {
+            pm_free(ver);
+            pm_free(rel);
+            continue;
+        }
+
+        /* First candidate wins by default; after that, a higher preference
+         * score wins outright and an equal score is broken on EVR. */
+        int better;
+        if (best == (size_t)-1 || score > best_score) {
+            better = 1;
+        } else if (score < best_score) {
+            better = 0;
+        } else {
+            int c = (epoch != best_epoch) ? (epoch > best_epoch ? 1 : -1)
+                                          : rpm_vercmp(ver, best_ver);
+            if (c == 0 && rel && best_rel)
+                c = rpm_vercmp(rel, best_rel);
+            better = c > 0;
+        }
+
+        if (better) {
+            best       = cands[i];
+            best_score = score;
+            best_epoch = epoch;
+            pm_free(best_ver);
+            pm_free(best_rel);
+            best_ver = ver;
+            best_rel = rel;
+        } else {
+            pm_free(ver);
+            pm_free(rel);
+        }
+    }
+
+    pm_free(best_ver);
+    pm_free(best_rel);
+    return best;
+}
+
+#define RPM_MAX_PROVIDERS 64
+
+/*
+ * rpm_get_deps — walk one package's <rpm:requires> and enqueue a provider for
+ * each unsatisfied capability.
+ *
+ * Scope note, because it surprises people: this resolves the closure *within
+ * the repository*, which includes base-system packages the target almost
+ * certainly already has (glibc, bash, systemd).  That is the safe default for
+ * an air-gapped install — dnf skips what is already present, and a bundle
+ * missing a dependency is unrecoverable on the target while a bundle
+ * carrying a redundant one merely costs disk.  Pass --rpm-deps none for the
+ * previous behaviour of bundling only what the manifest names.
+ */
+static int rpm_get_deps(const Registry *self, const Package *pkg,
+                        const PackageList *seen, PackageList *out)
+{
+    const RpmConfig *cfg = (const RpmConfig *)self->ctx;
+    if (!cfg || !cfg->resolve_deps || !cfg->repo)
+        return 0;
+
+    size_t idx[RPM_MAX_PROVIDERS];
+    int    n = rpm_repo_find_by_name(cfg->repo, pkg->name, idx,
+                                     RPM_MAX_PROVIDERS);
+    if (n <= 0)
+        return 0;
+
+    /* Locate the block matching the version we actually selected, so we walk
+     * the right package's requirements. */
+    const RpmBlock *self_block = NULL;
+    for (int i = 0; i < n && !self_block; i++) {
+        const RpmBlock *b = rpm_repo_block(cfg->repo, idx[i]);
+        int   epoch = 0;
+        char *ver = NULL, *rel = NULL;
+        if (b && rpm_block_evr(b, &epoch, &ver, &rel) == 0) {
+            char *evr = epoch > 0
+                ? (rel ? pm_asprintf("%d:%s-%s", epoch, ver, rel)
+                       : pm_asprintf("%d:%s", epoch, ver))
+                : (rel ? pm_asprintf("%s-%s", ver, rel)
+                       : pm_asprintf("%s", ver));
+            if (pkg->version && strcmp(evr, pkg->version) == 0)
+                self_block = b;
+            pm_free(evr);
+        }
+        pm_free(ver);
+        pm_free(rel);
+    }
+    if (!self_block)
+        self_block = rpm_repo_block(cfg->repo, idx[0]);
+
+    size_t  n_req = 0, n_rich = 0;
+    RpmCap *reqs  = rpm_block_requires(self_block, &n_req, &n_rich);
+
+    if (n_rich > 0)
+        fprintf(stderr,
+                "packmule: warning: %s has %zu boolean/rich dependency "
+                "expression(s) packmule cannot evaluate.\n"
+                "          Verify the install on the target, or list the "
+                "needed packages explicitly.\n", pkg->name, n_rich);
+
+    int added = 0;
+    for (size_t i = 0; i < n_req; i++) {
+        char *cap = pm_strndup(reqs[i].name, reqs[i].name_len);
+
+        size_t provs[RPM_MAX_PROVIDERS];
+        int    np = rpm_repo_find_providers(cfg->repo, cap, provs,
+                                            RPM_MAX_PROVIDERS);
+        if (np <= 0) {
+            fprintf(stderr,
+                    "packmule: warning: nothing in the repository provides "
+                    "'%s' (needed by %s).\n"
+                    "          If the target does not already have it, the "
+                    "install will fail.\n", cap, pkg->name);
+            pm_free(cap);
+            continue;
+        }
+
+        size_t win = pick_provider(cfg->repo, provs, np, &reqs[i], cap,
+                                   cfg->arch);
+        if (win == (size_t)-1) {
+            fprintf(stderr,
+                    "packmule: warning: no package satisfies '%s' at the "
+                    "required version (needed by %s)\n", cap, pkg->name);
+            pm_free(cap);
+            continue;
+        }
+        pm_free(cap);
+
+        char *pname = rpm_block_name(rpm_repo_block(cfg->repo, win));
+        if (!pname)
+            continue;
+
+        if (package_list_find_name(seen, pname, package_name_equal_exact)) {
+            pm_free(pname);
+            continue;   /* already queued or resolved */
+        }
+
+        package_list_add(out, package_create(pname, NULL));
+        pm_free(pname);
+        added++;
+    }
+
+    rpm_caps_free(reqs, n_req);
+    return added;
 }
 
 /* ── Filename detection ──────────────────────────────────────────────────── */
@@ -712,10 +1038,13 @@ static int rpm_detect(const char *basename)
 const Registry rpm_registry = {
     .name           = "rpm",
     .manifest_name  = "packages.txt",
+    /* RPM names are case-sensitive and '.'/'-' are meaningful
+     * (java-1.8.0-openjdk, python3.11): compare exactly. */
+    .name_equal     = package_name_equal_exact,
     .detect         = rpm_detect,
     .parse_manifest = rpm_parse_manifest,
     .resolve        = rpm_resolve,
-    .get_deps       = NULL, /* rpm does not support transitive resolution */
-    .ctx            = NULL, /* arch string, injected by main.c */
+    .get_deps       = rpm_get_deps,
+    .ctx            = NULL, /* RpmConfig *, injected by main.c */
     .repo_url       = NULL, /* set by main.c from -u flag */
 };

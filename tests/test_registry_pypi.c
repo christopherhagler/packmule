@@ -495,7 +495,8 @@ static void test_parse_response_prefers_manylinux(void)
     assert(rc == 0);
     assert(strcmp(pkg->filename,
                   "demo-1.0.0-cp312-cp312-manylinux_2_17_x86_64.whl") == 0);
-    assert(strcmp(pkg->sha256, "many222") == 0);
+    assert(strcmp(pkg->digest.value, "many222") == 0);
+    assert(pkg->digest.algo == DIGEST_SHA256);
 
     package_destroy(pkg);
 }
@@ -522,7 +523,8 @@ static void test_parse_response_prefers_lowest_glibc(void)
     int rc = pypi_parse_response(json, pkg, "x86_64", "linux", 12);
 
     assert(rc == 0);
-    assert(strcmp(pkg->sha256, "glibc217") == 0);
+    assert(strcmp(pkg->digest.value, "glibc217") == 0);
+    assert(pkg->digest.algo == DIGEST_SHA256);
 
     package_destroy(pkg);
 }
@@ -547,7 +549,8 @@ static void test_parse_response_windows_amd64(void)
     int rc = pypi_parse_response(json, pkg, "x86_64", "windows", 12);
 
     assert(rc == 0);
-    assert(strcmp(pkg->sha256, "win111") == 0);
+    assert(strcmp(pkg->digest.value, "win111") == 0);
+    assert(pkg->digest.algo == DIGEST_SHA256);
 
     package_destroy(pkg);
 }
@@ -573,7 +576,8 @@ static void test_parse_response_skips_yanked(void)
     int rc = pypi_parse_response(json, pkg, "x86_64", "linux", 12);
 
     assert(rc == 0);
-    assert(strcmp(pkg->sha256, "sdist333") == 0);
+    assert(strcmp(pkg->digest.value, "sdist333") == 0);
+    assert(pkg->digest.algo == DIGEST_SHA256);
 
     package_destroy(pkg);
 }
@@ -600,7 +604,7 @@ static void test_parse_response_rejects_musllinux(void)
 
     assert(rc == 0);
     assert(strcmp(pkg->filename, "demo-1.0.0.tar.gz") == 0);
-    assert(strcmp(pkg->sha256,   "sdist333")          == 0);
+    assert(strcmp(pkg->digest.value, "sdist333")       == 0);
 
     package_destroy(pkg);
 }

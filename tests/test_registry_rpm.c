@@ -6,6 +6,7 @@
  * primary.xml scanning against inline XML — no network calls either.
  */
 #include "registry.h"
+#include "hash.h"
 #include "registry_internal.h"
 #include "package.h"
 #include "utils.h"
@@ -275,40 +276,44 @@ static const char *PRIMARY_XML =
 
 static void test_find_unpinned_picks_newest(void)
 {
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "bash", NULL, "x86_64",
                               &href, &sha, &ver);
     assert(rc == 0);
     /* 5.2.26 > 5.2.15 — first-match would have returned 5.2.15. */
     assert(strcmp(ver,  "5.2.26-1.fc40") == 0);
-    assert(strcmp(sha,  "bbb222")        == 0);
+    assert(strcmp(sha.value, "bbb222")        == 0);
     assert(strstr(href, "bash-5.2.26")   != NULL);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 }
 
 static void test_find_pin_honored(void)
 {
     /* Pin the OLDER version: it must be returned, not the newest. */
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "bash", "5.2.15", "x86_64",
                               &href, &sha, &ver);
     assert(rc == 0);
     assert(strcmp(ver, "5.2.15-3.fc39") == 0);
-    assert(strcmp(sha, "aaa111")        == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    assert(strcmp(sha.value, "aaa111")        == 0);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 
     /* "ver-rel" pin form works too. */
-    href = sha = ver = NULL;
+    href = ver = NULL;
+    sha = (Digest){0};
     rc = find_rpm_package(PRIMARY_XML, "bash", "5.2.15-3.fc39", "x86_64",
                           &href, &sha, &ver);
     assert(rc == 0);
-    assert(strcmp(sha, "aaa111") == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    assert(strcmp(sha.value, "aaa111") == 0);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 }
 
 static void test_find_pin_mismatch(void)
 {
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "bash", "9.9.9", "x86_64",
                               &href, &sha, &ver);
     assert(rc == RPM_FIND_VERSION_MISMATCH);
@@ -316,7 +321,8 @@ static void test_find_pin_mismatch(void)
 
 static void test_find_not_found(void)
 {
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "zsh", NULL, "x86_64",
                               &href, &sha, &ver);
     assert(rc == RPM_FIND_NOT_FOUND);
@@ -325,7 +331,8 @@ static void test_find_not_found(void)
 static void test_find_arch_filter(void)
 {
     /* htop only exists for aarch64: invisible to an x86_64 target… */
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "htop", NULL, "x86_64",
                               &href, &sha, &ver);
     assert(rc == RPM_FIND_NOT_FOUND);
@@ -334,28 +341,30 @@ static void test_find_arch_filter(void)
     rc = find_rpm_package(PRIMARY_XML, "htop", NULL, "aarch64",
                           &href, &sha, &ver);
     assert(rc == 0);
-    assert(strcmp(sha, "ccc333") == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    assert(strcmp(sha.value, "ccc333") == 0);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 
     /* noarch packages match any target arch. */
-    href = sha = ver = NULL;
+    href = ver = NULL;
+    sha = (Digest){0};
     rc = find_rpm_package(PRIMARY_XML, "tzdata", NULL, "x86_64",
                           &href, &sha, &ver);
     assert(rc == 0);
-    assert(strcmp(sha, "ddd444") == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    assert(strcmp(sha.value, "ddd444") == 0);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 }
 
 static void test_find_hyphenated_name(void)
 {
     /* The full hyphenated name must match as a whole. */
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "python3-pip", NULL, "x86_64",
                               &href, &sha, &ver);
     assert(rc == 0);
-    assert(strcmp(sha, "eee555")         == 0);
+    assert(strcmp(sha.value, "eee555")         == 0);
     assert(strcmp(ver, "23.3.2-1.fc40")  == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 
     /* And a prefix of it ("python3") is NOT a match in this repo. */
     rc = find_rpm_package(PRIMARY_XML, "python3", NULL, "x86_64",
@@ -366,21 +375,23 @@ static void test_find_hyphenated_name(void)
 static void test_find_epoch_wins(void)
 {
     /* dnf 1:0.5.0 outranks 0:4.19.0 — epoch trumps version. */
-    char *href = NULL, *sha = NULL, *ver = NULL;
+    char *href = NULL, *ver = NULL;
+    Digest sha = {0};
     int rc = find_rpm_package(PRIMARY_XML, "dnf", NULL, "x86_64",
                               &href, &sha, &ver);
     assert(rc == 0);
     assert(strcmp(ver, "1:0.5.0-1.fc40") == 0);
-    assert(strcmp(sha, "fff666")         == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    assert(strcmp(sha.value, "fff666")         == 0);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 
     /* Epoch-qualified pin form. */
-    href = sha = ver = NULL;
+    href = ver = NULL;
+    sha = (Digest){0};
     rc = find_rpm_package(PRIMARY_XML, "dnf", "1:0.5.0-1.fc40", "x86_64",
                           &href, &sha, &ver);
     assert(rc == 0);
-    assert(strcmp(sha, "fff666") == 0);
-    pm_free(href); pm_free(sha); pm_free(ver);
+    assert(strcmp(sha.value, "fff666") == 0);
+    pm_free(href); digest_clear(&sha); pm_free(ver);
 }
 
 int main(void)

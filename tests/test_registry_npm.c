@@ -8,6 +8,7 @@
 #include "registry.h"
 #include "registry_internal.h"
 #include "package.h"
+#include "utils.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -45,7 +46,7 @@ static void test_basic_dependencies(void)
     assert(list != NULL);
     assert(list->count == 2);
     assert(strcmp(list->items[0]->name,    "express") == 0);
-    assert(strcmp(list->items[0]->version, "^4.18.2") == 0);
+    assert(strcmp(list->items[0]->constraint, "^4.18.2") == 0);
     assert(strcmp(list->items[1]->name,    "lodash")  == 0);
     assert(strcmp(list->items[1]->version, "4.17.21") == 0);
 
@@ -68,7 +69,7 @@ static void test_scoped_package(void)
     assert(list != NULL);
     assert(list->count == 1);
     assert(strcmp(list->items[0]->name,    "@scope/pkg") == 0);
-    assert(strcmp(list->items[0]->version, "~1.0.0")     == 0);
+    assert(strcmp(list->items[0]->constraint, "~1.0.0")     == 0);
 
     package_list_destroy(list);
     cleanup();
@@ -98,7 +99,7 @@ static void test_manifest_dep_objects(void)
     assert(strcmp(list->items[0]->name, "express")  == 0);
     assert(strcmp(list->items[1]->name, "fsevents") == 0);
     assert(strcmp(list->items[2]->name, "react")    == 0);
-    assert(strcmp(list->items[2]->version, ">=17")  == 0);
+    assert(strcmp(list->items[2]->constraint, ">=17")  == 0);
 
     package_list_destroy(list);
     cleanup();
@@ -123,9 +124,9 @@ static void test_manifest_alias(void)
     assert(list != NULL);
     assert(list->count == 2);   /* both left-pad aliases collapse to one */
     assert(strcmp(list->items[0]->name,    "left-pad")   == 0);
-    assert(strcmp(list->items[0]->version, "^1.3.0")     == 0);
+    assert(strcmp(list->items[0]->constraint, "^1.3.0")     == 0);
     assert(strcmp(list->items[1]->name,    "@scope/pkg") == 0);
-    assert(strcmp(list->items[1]->version, "~2.0.0")     == 0);
+    assert(strcmp(list->items[1]->constraint, "~2.0.0")     == 0);
 
     package_list_destroy(list);
     cleanup();
@@ -222,25 +223,25 @@ static void test_fixture_file(void)
 
     /* JSON key order is preserved by cJSON. */
     assert(strcmp(list->items[0]->name,    "react")                  == 0);
-    assert(strcmp(list->items[0]->version, "^18.2.0")                == 0);
+    assert(strcmp(list->items[0]->constraint, "^18.2.0")                == 0);
 
     assert(strcmp(list->items[1]->name,    "react-dom")              == 0);
-    assert(strcmp(list->items[1]->version, "^18.2.0")                == 0);
+    assert(strcmp(list->items[1]->constraint, "^18.2.0")                == 0);
 
     assert(strcmp(list->items[2]->name,    "react-router-dom")       == 0);
-    assert(strcmp(list->items[2]->version, "^6.22.3")                == 0);
+    assert(strcmp(list->items[2]->constraint, "^6.22.3")                == 0);
 
     assert(strcmp(list->items[4]->name,    "lodash")                 == 0);
-    assert(strcmp(list->items[4]->version, "^4.17.21")               == 0);
+    assert(strcmp(list->items[4]->constraint, "^4.17.21")               == 0);
 
     assert(strcmp(list->items[5]->name,    "@tanstack/react-query")  == 0);
-    assert(strcmp(list->items[5]->version, "^5.28.6")                == 0);
+    assert(strcmp(list->items[5]->constraint, "^5.28.6")                == 0);
 
     assert(strcmp(list->items[9]->name,    "@radix-ui/react-dialog") == 0);
-    assert(strcmp(list->items[9]->version, "^1.0.5")                 == 0);
+    assert(strcmp(list->items[9]->constraint, "^1.0.5")                 == 0);
 
     assert(strcmp(list->items[10]->name,    "fsevents")              == 0);
-    assert(strcmp(list->items[10]->version, "^2.3.3")                == 0);
+    assert(strcmp(list->items[10]->constraint, "^2.3.3")                == 0);
 
     package_list_destroy(list);
 }
@@ -290,7 +291,9 @@ static void test_lockfile_parse(void)
     assert(strcmp(list->items[0]->name,     "debug")            == 0);
     assert(strcmp(list->items[0]->version,  "2.6.9")            == 0);
     assert(strcmp(list->items[0]->filename, "debug-2.6.9.tgz")  == 0);
-    assert(strcmp(list->items[0]->sha256,   "sha512-aaa")       == 0);
+    assert(list->items[0]->digest.algo == DIGEST_SHA512);
+    assert(list->items[0]->digest.enc  == DIGEST_ENC_BASE64);
+    assert(strcmp(list->items[0]->digest.value, "aaa")          == 0);
     assert(strcmp(list->items[0]->url,
                   "https://registry.npmjs.org/debug/-/debug-2.6.9.tgz") == 0);
 
@@ -415,7 +418,7 @@ static void test_npm_get_deps_enqueues_new(void)
     /* The semver range must survive into the queued package's version, so
      * npm_resolve can honor it — dropping it meant "always latest". */
     assert(strcmp(out->items[0]->name,    "body-parser")    == 0);
-    assert(strcmp(out->items[0]->version, "^1.20.0")        == 0);
+    assert(strcmp(out->items[0]->constraint, "^1.20.0")        == 0);
     assert(strcmp(out->items[1]->name,    "path-to-regexp") == 0);
     assert(strcmp(out->items[1]->version, "0.1.7")          == 0);
 
@@ -437,9 +440,9 @@ static void test_npm_get_deps_scoped_names(void)
 
     assert(added == 2);
     assert(strcmp(out->items[0]->name,    "@babel/core") == 0);
-    assert(strcmp(out->items[0]->version, "^7.24.0")     == 0);
+    assert(strcmp(out->items[0]->constraint, "^7.24.0")     == 0);
     assert(strcmp(out->items[1]->name,    "@scope/pkg")  == 0);
-    assert(strcmp(out->items[1]->version, "~1.0.0")      == 0);
+    assert(strcmp(out->items[1]->constraint, "~1.0.0")      == 0);
 
     package_destroy(pkg);
     package_list_destroy(seen);
@@ -499,7 +502,7 @@ static void test_npm_get_deps_alias(void)
 
     assert(added == 1);
     assert(strcmp(out->items[0]->name,    "left-pad") == 0);
-    assert(strcmp(out->items[0]->version, "^1.3.0")   == 0);
+    assert(strcmp(out->items[0]->constraint, "^1.3.0")   == 0);
 
     package_destroy(pkg);
     package_list_destroy(seen);
@@ -508,19 +511,55 @@ static void test_npm_get_deps_alias(void)
 
 static void test_npm_get_deps_range_intersection(void)
 {
-    /* A still-queued (unresolved) duplicate narrows to the intersection of
-     * both ranges, so the eventual resolution honours every dependent. */
+    /* A duplicate narrows to the intersection of both ranges, so the eventual
+     * resolution honours every dependent.  Ranges live in `constraint`;
+     * `version` only ever holds a concrete version. */
     const char *deps[] = { "ms@^2.1.3" };
     Package     *pkg   = make_npm_resolved("debug", deps, 1);
     const Registry *npm = registry_find("npm");
     PackageList *queue = package_list_create();
-    package_list_add(queue, package_create("ms", "^2.1.0"));   /* url == NULL */
+    Package *ms = package_create("ms", NULL);
+    ms->constraint = pm_strdup("^2.1.0");
+    package_list_add(queue, ms);
 
     int added = npm->get_deps(npm, pkg, queue, queue);
 
     assert(added == 0);
     assert(queue->count == 1);
-    assert(strcmp(queue->items[0]->version, "^2.1.0 ^2.1.3") == 0);
+    assert(strcmp(queue->items[0]->constraint, "^2.1.0 ^2.1.3") == 0);
+    assert(queue->items[0]->version == NULL);
+
+    /* Idempotent: the fixpoint resolver calls get_deps once per round, and a
+     * constraint that grew a duplicate term each time would never settle. */
+    npm->get_deps(npm, pkg, queue, queue);
+    assert(strcmp(queue->items[0]->constraint, "^2.1.0 ^2.1.3") == 0);
+
+    package_destroy(pkg);
+    package_list_destroy(queue);
+}
+
+static void test_npm_get_deps_redirties_resolved_package(void)
+{
+    /*
+     * The order-dependence fix: when a dependent's range reaches a package
+     * that has ALREADY been resolved, recording it must mark that package
+     * dirty so the resolver revisits it.  Previously this path only warned,
+     * and the bundle kept whatever version happened to be chosen first.
+     */
+    const char *deps[] = { "ms@^2.1.3" };
+    Package     *pkg   = make_npm_resolved("debug", deps, 1);
+    const Registry *npm = registry_find("npm");
+
+    PackageList *queue = package_list_create();
+    Package *ms = package_create("ms", "2.0.0");
+    ms->state = PKG_RESOLVED;
+    ms->dirty = 0;
+    package_list_add(queue, ms);
+
+    npm->get_deps(npm, pkg, queue, queue);
+
+    assert(queue->items[0]->dirty == 1);
+    assert(strcmp(queue->items[0]->constraint, "^2.1.3") == 0);
 
     package_destroy(pkg);
     package_list_destroy(queue);
@@ -565,7 +604,8 @@ static void test_npm_parse_response_basic(void)
     assert(strcmp(pkg->version,  "4.18.2")             == 0);
     assert(strcmp(pkg->url,
                   "https://registry.npmjs.org/express/-/express-4.18.2.tgz") == 0);
-    assert(strcmp(pkg->sha256,   "sha512-abcdef")      == 0);
+    assert(pkg->digest.algo == DIGEST_SHA512);
+    assert(strcmp(pkg->digest.value, "abcdef")         == 0);
     assert(strcmp(pkg->filename, "express-4.18.2.tgz") == 0);
 
     /* dep_specs carry "name@range". */
@@ -672,6 +712,7 @@ int main(void)
     test_npm_get_deps_dedup();
     test_npm_get_deps_alias();
     test_npm_get_deps_range_intersection();
+    test_npm_get_deps_redirties_resolved_package();
     test_npm_get_deps_unbundleable_fails();
     test_npm_parse_response_basic();
     test_npm_parse_response_missing_integrity();

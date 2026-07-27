@@ -3,6 +3,10 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+#__PACKMULE_VERIFY__
+
+[ "${PACKMULE_SKIP_VERIFY:-0}" = "1" ] || packmule_verify "$DIR" || exit 1
+
 # Bare `pip` is often missing (or belongs to a different interpreter) on
 # minimal/hardened systems; always go through the interpreter itself.
 if command -v python3 >/dev/null 2>&1; then
@@ -17,8 +21,11 @@ fi
 # If the bundle carries source distributions it also carries setuptools/wheel;
 # install those first so the sdists can build.  Build isolation is disabled
 # below because an offline pip cannot fetch build backends from an index.
-if ls "$DIR"/setuptools-*.whl >/dev/null 2>&1; then
-  "$PY" -m pip install --no-index --find-links="$DIR" setuptools wheel
+# Both wheel and sdist forms are matched: setuptools may itself have been
+# bundled as an sdist.
+if ls "$DIR"/setuptools-* >/dev/null 2>&1; then
+  "$PY" -m pip install --no-index --find-links="$DIR" --no-build-isolation \
+      setuptools wheel
 fi
 
 # Install everything from the bundled requirements.txt without contacting any

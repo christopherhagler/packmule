@@ -3,8 +3,34 @@
 
 #include <ctype.h>
 #include <string.h>
+#include <strings.h>
 
 #define INITIAL_CAPACITY 16
+
+/* ── Name equality ────────────────────────────────────────────────────────── */
+
+int package_name_equal_pep503(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        char ca = (char)tolower((unsigned char)*a);
+        char cb = (char)tolower((unsigned char)*b);
+        if (ca == '-' || ca == '_' || ca == '.') ca = '-';
+        if (cb == '-' || cb == '_' || cb == '.') cb = '-';
+        if (ca != cb)
+            return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+int package_name_equal_casefold(const char *a, const char *b)
+{
+    return strcasecmp(a, b) == 0;
+}
+
+int package_name_equal_exact(const char *a, const char *b)
+{
+    return strcmp(a, b) == 0;
+}
 
 /* ── Package ──────────────────────────────────────────────────────────────── */
 
@@ -14,8 +40,87 @@ Package *package_create(const char *name, const char *version)
     pkg->name    = pm_strdup(name);
     if (version)
         pkg->version = pm_strdup(version);
-    /* url, sha256, filename remain NULL until populated by parse_pypi_response */
+    pkg->state = PKG_QUEUED;
     return pkg;
+}
+
+static void free_dep_specs(char **specs)
+{
+    if (!specs)
+        return;
+    for (char **p = specs; *p; p++)
+        pm_free(*p);
+    pm_free(specs);
+}
+
+void package_set_dep_specs(Package *pkg, char **specs)
+{
+    free_dep_specs(pkg->dep_specs);
+    pkg->dep_specs = specs;
+}
+
+int package_set_constraint(Package *pkg, char *constraint)
+{
+    int changed = (constraint == NULL) != (pkg->constraint == NULL) ||
+                  (constraint && pkg->constraint &&
+                   strcmp(constraint, pkg->constraint) != 0);
+
+    pm_free(pkg->constraint);
+    pkg->constraint = constraint;
+
+    if (changed && pkg->state == PKG_RESOLVED)
+        pkg->dirty = 1;
+    return changed;
+}
+
+/* has_extra — is `token` (length `len`) already one of `list`'s comma-
+ * separated entries?  Whole-token comparison: "sec" must not match inside
+ * "security". */
+static int has_extra(const char *list, const char *token, size_t len)
+{
+    if (!list)
+        return 0;
+    for (const char *p = list; *p; ) {
+        const char *comma = strchr(p, ',');
+        size_t      n     = comma ? (size_t)(comma - p) : strlen(p);
+        if (n == len && strncasecmp(p, token, len) == 0)
+            return 1;
+        if (!comma)
+            break;
+        p = comma + 1;
+    }
+    return 0;
+}
+
+int package_add_extras(Package *pkg, const char *extras)
+{
+    if (!extras || !*extras)
+        return 0;
+
+    int added = 0;
+    for (const char *p = extras; *p; ) {
+        const char *comma = strchr(p, ',');
+        size_t      len   = comma ? (size_t)(comma - p) : strlen(p);
+
+        if (len > 0 && !has_extra(pkg->extras, p, len)) {
+            char *merged = pkg->extras
+                ? pm_asprintf("%s,%.*s", pkg->extras, (int)len, p)
+                : pm_strndup(p, len);
+            pm_free(pkg->extras);
+            pkg->extras = merged;
+            added = 1;
+        }
+
+        if (!comma)
+            break;
+        p = comma + 1;
+    }
+
+    /* Extras decide which dependencies get followed, so gaining one after
+     * resolution means the dependency walk has to run again. */
+    if (added && pkg->state == PKG_RESOLVED)
+        pkg->dirty = 1;
+    return added;
 }
 
 void package_destroy(Package *pkg)
@@ -24,16 +129,12 @@ void package_destroy(Package *pkg)
         return;
     pm_free(pkg->name);
     pm_free(pkg->version);
-    pm_free(pkg->url);
-    pm_free(pkg->sha256);
-    pm_free(pkg->filename);
     pm_free(pkg->constraint);
     pm_free(pkg->extras);
-    if (pkg->dep_specs) {
-        for (char **p = pkg->dep_specs; *p; p++)
-            pm_free(*p);
-        pm_free(pkg->dep_specs);
-    }
+    pm_free(pkg->url);
+    pm_free(pkg->filename);
+    digest_clear(&pkg->digest);
+    free_dep_specs(pkg->dep_specs);
     pm_free(pkg);
 }
 
@@ -59,30 +160,21 @@ int package_list_add(PackageList *list, Package *pkg)
     return 0;
 }
 
-Package *package_list_find_name(const PackageList *list, const char *name)
+Package *package_list_find_name(const PackageList *list, const char *name,
+                                package_name_equal_fn eq)
 {
-    for (size_t i = 0; i < list->count; i++) {
-        const char *a = list->items[i]->name;
-        const char *b = name;
-        for (; *a && *b; a++, b++) {
-            /* PyPI normalizes '-', '_', and '.' as equivalent (PEP 503). */
-            char ca = (char)tolower((unsigned char)*a);
-            char cb = (char)tolower((unsigned char)*b);
-            if (ca == '-' || ca == '_' || ca == '.') ca = '-';
-            if (cb == '-' || cb == '_' || cb == '.') cb = '-';
-            if (ca != cb)
-                goto next;
-        }
-        if (*a == '\0' && *b == '\0')
+    if (!eq)
+        eq = package_name_equal_exact;
+    for (size_t i = 0; i < list->count; i++)
+        if (eq(list->items[i]->name, name))
             return list->items[i];
-next:;
-    }
     return NULL;
 }
 
-int package_list_contains_name(const PackageList *list, const char *name)
+int package_list_contains_name(const PackageList *list, const char *name,
+                               package_name_equal_fn eq)
 {
-    return package_list_find_name(list, name) != NULL;
+    return package_list_find_name(list, name, eq) != NULL;
 }
 
 void package_list_destroy(PackageList *list)

@@ -41,6 +41,9 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Largest package.json / package-lock.json we will read into memory. */
+#define NPM_MAX_MANIFEST_BYTES ((size_t)256 * 1024 * 1024)
+
 /* ── Dependency-spec helpers (shared by manifest and transitive paths) ───── */
 
 /*
@@ -135,6 +138,80 @@ static const char *const NPM_DEP_KEYS[] = {
 };
 enum { NPM_DEP_NKEYS = 3 };
 
+/* ── Version classifier ──────────────────────────────────────────────────── */
+
+/*
+ * is_exact_version — return 1 if `ver` is an exact full semver triple.
+ *
+ * Exact: "major.minor.patch" with all three numeric parts present, then
+ * optionally a prerelease/build suffix.
+ * Examples:  "4.18.2"  "1.0.0-beta.1"  "2.0.0+build.1"
+ * Ranges:    "^4.18.2"  "~1.2.3"  ">=1.0.0"  "*"  ""
+ *            "4"  "4.2"   ← bare partials are x-range shorthand in npm
+ *                           (>=4.0.0 <5.0.0), NOT versions the registry
+ *                           serves at /<name>/<ver> (that 404s).
+ */
+static int is_exact_version(const char *ver)
+{
+    if (!ver)
+        return 0;
+
+    const char *p = ver;
+    for (int part = 0; part < 3; part++) {
+        if (!isdigit((unsigned char)*p))
+            return 0;
+        while (isdigit((unsigned char)*p))
+            p++;
+        if (part < 2) {
+            if (*p != '.')
+                return 0;
+            p++;
+        }
+    }
+
+    /* Anything after the triple must be a prerelease/build suffix. */
+    if (*p == '\0')
+        return 1;
+    if (*p != '-' && *p != '+')
+        return 0;
+    for (; *p; p++) {
+        if (!isalnum((unsigned char)*p) &&
+            *p != '.' && *p != '-' && *p != '+')
+            return 0;
+    }
+    return 1;
+}
+
+/* Specs that mean "whatever is newest" — served directly by /<name>/latest. */
+static int is_any_version(const char *ver)
+{
+    return !ver || ver[0] == '\0' ||
+           strcmp(ver, "*")      == 0 ||
+           strcmp(ver, "x")      == 0 ||
+           strcmp(ver, "latest") == 0;
+}
+
+/*
+ * npm_package_from_spec — build a Package from a "name": "spec" pair.
+ *
+ * An exact triple is a pin the resolver must not move off; anything else is a
+ * range, and ranges belong in `constraint`.  Storing a range in `version` —
+ * which this backend used to do — leaves no way to distinguish what was asked
+ * for from what was chosen.
+ */
+static Package *npm_package_from_spec(const char *name, const char *spec)
+{
+    if (is_exact_version(spec)) {
+        Package *p = package_create(name, spec);
+        p->user_pinned = 1;
+        return p;
+    }
+    Package *p = package_create(name, NULL);
+    if (spec && !is_any_version(spec))
+        p->constraint = pm_strdup(spec);
+    return p;
+}
+
 /* ── Manifest parser ─────────────────────────────────────────────────────── */
 
 /* read_json_file — parse the JSON document at `path`.  Returns NULL (with a
@@ -151,17 +228,38 @@ static cJSON *read_json_file(const char *path, int quiet)
     long fsize = -1;
     if (fseek(fp, 0, SEEK_END) == 0)
         fsize = ftell(fp);
-    if (fsize < 0) {
+    /* fseek back rather than rewind(): rewind has no way to report failure,
+     * and a silent failure here would read the file from the wrong offset. */
+    if (fsize < 0 || fseek(fp, 0, SEEK_SET) != 0) {
         if (!quiet)
             fprintf(stderr, "packmule: cannot determine size of %s\n", path);
         fclose(fp);
         return NULL;
     }
-    rewind(fp);
 
-    char  *buf   = pm_malloc((size_t)fsize + 1);
-    size_t nread = fread(buf, 1, (size_t)fsize, fp);
-    buf[nread]   = '\0';
+    /* Bound the read.  A lockfile for a very large monorepo runs to a few tens
+     * of megabytes; past that the input is not a manifest, and allocating
+     * whatever size the filesystem reports would turn a bad path into an
+     * out-of-memory abort. */
+    if ((size_t)fsize > NPM_MAX_MANIFEST_BYTES) {
+        if (!quiet)
+            fprintf(stderr,
+                    "packmule: %s is larger than %zu MB; refusing to parse it\n",
+                    path, NPM_MAX_MANIFEST_BYTES / ((size_t)1024 * 1024));
+        fclose(fp);
+        return NULL;
+    }
+
+    size_t want   = (size_t)fsize;
+    char  *buf    = pm_malloc(want + 1);
+    size_t nread  = fread(buf, 1, want, fp);
+    if (nread > want)          /* unreachable; keeps the bound explicit */
+        nread = want;
+    /* buf holds want+1 bytes and nread <= want, so this index is in range.
+     * The analyzer cannot see the size pm_malloc was called with (it lives in
+     * another translation unit and returns void *), so it treats the file
+     * size as an unbounded tainted value. */
+    buf[nread] = '\0';         /* NOLINT(clang-analyzer-security.ArrayBound) */
     fclose(fp);
 
     cJSON *root = cJSON_Parse(buf);
@@ -256,8 +354,20 @@ static PackageList *npm_parse_lockfile(const cJSON *root, const char *path)
 
         Package *p  = package_create(name, vstr);
         p->url      = pm_strdup(res->valuestring);
-        p->sha256   = pm_strdup(integ->valuestring);
         p->filename = npm_local_filename(name, res->valuestring);
+        if (digest_parse_sri(&p->digest, integ->valuestring) != 0) {
+            fprintf(stderr,
+                    "packmule: %s in %s has an integrity value packmule "
+                    "cannot verify (%s).\n",
+                    name, path, integ->valuestring);
+            package_destroy(p);
+            package_list_destroy(list);
+            return NULL;
+        }
+        /* A lock entry is npm's own final answer: fully resolved, and not
+         * something the resolver may revise. */
+        p->state       = PKG_RESOLVED;
+        p->user_pinned = 1;
         package_list_add(list, p);
     }
     return list;
@@ -369,8 +479,9 @@ static PackageList *npm_parse_manifest(const Registry *self, const char *path)
             /* The same package may appear in several objects (commonly
              * dependencies + optionalDependencies); the first — most
              * specific — entry wins. */
-            if (!package_list_contains_name(list, name))
-                package_list_add(list, package_create(name, range));
+            if (!package_list_contains_name(list, name,
+                                            package_name_equal_casefold))
+                package_list_add(list, npm_package_from_spec(name, range));
             pm_free(name);
             pm_free(range);
         }
@@ -378,50 +489,6 @@ static PackageList *npm_parse_manifest(const Registry *self, const char *path)
 
     cJSON_Delete(root);
     return list;
-}
-
-/* ── Version classifier ──────────────────────────────────────────────────── */
-
-/*
- * is_exact_version — return 1 if `ver` is an exact full semver triple.
- *
- * Exact: "major.minor.patch" with all three numeric parts present, then
- * optionally a prerelease/build suffix.
- * Examples:  "4.18.2"  "1.0.0-beta.1"  "2.0.0+build.1"
- * Ranges:    "^4.18.2"  "~1.2.3"  ">=1.0.0"  "*"  ""
- *            "4"  "4.2"   ← bare partials are x-range shorthand in npm
- *                           (>=4.0.0 <5.0.0), NOT versions the registry
- *                           serves at /<name>/<ver> (that 404s).
- */
-static int is_exact_version(const char *ver)
-{
-    if (!ver)
-        return 0;
-
-    const char *p = ver;
-    for (int part = 0; part < 3; part++) {
-        if (!isdigit((unsigned char)*p))
-            return 0;
-        while (isdigit((unsigned char)*p))
-            p++;
-        if (part < 2) {
-            if (*p != '.')
-                return 0;
-            p++;
-        }
-    }
-
-    /* Anything after the triple must be a prerelease/build suffix. */
-    if (*p == '\0')
-        return 1;
-    if (*p != '-' && *p != '+')
-        return 0;
-    for (; *p; p++) {
-        if (!isalnum((unsigned char)*p) &&
-            *p != '.' && *p != '-' && *p != '+')
-            return 0;
-    }
-    return 1;
 }
 
 /* ── URL builder ─────────────────────────────────────────────────────────── */
@@ -497,13 +564,22 @@ static int npm_parse_version_doc(const cJSON *doc, Package *pkg)
         return -1;
     }
 
+    Digest d = {0};
+    if (digest_parse_sri(&d, integrity->valuestring) != 0) {
+        fprintf(stderr,
+                "packmule: npm package %s@%s publishes an integrity value "
+                "packmule cannot verify (%s).\n",
+                pkg->name, ver_item->valuestring, integrity->valuestring);
+        return -1;
+    }
+
     pm_free(pkg->version);
     pm_free(pkg->url);
-    pm_free(pkg->sha256);
     pm_free(pkg->filename);
+    digest_clear(&pkg->digest);
     pkg->version = pm_strdup(ver_item->valuestring);
     pkg->url     = pm_strdup(tarball->valuestring);
-    pkg->sha256  = pm_strdup(integrity->valuestring);  /* "sha512-<base64>" */
+    pkg->digest  = d;                       /* ownership moves into pkg */
 
     pkg->filename = npm_local_filename(pkg->name, tarball->valuestring);
 
@@ -515,13 +591,9 @@ static int npm_parse_version_doc(const cJSON *doc, Package *pkg)
         if (cJSON_IsObject(deps))
             total += cJSON_GetArraySize(deps);
     }
+    package_set_dep_specs(pkg, NULL);
     if (total > 0) {
-        if (pkg->dep_specs) {
-            for (char **p = pkg->dep_specs; *p; p++)
-                pm_free(*p);
-            pm_free(pkg->dep_specs);
-        }
-        pkg->dep_specs = pm_malloc(((size_t)total + 1) * sizeof(char *));
+        char **specs = pm_malloc(((size_t)total + 1) * sizeof(char *));
         int k = 0;
         for (int i = 0; i < NPM_DEP_NKEYS; i++) {
             cJSON *deps = cJSON_GetObjectItemCaseSensitive(doc, NPM_DEP_KEYS[i]);
@@ -541,22 +613,23 @@ static int npm_parse_version_doc(const cJSON *doc, Package *pkg)
                 size_t nlen = strlen(entry->string);
                 int    dup  = 0;
                 for (int j = 0; j < k && !dup; j++) {
-                    const char *at = strrchr(pkg->dep_specs[j], '@');
-                    size_t len = (at && at != pkg->dep_specs[j])
-                               ? (size_t)(at - pkg->dep_specs[j])
-                               : strlen(pkg->dep_specs[j]);
+                    const char *at = strrchr(specs[j], '@');
+                    size_t len = (at && at != specs[j])
+                               ? (size_t)(at - specs[j])
+                               : strlen(specs[j]);
                     dup = (len == nlen &&
-                           strncmp(pkg->dep_specs[j], entry->string, len) == 0);
+                           strncmp(specs[j], entry->string, len) == 0);
                 }
                 if (dup)
                     continue;
 
-                pkg->dep_specs[k++] = pm_asprintf("%s@%s", entry->string,
-                                                  cJSON_IsString(entry)
-                                                      ? entry->valuestring : "");
+                specs[k++] = pm_asprintf("%s@%s", entry->string,
+                                         cJSON_IsString(entry)
+                                             ? entry->valuestring : "");
             }
         }
-        pkg->dep_specs[k] = NULL;
+        specs[k] = NULL;
+        package_set_dep_specs(pkg, specs);
     }
 
     return 0;
@@ -576,9 +649,9 @@ int npm_parse_response(const char *json, Package *pkg)
 
 /*
  * npm_resolve_range — resolve a semver range against a packument: pick the
- * highest key of the "versions" object satisfying `pkg->version`, mirroring
- * npm's own selection.  A non-semver spec (git URL, dist-tag) falls back to
- * the "latest" dist-tag with a warning.  Returns 0 on success.
+ * highest key of the "versions" object satisfying `pkg->constraint`, mirroring
+ * npm's own selection.  A non-semver spec (dist-tag) falls back to the
+ * matching dist-tag, then to "latest" with a warning.  Returns 0 on success.
  */
 static int npm_resolve_range(const char *json, Package *pkg)
 {
@@ -603,7 +676,7 @@ static int npm_resolve_range(const char *json, Package *pkg)
     cJSON_ArrayForEach(entry, versions) {
         if (!entry->string)
             continue;
-        int sat = semver_satisfies(entry->string, pkg->version);
+        int sat = semver_satisfies(entry->string, pkg->constraint);
         if (sat == -1)
             unparseable = 1;
         else if (sat == 1 &&
@@ -617,7 +690,7 @@ static int npm_resolve_range(const char *json, Package *pkg)
          * back to "latest" with a warning (git/URL/path specs never get here —
          * manifest parsing rejects them). */
         cJSON *tags = cJSON_GetObjectItemCaseSensitive(root, "dist-tags");
-        cJSON *tag  = cJSON_GetObjectItemCaseSensitive(tags, pkg->version);
+        cJSON *tag  = cJSON_GetObjectItemCaseSensitive(tags, pkg->constraint);
         if (cJSON_IsString(tag))
             best = cJSON_GetObjectItemCaseSensitive(versions, tag->valuestring);
 
@@ -625,7 +698,7 @@ static int npm_resolve_range(const char *json, Package *pkg)
             fprintf(stderr,
                     "packmule: %s: spec '%s' is not a semver range or "
                     "dist-tag; falling back to latest\n",
-                    pkg->name, pkg->version);
+                    pkg->name, pkg->constraint);
             cJSON *latest = cJSON_GetObjectItemCaseSensitive(tags, "latest");
             if (cJSON_IsString(latest))
                 best = cJSON_GetObjectItemCaseSensitive(versions,
@@ -636,12 +709,12 @@ static int npm_resolve_range(const char *json, Package *pkg)
     if (!best) {
         fprintf(stderr,
                 "packmule: no published version of %s satisfies '%s'\n",
-                pkg->name, pkg->version ? pkg->version : "(none)");
+                pkg->name, pkg->constraint ? pkg->constraint : "(none)");
         /* A space-joined spec is the intersection of several dependents'
          * ranges (see npm_get_deps).  When it is unsatisfiable the tree
          * needs two versions of this package at once — something only a
          * lockfile-driven bundle can represent. */
-        if (pkg->version && strchr(pkg->version, ' '))
+        if (pkg->constraint && strchr(pkg->constraint, ' '))
             fprintf(stderr,
                     "          The dependency tree needs multiple versions "
                     "of %s.  Bundle your project's\n"
@@ -660,28 +733,27 @@ done:
 
 /* ── Resolver ────────────────────────────────────────────────────────────── */
 
-/* Specs that mean "whatever is newest" — served directly by /<name>/latest. */
-static int is_any_version(const char *ver)
-{
-    return !ver || ver[0] == '\0' ||
-           strcmp(ver, "*")      == 0 ||
-           strcmp(ver, "x")      == 0 ||
-           strcmp(ver, "latest") == 0;
-}
-
 static int npm_resolve(const Registry *self, Package *pkg)
 {
     /* Lockfile entries arrive fully resolved (url/integrity/filename from
      * the lock); there is nothing to ask the registry. */
-    if (pkg->url && pkg->sha256 && pkg->filename)
+    if (pkg->user_pinned && pkg->url && digest_is_set(&pkg->digest) &&
+        pkg->filename)
         return 0;
+
+    /* A version chosen on an earlier round is provisional: if a dependent has
+     * since narrowed the constraint, choose again. */
+    if (pkg->version && !pkg->user_pinned && pkg->constraint) {
+        pm_free(pkg->version);
+        pkg->version = NULL;
+    }
 
     char *url;
     int   want_range = 0;
 
-    if (is_exact_version(pkg->version)) {
+    if (pkg->version) {
         url = npm_build_url(pkg->name, pkg->version, self->repo_url);
-    } else if (is_any_version(pkg->version)) {
+    } else if (is_any_version(pkg->constraint)) {
         url = npm_build_url(pkg->name, "latest", self->repo_url);
     } else {
         /* Semver range: need the full packument to pick from "versions". */
@@ -697,10 +769,55 @@ static int npm_resolve(const Registry *self, Package *pkg)
     int ret = want_range ? npm_resolve_range(json, pkg)
                          : npm_parse_response(json, pkg);
     pm_free(json);
+
+    /* A manifest pin that no longer satisfies what its dependents need is a
+     * genuine conflict, not something to install and hope about. */
+    if (ret == 0 && pkg->user_pinned && pkg->constraint && pkg->version &&
+        semver_satisfies(pkg->version, pkg->constraint) == 0) {
+        fprintf(stderr,
+                "packmule: %s is pinned to %s but other packages require "
+                "'%s'.\n"
+                "          Bundle a package-lock.json if the tree genuinely "
+                "needs two versions.\n",
+                pkg->name, pkg->version, pkg->constraint);
+        return -1;
+    }
     return ret;
 }
 
 /* ── Transitive dependency resolver ─────────────────────────────────────── */
+
+/*
+ * npm_merge_range — AND `range` into pkg->constraint, node-semver style
+ * (space is conjunction).  Idempotent: the fixpoint resolver calls get_deps
+ * once per round, so a constraint that grew a duplicate term every time would
+ * never settle.  Returns 1 when the constraint actually changed.
+ */
+static int npm_merge_range(Package *pkg, const char *range)
+{
+    if (!pkg->constraint || is_any_version(pkg->constraint))
+        return package_set_constraint(pkg, pm_strdup(range));
+
+    if (strcmp(pkg->constraint, range) == 0)
+        return 0;
+
+    /* "||" alternation does not distribute over concatenation. */
+    if (strstr(pkg->constraint, "||") || strstr(range, "||"))
+        return 0;
+
+    /* Already one of the space-separated terms? */
+    size_t rlen = strlen(range);
+    for (const char *p = pkg->constraint; *p; ) {
+        while (*p == ' ') p++;
+        size_t n = strcspn(p, " ");
+        if (n == rlen && strncmp(p, range, n) == 0)
+            return 0;
+        p += n;
+    }
+
+    return package_set_constraint(pkg,
+                                  pm_asprintf("%s %s", pkg->constraint, range));
+}
 
 static int npm_get_deps(const Registry *self, const Package *pkg,
                          const PackageList *seen, PackageList *out)
@@ -740,38 +857,21 @@ static int npm_get_deps(const Registry *self, const Package *pkg,
             return -1;
         }
 
-        Package *existing = package_list_find_name(seen, name);
+        Package *existing = package_list_find_name(seen, name,
+                                                   package_name_equal_casefold);
         if (existing) {
-            if (existing->url) {
-                /* Already resolved: the selected version must satisfy this
-                 * dependent's range too, or the offline install will try
-                 * (and fail) to fetch a second version from the registry. */
-                if (range && existing->version &&
-                    semver_satisfies(existing->version, range) == 0)
-                    fprintf(stderr,
-                            "packmule: warning: %s requires %s@%s but %s is "
-                            "already selected; the offline install may fail\n",
-                            pkg->name, name, range, existing->version);
-            } else if (range) {
-                /* Still queued: narrow its spec so the eventual resolution
-                 * honours every dependent (space is AND in node-semver).
-                 * "||" alternation cannot be intersected by concatenation;
-                 * keep the first spec and let the bundle check catch any
-                 * real mismatch. */
-                if (!existing->version || is_any_version(existing->version)) {
-                    pm_free(existing->version);
-                    existing->version = pm_strdup(range);
-                } else if (strcmp(existing->version, range) != 0 &&
-                           !strstr(existing->version, "||") &&
-                           !strstr(range, "||")) {
-                    char *merged = pm_asprintf("%s %s",
-                                               existing->version, range);
-                    pm_free(existing->version);
-                    existing->version = merged;
-                }
-            }
+            /*
+             * Record this dependent's range on the entry and let the resolver
+             * come back to it.  Space is AND in node-semver, so intersecting
+             * is string concatenation — except across "||" alternation, which
+             * concatenation cannot express; there we keep the existing spec
+             * and rely on the post-bundle install check to catch a genuine
+             * mismatch.
+             */
+            if (range && !is_any_version(range))
+                npm_merge_range(existing, range);
         } else {
-            package_list_add(out, package_create(name, range));
+            package_list_add(out, npm_package_from_spec(name, range));
             added++;
         }
         pm_free(name);
@@ -794,6 +894,10 @@ static int npm_detect(const char *basename)
 const Registry npm_registry = {
     .name           = "npm",
     .manifest_name  = "package.json",
+    /* npm names are case-insensitive for lookup, but '.', '-' and '_' are
+     * distinct characters: "lodash.merge" and "lodash-merge" are different
+     * packages.  PyPI's PEP 503 folding must not be applied here. */
+    .name_equal     = package_name_equal_casefold,
     .detect         = npm_detect,
     .parse_manifest = npm_parse_manifest,
     .resolve        = npm_resolve,

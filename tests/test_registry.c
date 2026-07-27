@@ -72,11 +72,25 @@ static void test_manifest_names_set(void)
 
 static void test_get_deps_vtable(void)
 {
-    /* pypi and npm implement transitive resolution via get_deps. */
+    /* Every backend implements transitive resolution. */
     assert(registry_find("pypi")->get_deps != NULL);
     assert(registry_find("npm")->get_deps  != NULL);
-    /* rpm does not follow transitive dependencies automatically. */
-    assert(registry_find("rpm")->get_deps  == NULL);
+    assert(registry_find("rpm")->get_deps  != NULL);
+}
+
+static void test_name_equal_vtable(void)
+{
+    /* Name identity is a per-registry rule and every backend must state it;
+     * falling back to a default would silently give one registry another's
+     * semantics. */
+    const char *const *names = registry_names();
+    for (int i = 0; names[i]; i++)
+        assert(registry_find(names[i])->name_equal != NULL);
+
+    /* And they are genuinely different rules. */
+    assert(registry_find("pypi")->name_equal("a.b", "a-b") == 1);
+    assert(registry_find("npm")->name_equal("a.b", "a-b")  == 0);
+    assert(registry_find("rpm")->name_equal("A", "a")      == 0);
 }
 
 int main(void)
@@ -86,5 +100,6 @@ int main(void)
     test_names_list();
     test_manifest_names_set();
     test_get_deps_vtable();
+    test_name_equal_vtable();
     return 0;
 }

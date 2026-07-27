@@ -4,9 +4,13 @@ on:
   push:
     branches: ["main", "master"]
   pull_request:
+  schedule:
+    # Nightly, so the network-dependent end-to-end tests run against the real
+    # registries without slowing down every pull request.
+    - cron: "0 4 * * *"
 
 jobs:
-  # ── Ubuntu (22.04 / 24.04) × (gcc / clang) ──────────────────────────────────
+  # ── Ubuntu (22.04 / 24.04) × (gcc / clang) + macOS ──────────────────────────
   build:
     name: ${{ matrix.os }} / ${{ matrix.cc }}
     runs-on: ${{ matrix.os }}
@@ -15,35 +19,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux / GCC ────────────────────────────────────────────────────
-          - os: ubuntu-22.04
-            cc: gcc
-          - os: ubuntu-24.04
-            cc: gcc
-          # ── Linux / Clang ──────────────────────────────────────────────────
-          - os: ubuntu-22.04
-            cc: clang
-          - os: ubuntu-24.04
-            cc: clang
-          # ── macOS / Apple Clang ────────────────────────────────────────────
-          - os: macos-latest
-            cc: clang
+          - { os: ubuntu-22.04,  cc: gcc }
+          - { os: ubuntu-24.04,  cc: gcc }
+          - { os: ubuntu-22.04,  cc: clang }
+          - { os: ubuntu-24.04,  cc: clang }
+          - { os: macos-latest,  cc: clang }
 
     steps:
       - uses: actions/checkout@v4
 
-      # ── Install dependencies ──────────────────────────────────────────────
       - name: Install dependencies (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            cmake \
-            ${{ matrix.cc }} \
-            libcurl4-openssl-dev \
-            libssl-dev \
-            libarchive-dev \
-            libcjson-dev
+            cmake ${{ matrix.cc }} \
+            libcurl4-openssl-dev libssl-dev libarchive-dev libcjson-dev
 
       - name: Install dependencies (macOS)
         if: startsWith(matrix.os, 'macos')
@@ -54,7 +45,6 @@ jobs:
           echo "SSL_PREFIX=$(brew --prefix openssl@3)"       >> "$GITHUB_ENV"
           echo "ARCHIVE_PREFIX=$(brew --prefix libarchive)"  >> "$GITHUB_ENV"
 
-      # ── Configure ─────────────────────────────────────────────────────────
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
@@ -71,24 +61,94 @@ jobs:
 
           cmake -B build $CMAKE_ARGS
 
-      # ── Build ──────────────────────────────────────────────────────────────
       - name: Build
         run: cmake --build build --parallel
 
-      # ── Test ───────────────────────────────────────────────────────────────
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      # ── Smoke-test the binary ──────────────────────────────────────────────
       - name: Smoke test (--help)
-        run: ./build/packmule --help || true   # exits 0; just check it runs
+        run: ./build/packmule --help
 
-      - name: Smoke test (missing -r flag)
+      - name: Smoke test (missing -f is an error)
         run: |
           if ./build/packmule 2>/dev/null; then
-            echo "Expected non-zero exit when -r is missing" && exit 1
+            echo "Expected non-zero exit when -f is missing" && exit 1
           fi
           echo "OK: exited non-zero as expected"
+
+      - name: Smoke test (verify rejects a bundle it cannot check)
+        run: |
+          mkdir -p /tmp/emptybundle
+          if ./build/packmule verify /tmp/emptybundle 2>/dev/null; then
+            echo "Expected non-zero exit with no SHA256SUMS" && exit 1
+          fi
+          echo "OK: exited non-zero as expected"
+
+  # ── Sanitizers ──────────────────────────────────────────────────────────────
+  #
+  # Most of this codebase is hand-rolled parsing of untrusted input (XML,
+  # version strings, wheel filenames), which is exactly the shape of code that
+  # goes wrong in ways a passing test suite does not reveal.  ASan + UBSan on
+  # every push is the cheapest insurance available.
+  sanitizers:
+    name: sanitizers (asan+ubsan)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake clang \
+            libcurl4-openssl-dev libssl-dev libarchive-dev libcjson-dev
+
+      - name: Configure
+        env:
+          CC: clang
+        run: |
+          cmake -B build-asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DPACKMULE_WERROR=OFF \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g"
+
+      - name: Build
+        run: cmake --build build-asan --parallel
+
+      - name: Test under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-asan --output-on-failure
+
+  # ── Static analysis ─────────────────────────────────────────────────────────
+  analyze:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake clang clang-tidy shellcheck \
+            libcurl4-openssl-dev libssl-dev libarchive-dev libcjson-dev
+
+      - name: Configure (for compile_commands.json)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      # The generated header must exist before anything is analysed.
+      - name: Generate embedded scripts
+        run: cmake --build build --target bundle_scripts
+
+      - name: clang-tidy
+        run: |
+          clang-tidy -p build --warnings-as-errors='*' src/*.c
+
+      - name: shellcheck the install scripts
+        run: shellcheck -s sh scripts/*.sh
 
   # ── Fedora (latest) / GCC — run inside a Fedora container ───────────────────
   build-fedora:
@@ -103,13 +163,8 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y \
-            cmake \
-            gcc \
-            libcurl-devel \
-            openssl-devel \
-            libarchive-devel \
-            cjson-devel \
-            gzip
+            cmake gcc libcurl-devel openssl-devel libarchive-devel \
+            cjson-devel gzip
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
@@ -121,11 +176,40 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Smoke test (--help)
-        run: ./build/packmule --help || true
+        run: ./build/packmule --help
 
-      - name: Smoke test (missing -r flag)
+  # ── End-to-end against the real registries ──────────────────────────────────
+  #
+  # Network-dependent, so nightly and on demand rather than per-push.  These
+  # are the only tests that exercise the whole pipeline through to an actual
+  # offline install, which is the thing users care about.
+  e2e:
+    name: end-to-end (network)
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
-          if ./build/packmule 2>/dev/null; then
-            echo "Expected non-zero exit when -r is missing" && exit 1
-          fi
-          echo "OK: exited non-zero as expected"
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake gcc \
+            libcurl4-openssl-dev libssl-dev libarchive-dev libcjson-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DPACKMULE_E2E_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run end-to-end tests
+        run: ctest --test-dir build -L e2e --output-on-failure

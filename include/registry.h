@@ -24,8 +24,15 @@ struct Registry {
     const char *manifest_name;
 
     /*
+     * name_equal — this registry's package-name identity rule.  Required.
+     * See package_name_equal_fn in package.h for why this is per-registry.
+     */
+    package_name_equal_fn name_equal;
+
+    /*
      * parse_manifest — read the registry-specific manifest file and return
-     * a PackageList with name/version populated for each entry.
+     * a PackageList with name and, where the manifest is explicit, version /
+     * constraint / extras populated for each entry.
      *
      * Returns a heap-allocated PackageList (possibly empty) on success.
      * Returns NULL on I/O error; the error is printed to stderr.
@@ -43,24 +50,32 @@ struct Registry {
     int (*detect)(const char *basename);
 
     /*
-     * resolve — query the upstream registry to fill in pkg->url, pkg->sha256,
-     * pkg->filename, and (if previously NULL) pkg->version.
+     * resolve — select a concrete version for `pkg` and fill in pkg->url,
+     * pkg->digest, pkg->filename, pkg->version and pkg->dep_specs.
      *
-     * On success, any previous values in those fields are freed and replaced
-     * with newly heap-allocated strings.
+     * The resolver calls this again whenever pkg->dirty is set — a later
+     * dependent narrowed pkg->constraint — so an implementation must be
+     * idempotent and must honour pkg->constraint on every call.  It must not
+     * change pkg->version when pkg->user_pinned is set.
+     *
+     * On success, previous values in those fields are freed and replaced.
      * Returns 0 on success, -1 on failure (error printed to stderr).
      */
     int (*resolve)(const Registry *self, Package *pkg);
 
     /*
-     * get_deps — enqueue transitive dependencies discovered after resolve().
+     * get_deps — record the transitive dependencies discovered by resolve().
      *
-     * For each dependency implied by `pkg` that is not already present in
-     * `seen`, appends a new Package to `out`.  The registry is responsible
-     * for all format-specific filtering (e.g. extras-only entries for PyPI).
-     * `seen` and `out` may point to the same list.
+     * For each dependency implied by `pkg`: append a new Package to `out` if
+     * it is not already in `seen`, or merge the requirement into the existing
+     * entry (narrowing its constraint, unioning its extras) if it is.  When a
+     * merge widens what an already-resolved package must satisfy, the entry
+     * must be marked dirty so the resolver revisits it.  The registry is
+     * responsible for all format-specific filtering (e.g. extras-only entries
+     * for PyPI).  `seen` and `out` may point to the same list.
      *
-     * Returns the number of packages added, or -1 on internal error.
+     * Returns the number of packages added, or -1 on an error that makes the
+     * bundle unbuildable (e.g. an npm git dependency).
      * May be NULL for registries that do not support transitive resolution.
      */
     int (*get_deps)(const Registry *self, const Package *pkg,
