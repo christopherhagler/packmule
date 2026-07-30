@@ -670,3 +670,21 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 - [ ] Signature verification beyond digests — GPG for RPMs, PyPI
       attestations, npm provenance
 - [ ] More backends: Go modules, crates.io, Maven
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the checks CI
+runs (tests, ASan/UBSan, clang-tidy, shellcheck), and the resolver invariants
+reviewers enforce.
+
+## Security
+
+Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md), which
+also documents what packmule's digest and metadata verification does and does
+not protect against.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

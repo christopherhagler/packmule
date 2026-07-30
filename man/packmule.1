@@ -435,9 +435,17 @@ field.
 .PP
 For the
 .B rpm
-backend, dependencies are not followed automatically.
-Every package that must be present in the bundle should be listed explicitly
-in the manifest.
+backend, transitive dependencies are followed by default: each
+.I <rpm:requires>
+capability is matched against the
+.I <rpm:provides>
+and file lists published in the repository metadata, and one provider is
+bundled per capability.
+See
+.B \-\-rpm\-deps
+to turn this off.
+Version constraints on a capability are compared using RPM epoch-version-release
+ordering.
 When an architecture-specific package and a
 .B noarch
 package are both available,
@@ -472,6 +480,28 @@ Written when
 .B \-\-bundle
 is given.
 .TP
+.I output_dir/SHA256SUMS
+SHA\-256 digests of every package file and of the generated metadata, in
+.BR sha256sum (1)
+format.
+Written when
+.B \-\-bundle
+is given, and checked by
+.I install.sh
+and by
+.BR "packmule verify" .
+.TP
+.I output_dir/package-lock.json
+Copy of the project's lockfile, consumed by
+.I install.sh
+via
+.BR "npm ci \-\-offline" .
+Written when
+.B \-\-bundle
+is given, the active backend is
+.BR npm ,
+and the manifest directory contained a lockfile.
+.TP
 .I output_dir/install.sh
 Shell script for installing the bundle on the target machine.
 Written when
@@ -504,4 +534,5 @@ Written by Christopher Hagler.
 .br
 Report bugs at
 .UR https://github.com/christopherhagler/packmule/issues
+the issue tracker
 .UE .

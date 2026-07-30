@@ -24,6 +24,17 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/packmule_e2e_npm.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
+# count_glob — how many of the given paths exist.  Called with an unquoted
+# glob, so a pattern matching nothing yields 0 rather than counting the
+# literal unexpanded pattern the shell leaves behind.
+count_glob() {
+    n=0
+    for f in "$@"; do
+        [ -e "$f" ] && n=$((n + 1))
+    done
+    echo "$n"
+}
+
 cat > package.json <<'EOF'
 {
   "dependencies": {
@@ -49,7 +60,7 @@ cat bundle.log
 # dep (ms) must be present exactly once, and typescript must NOT be bundled.
 ls vendor/isaacs-string-locale-compare-*.tgz >/dev/null \
     || { echo "FAIL: scoped tarball missing/misnamed"; ls vendor; exit 1; }
-[ "$(ls vendor/ms-*.tgz | wc -l)" -eq 1 ] \
+[ "$(count_glob vendor/ms-*.tgz)" -eq 1 ] \
     || { echo "FAIL: expected exactly one ms tarball"; ls vendor; exit 1; }
 if ls vendor/typescript-*.tgz >/dev/null 2>&1; then
     echo "FAIL: devDependency was bundled"; exit 1
@@ -119,7 +130,7 @@ grep -q "using package-lock.json" bundle.log \
     || { echo "FAIL: sibling lockfile was not preferred"; exit 1; }
 grep -q "offline install check PASSED" bundle.log \
     || { echo "FAIL: lock-mode offline install check did not pass"; exit 1; }
-[ "$(ls vendor/debug-*.tgz | wc -l)" -eq 2 ] \
+[ "$(count_glob vendor/debug-*.tgz)" -eq 2 ] \
     || { echo "FAIL: expected both debug versions bundled"; ls vendor; exit 1; }
 
 mkdir extracted

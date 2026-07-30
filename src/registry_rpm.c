@@ -639,6 +639,36 @@ static char *g_cached_repo;
 static char *g_cached_xml;
 static RpmRepo *g_index;
 
+/* ── One-shot warnings ───────────────────────────────────────────────────── */
+
+/*
+ * The fixpoint resolver calls get_deps again every time a package is marked
+ * dirty, so a warning printed there repeats once per round — and an unmet
+ * capability like '/bin/sh' is requested by most packages in a repository,
+ * which multiplies it again.  Warnings are keyed by their subject (the missing
+ * capability, or the package with rich dependencies) and printed once.
+ *
+ * A linear scan is the right structure here: the set holds tens of entries at
+ * most, and it is consulted only on the failure path.
+ */
+static char **g_warned;
+static size_t g_warned_n;
+static size_t g_warned_cap;
+
+static int warn_once(const char *key)
+{
+    for (size_t i = 0; i < g_warned_n; i++)
+        if (strcmp(g_warned[i], key) == 0)
+            return 0;
+
+    if (g_warned_n == g_warned_cap) {
+        g_warned_cap = g_warned_cap ? g_warned_cap * 2 : 16;
+        g_warned = pm_realloc(g_warned, g_warned_cap * sizeof *g_warned);
+    }
+    g_warned[g_warned_n++] = pm_strdup(key);
+    return 1;
+}
+
 void rpm_backend_cleanup(RpmConfig *cfg)
 {
     if (cfg)
@@ -649,6 +679,13 @@ void rpm_backend_cleanup(RpmConfig *cfg)
     g_cached_xml = NULL;
     pm_free(g_cached_repo);
     g_cached_repo = NULL;
+
+    for (size_t i = 0; i < g_warned_n; i++)
+        pm_free(g_warned[i]);
+    pm_free(g_warned);
+    g_warned     = NULL;
+    g_warned_n   = 0;
+    g_warned_cap = 0;
 }
 
 static char *fetch_primary_xml(const char *repo)
@@ -973,12 +1010,16 @@ static int rpm_get_deps(const Registry *self, const Package *pkg,
     size_t  n_req = 0, n_rich = 0;
     RpmCap *reqs  = rpm_block_requires(self_block, &n_req, &n_rich);
 
-    if (n_rich > 0)
-        fprintf(stderr,
-                "packmule: warning: %s has %zu boolean/rich dependency "
-                "expression(s) packmule cannot evaluate.\n"
-                "          Verify the install on the target, or list the "
-                "needed packages explicitly.\n", pkg->name, n_rich);
+    if (n_rich > 0) {
+        char *key = pm_asprintf("rich:%s", pkg->name);
+        if (warn_once(key))
+            fprintf(stderr,
+                    "packmule: warning: %s has %zu boolean/rich dependency "
+                    "expression(s) packmule cannot evaluate.\n"
+                    "          Verify the install on the target, or list the "
+                    "needed packages explicitly.\n", pkg->name, n_rich);
+        pm_free(key);
+    }
 
     int added = 0;
     for (size_t i = 0; i < n_req; i++) {
@@ -988,11 +1029,17 @@ static int rpm_get_deps(const Registry *self, const Package *pkg,
         int    np = rpm_repo_find_providers(cfg->repo, cap, provs,
                                             RPM_MAX_PROVIDERS);
         if (np <= 0) {
-            fprintf(stderr,
-                    "packmule: warning: nothing in the repository provides "
-                    "'%s' (needed by %s).\n"
-                    "          If the target does not already have it, the "
-                    "install will fail.\n", cap, pkg->name);
+            /* Keyed on the capability, not the requester: the operator needs
+             * the set of things the target must already provide, and most of
+             * these are wanted by nearly every package in the repository. */
+            char *key = pm_asprintf("cap:%s", cap);
+            if (warn_once(key))
+                fprintf(stderr,
+                        "packmule: warning: nothing in the repository provides "
+                        "'%s' (first needed by %s).\n"
+                        "          If the target does not already have it, the "
+                        "install will fail.\n", cap, pkg->name);
+            pm_free(key);
             pm_free(cap);
             continue;
         }

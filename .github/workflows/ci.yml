@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main", "master"]
   pull_request:
+  # The end-to-end job is gated on this event as well as the schedule, so that
+  # a maintainer can run the network tests on demand before cutting a release
+  # rather than waiting for the nightly.
+  workflow_dispatch:
   schedule:
     # Nightly, so the network-dependent end-to-end tests run against the real
     # registries without slowing down every pull request.
@@ -147,8 +151,11 @@ jobs:
         run: |
           clang-tidy -p build --warnings-as-errors='*' src/*.c
 
-      - name: shellcheck the install scripts
-        run: shellcheck -s sh scripts/*.sh
+      # The install scripts ship inside every bundle and the e2e scripts are
+      # the only thing checking the pipeline end to end, so both are held to
+      # the same standard as the C.
+      - name: shellcheck the install and e2e scripts
+        run: shellcheck -s sh scripts/*.sh tests/e2e/*.sh
 
   # ── Fedora (latest) / GCC — run inside a Fedora container ───────────────────
   build-fedora:

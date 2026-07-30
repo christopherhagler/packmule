@@ -31,6 +31,8 @@ mkdir extracted
 tar -xzf vendor.tar.gz -C extracted
 
 python3 -m venv venv
+# Generated at runtime by venv, so there is nothing for shellcheck to follow.
+# shellcheck disable=SC1091
 . venv/bin/activate
 
 sh extracted/vendor/install.sh
