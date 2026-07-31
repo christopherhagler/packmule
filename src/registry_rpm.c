@@ -525,6 +525,46 @@ static int parse_package_block(const char *p, const char *pkg_end,
  * Returns RPM_FIND_NOT_FOUND when no package has that name/arch, and
  * RPM_FIND_VERSION_MISMATCH when the name exists but not at `version`.
  */
+/*
+ * license_for_href — the <rpm:license> of the package block whose
+ * <location href="…"> is `href`.
+ *
+ * Kept separate from find_rpm_package rather than added to its out-parameters:
+ * the licence is wanted only by the SBOM writer, and widening a signature that
+ * fourteen tests pin in order to carry one optional field is a poor trade.
+ * The href uniquely identifies the block, so the second scan cannot drift from
+ * the package that was actually selected.
+ *
+ * Returns a heap string the caller frees with pm_free(), or NULL.
+ */
+static char *license_for_href(const char *primary_xml, const char *href)
+{
+    char needle[1024];
+    int  written = snprintf(needle, sizeof(needle), "href=\"%s\"", href);
+    if (written < 0 || (size_t)written >= sizeof(needle))
+        return NULL;
+
+    const char *p = primary_xml;
+    while ((p = strstr(p, "<package ")) != NULL) {
+        const char *pkg_end = strstr(p, "</package>");
+        if (!pkg_end)
+            break;
+
+        if (strstr_bound(p, pkg_end, needle)) {
+            const char *lic = strstr_bound(p, pkg_end, "<rpm:license>");
+            if (lic) {
+                const char *val = lic + strlen("<rpm:license>");
+                const char *end = strstr_bound(val, pkg_end, "</rpm:license>");
+                if (end && end > val)
+                    return pm_strndup(val, (size_t)(end - val));
+            }
+            return NULL;      /* right block, no licence recorded */
+        }
+        p = pkg_end + 10;
+    }
+    return NULL;
+}
+
 int find_rpm_package(const char *primary_xml,
                      const char *name,
                      const char *version,
@@ -855,6 +895,9 @@ static int rpm_resolve(const Registry *self, Package *pkg)
     /* Derive filename from the location href (last path component). */
     const char *slash = strrchr(href, '/');
     pkg->filename = pm_strdup(slash ? slash + 1 : href);
+
+    pm_free(pkg->license);
+    pkg->license = license_for_href(primary_xml, href);
 
     /* Build full download URL: repo_base + "/" + location_href */
     pkg->url = pm_asprintf("%s/%s", repo, href);

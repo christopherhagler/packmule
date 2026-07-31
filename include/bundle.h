@@ -3,6 +3,8 @@
 
 #include "package.h"
 
+typedef struct Registry Registry;
+
 typedef struct {
     const char  *output_dir;
     const char  *registry_name;
@@ -16,6 +18,20 @@ typedef struct {
      */
     const char  *aux_file;
     const char  *aux_name;
+
+    /*
+     * SbomFormat flags (see sbom.h).  Generated before SHA256SUMS so the
+     * documents are covered by it and travel inside the archive: an inventory
+     * that can be swapped out without detection is not much of an inventory.
+     */
+    int          sbom_formats;
+
+    /*
+     * The backend that resolved these packages.  The SBOM needs its name (to
+     * choose a purl type) and its name-equality rule (to match a dependency
+     * specifier back to the component satisfying it).
+     */
+    const Registry *registry;
 } BundleOptions;
 
 /*

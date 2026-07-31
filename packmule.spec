@@ -1,6 +1,6 @@
 Name:           packmule
 Version:        0.2.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Air-gapped multi-registry package bundler
 
 License:        MIT
@@ -50,6 +50,14 @@ Supported registries:
 %{_mandir}/man1/packmule.1*
 
 %changelog
+* Fri Jul 31 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.2.0-2
+- Authentication for private registries (pypi, npm, rpm): Basic, Bearer, or any
+  custom header, supplied through the environment and scoped to the --repo-url host
+- Corporate PKI support: custom CA bundle and client certificates for mutual TLS
+- Redirects followed in-process so credentials are re-scoped at every hop
+- pypi: PEP 503 simple-index support, for Artifactory, Nexus, devpi and GitLab
+- SBOM output (--sbom): CycloneDX 1.5 and SPDX 2.3 from the resolved package set
+
 * Fri Jul 03 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.2.0-1
 - npm: package-lock.json bundling with exact-tree offline replay (npm ci --offline)
 - npm: bundle peer and optional dependencies; devDependencies handled offline

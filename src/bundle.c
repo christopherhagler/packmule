@@ -7,6 +7,7 @@
  */
 
 #include "bundle.h"
+#include "sbom.h"
 #include "utils.h"
 #include "version.h"
 
@@ -464,6 +465,11 @@ int bundle_create(const BundleOptions *opts)
             return -1;
     }
 
+    if (opts->sbom_formats != SBOM_NONE &&
+        sbom_write(opts->output_dir, opts->registry, opts->packages,
+                   opts->sbom_formats) != 0)
+        return -1;
+
     printf("packmule: writing install.sh ...\n");
     if (write_install_script(opts) != 0)
         return -1;
@@ -476,7 +482,11 @@ int bundle_create(const BundleOptions *opts)
      * so neither is listed in `meta`.)
      */
     const char *meta[] = { "manifest.json", "requirements.txt",
-                           opts->aux_name };
+                           opts->aux_name,
+                           (opts->sbom_formats & SBOM_CYCLONEDX)
+                               ? SBOM_FILE_CYCLONEDX : NULL,
+                           (opts->sbom_formats & SBOM_SPDX)
+                               ? SBOM_FILE_SPDX : NULL };
     const size_t meta_n = sizeof(meta) / sizeof(meta[0]);
 
     printf("packmule: writing SHA256SUMS ...\n");
@@ -484,7 +494,12 @@ int bundle_create(const BundleOptions *opts)
         return -1;
 
     const char *archived[] = { "manifest.json", "requirements.txt",
-                               opts->aux_name, "SHA256SUMS", "install.sh" };
+                               opts->aux_name,
+                               (opts->sbom_formats & SBOM_CYCLONEDX)
+                                   ? SBOM_FILE_CYCLONEDX : NULL,
+                               (opts->sbom_formats & SBOM_SPDX)
+                                   ? SBOM_FILE_SPDX : NULL,
+                               "SHA256SUMS", "install.sh" };
 
     /* Archive path: strip any trailing slashes from output_dir, append .tar.gz */
     const char *dir  = opts->output_dir;

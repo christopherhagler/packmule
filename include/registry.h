@@ -16,6 +16,20 @@
 
 typedef struct Registry Registry;
 
+/*
+ * Which flavour of index the pypi backend should talk to.
+ *
+ * pypi.org serves a JSON API that carries dependency metadata directly.
+ * Private indexes (JFrog Artifactory, Sonatype Nexus, devpi, GitLab) serve
+ * the PEP 503 simple API instead, which is HTML and carries no dependency
+ * information — see registry_pypi.c for how that gap is filled.
+ */
+typedef enum {
+    PYPI_INDEX_AUTO = 0,  /* simple when --repo-url is set, else json */
+    PYPI_INDEX_JSON,
+    PYPI_INDEX_SIMPLE,
+} PypiIndexMode;
+
 struct Registry {
     /* Short identifier passed to --type: "pypi", "npm", "rpm", … */
     const char *name;
@@ -116,6 +130,15 @@ struct Registry {
      * static/argv memory; must NOT be freed by the backend.
      */
     const char *target_os;
+
+    /*
+     * index_mode — which PyPI index API to speak.  Set by main.c from
+     * --index; only the pypi backend reads it.  PYPI_INDEX_AUTO resolves to
+     * the simple API whenever repo_url is set, because a custom -u is nearly
+     * always a private index and the JSON API is a pypi.org extension that
+     * most of them do not implement.
+     */
+    PypiIndexMode index_mode;
 };
 
 /*

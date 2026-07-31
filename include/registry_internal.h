@@ -96,4 +96,18 @@ char *npm_effective_lockfile(const char *manifest_path);
 int pypi_parse_response(const char *json, Package *pkg, const char *arch,
                         const char *target_os, int py_minor);
 
+/*
+ * pypi_cached_artifact — path to `filename` inside the run's metadata cache,
+ * or NULL when it is not there.
+ *
+ * On an index without PEP 658 support the backend must download a
+ * distribution to read its METADATA.  That is the same file the download phase
+ * then wants, so main.c claims it from here rather than fetching it twice.
+ * The returned pointer is to static storage, valid until the next call.
+ */
+const char *pypi_cached_artifact(const char *filename);
+
+/* Remove the metadata cache directory and everything the backend put in it. */
+void pypi_backend_cleanup(void);
+
 #endif /* PACKMULE_REGISTRY_INTERNAL_H */

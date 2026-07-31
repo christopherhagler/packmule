@@ -89,6 +89,71 @@ jobs:
           fi
           echo "OK: exited non-zero as expected"
 
+      # Argument and environment validation is entirely offline, so it belongs
+      # on every push rather than in the nightly network job.  Each of these
+      # guards a way a run could otherwise fail late, confusingly, or by
+      # leaking a credential.
+      - name: Smoke test (invalid option values are rejected)
+        run: |
+          set -eu
+          printf 'requests\n' > /tmp/req.txt
+          expect_fail() {
+            desc="$1"; shift
+            if "$@" >/dev/null 2>&1; then
+              echo "FAIL: expected non-zero exit: $desc" && exit 1
+            fi
+            echo "OK: $desc"
+          }
+          expect_fail "--sbom rejects an unknown format" \
+            ./build/packmule -f /tmp/req.txt --sbom yaml -n
+          expect_fail "--index rejects an unknown mode" \
+            ./build/packmule -f /tmp/req.txt --index html -n
+          expect_fail "--jobs rejects an out-of-range value" \
+            ./build/packmule -f /tmp/req.txt -j 99 -n
+
+      - name: Smoke test (credentials are never sent somewhere unintended)
+        run: |
+          set -eu
+          printf 'requests\n' > /tmp/req.txt
+          expect_fail() {
+            desc="$1"; shift
+            if env "$@" >/dev/null 2>&1; then
+              echo "FAIL: expected non-zero exit: $desc" && exit 1
+            fi
+            echo "OK: $desc"
+          }
+          # Credentials with no --repo-url would otherwise silently build the
+          # bundle from the public index.
+          expect_fail "credentials without --repo-url are fatal" \
+            PACKMULE_TOKEN=t ./build/packmule -f /tmp/req.txt -n
+          # Cleartext transport, without the explicit opt-out.
+          expect_fail "credentials over http are refused" \
+            PACKMULE_TOKEN=t ./build/packmule -f /tmp/req.txt \
+              -u http://example.invalid/simple -n
+          # A secret in the URL would be echoed into logs.
+          expect_fail "userinfo in --repo-url is refused" \
+            ./build/packmule -f /tmp/req.txt \
+              -u https://u:p@example.invalid/simple -n
+          # Half a credential pair fails now rather than as an opaque 401.
+          expect_fail "an incomplete credential pair is fatal" \
+            PACKMULE_USERNAME=u ./build/packmule -f /tmp/req.txt \
+              -u https://example.invalid/simple -n
+          # A raw header is the escape hatch for unknown registries; a newline
+          # in it would inject further headers.  $'...' keeps the newline off
+          # this file, where it would end the YAML block scalar.
+          expect_fail "a newline in PACKMULE_AUTH_HEADER is refused" \
+            PACKMULE_AUTH_HEADER=$'X-Api-Key: a\nX-Evil: 1' \
+            ./build/packmule -f /tmp/req.txt \
+              -u https://example.invalid/simple -n
+          # Two schemes at once is ambiguous.
+          expect_fail "conflicting auth schemes are fatal" \
+            PACKMULE_AUTH_HEADER='X-Api-Key: a' PACKMULE_TOKEN=t \
+            ./build/packmule -f /tmp/req.txt -u https://example.invalid/simple -n
+          # A mistyped CA path must fail at startup, not as a TLS error later.
+          expect_fail "a missing CA bundle is reported at startup" \
+            PACKMULE_CA_BUNDLE=/nonexistent/ca.pem \
+            ./build/packmule -f /tmp/req.txt -n
+
   # ── Sanitizers ──────────────────────────────────────────────────────────────
   #
   # Most of this codebase is hand-rolled parsing of untrusted input (XML,

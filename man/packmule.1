@@ -23,6 +23,10 @@ packmule \- resolve, download, and bundle packages for air-gapped environments
 .IR url ]
 .RB [ \-j
 .IR n ]
+.RB [ \-\-index
+.IR mode ]
+.RB [ \-\-sbom
+.IR format ]
 .RB [ \-b ]
 .RB [ \-n ]
 .br
@@ -186,15 +190,67 @@ and
 (pypi.org and registry.npmjs.org respectively).
 Use this flag to point any backend at a private mirror or corporate proxy
 such as JFrog Artifactory or Sonatype Nexus.
+See
+.B AUTHENTICATION
+below for supplying credentials, which are scoped to this URL's host.
 .RS
 .PP
 Examples:
 .IP
 .I https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os
 .IP
-.I https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi
+.I https://artifactory.example.com/artifactory/api/pypi/pypi\-virtual/simple
 .IP
-.I https://nexus.example.com/repository/npm-proxy
+.I https://nexus.example.com/repository/npm\-proxy
+.PP
+The URL must not embed credentials
+.RI ( https://user:pass@host/... );
+packmule refuses them because the URL is echoed in progress and error output.
+.RE
+.TP
+.BI \-\-index " mode"
+.RB ( pypi
+only) Which index API to speak:
+.BR auto ", " simple ", or " json .
+.RS
+.PP
+.B auto
+selects the better API for the endpoint:
+.B json
+against pypi.org, and
+.B simple
+whenever
+.B \-\-repo\-url
+is given.
+Neither is a legacy of the other.
+The JSON API
+.RI ( /pypi/<name>/json )
+is a pypi.org extension that private indexes generally do not implement, so a
+private index needs
+.BR simple ;
+against pypi.org, however,
+.B json
+answers in one request per package instead of two and reports dependencies for
+source distributions, which
+.B simple
+cannot.
+.PP
+The simple API carries no dependency metadata.
+packmule recovers it from the index's PEP 658/714
+.I .metadata
+files when they are advertised, and otherwise by downloading the distribution
+during resolution and reading METADATA out of the archive \(em those downloads
+are reused by the download phase rather than repeated.
+When neither yields metadata, packmule warns that dependencies were not
+followed rather than silently shipping an incomplete bundle.
+.PP
+Source distributions are the weak spot of the simple API: pypi.org advertises
+PEP 658 metadata for wheels but not for sdists, and most private indexes
+advertise none, so an sdist's dependencies come from its
+.IR PKG-INFO ,
+which frequently declares none even when the package has them.
+When a manifest resolves to sdists on a private index, read the warnings and
+pin the missing transitive dependencies explicitly.
 .RE
 .TP
 .BR \-b ", " \-\-bundle
@@ -298,6 +354,48 @@ Capabilities nothing in the repository provides are reported as warnings.
 Boolean and rich dependency expressions are reported but not evaluated.
 .RE
 .TP
+.BI \-\-sbom " format"
+Also emit a Software Bill of Materials describing the resolved package set.
+.I format
+is
+.BR cyclonedx ", " spdx ", or " both .
+.RS
+.PP
+.B cyclonedx
+writes
+.I sbom.cdx.json
+(CycloneDX 1.5 JSON), which is what vulnerability tooling ingests.
+.B spdx
+writes
+.I sbom.spdx.json
+(SPDX 2.3 JSON), which licence-compliance processes usually ask for.
+Both are generated from the same data, so
+.B both
+costs only the second file.
+No extra network requests are made: resolution has already established every
+name, version, digest, source URL and dependency edge.
+.PP
+Each component carries a package URL (purl), the SHA-256 of the file as it sits
+in the bundle, its source URL and filename, the declared licence where the
+registry publishes one, and dependency edges for
+.B pypi
+and
+.BR npm .
+RPM dependency edges are omitted deliberately: RPM requirements are
+capabilities rather than package names, and mapping them would produce edges
+that are wrong rather than merely absent.
+.PP
+With
+.B \-\-bundle
+the SBOM is written before
+.IR SHA256SUMS ,
+so it is covered by it and travels inside the archive.
+Without it, the SBOM is written into the output directory.
+.PP
+.B SOURCE_DATE_EPOCH
+is honoured for the document timestamp.
+.RE
+.TP
 .BR \-V ", " \-\-version
 Print the version banner and exit with status 0.
 .TP
@@ -316,6 +414,117 @@ Resolution failures are reported before anything is downloaded.
 Packages that did download successfully are left in the output directory, so
 a re-run resumes rather than starting over; consult standard error for a
 per-package diagnosis.
+.\"
+.SH AUTHENTICATION
+Private indexes \(em JFrog Artifactory, Sonatype Nexus, devpi, GitLab \(em are
+reached with
+.B \-\-repo\-url
+and authenticated with credentials taken
+.B from the environment only.
+This applies to all three backends.
+Credentials are never accepted on the command line: an argument is visible in
+.BR ps (1)
+output to every user on the machine and is recorded in shell history.
+.TP
+.B PACKMULE_USERNAME
+Account name, used with either of the two variables below.
+.TP
+.B PACKMULE_PASSWORD
+Password. With
+.B PACKMULE_USERNAME
+this selects HTTP Basic authentication.
+.TP
+.B PACKMULE_TOKEN
+An API key, identity token or access token.
+Combined with
+.B PACKMULE_USERNAME
+it is sent as HTTP Basic \(em Artifactory's "username plus API key" form.
+On its own it is sent as
+.IR "Authorization: Bearer <token>" .
+.TP
+.B PACKMULE_AUTH_HEADER
+A literal header line, for any scheme the variables above do not cover \(em
+.RI ' "X-JFrog-Art-Api: <key>" ', ' "PRIVATE-TOKEN: <token>" ', ' "X-Api-Key: <key>" '.
+This is what lets packmule work against a registry it has no specific
+knowledge of.
+Cannot be combined with the variables above, and is rejected if it contains a
+newline or lacks a colon.
+.TP
+.B PACKMULE_AUTH_HOSTS
+Additional hosts to authenticate to, comma-separated.
+Entries may be bare
+.RI ( art\-cdn.example.com ", " art\-cdn.example.com:8443 )
+or full URLs.
+.TP
+.B PACKMULE_AUTH_INSECURE
+Set to
+.B 1
+to permit credentials over plain
+.BR http:// .
+Refused by default: anyone on the network path can read them.
+.PP
+Credentials are scoped to the host named by
+.B \-\-repo\-url
+and are sent to no other host.
+An index decides the download URLs it returns, so a repository that hands back
+a file URL elsewhere \(em or an attacker who can make it do so \(em would
+otherwise receive the token.
+Requests to out-of-scope hosts are sent unauthenticated; use
+.B PACKMULE_AUTH_HOSTS
+when an index legitimately serves artifacts from a separate CDN or storage
+hostname.
+.PP
+An HTTP 401 or 403 is reported together with its cause \(em no credentials
+configured, credentials scoped to a different host, or credentials the server
+rejected \(em because the remedy differs in each case.
+Credentials set without
+.B \-\-repo\-url
+are an error rather than a silent anonymous fetch of the public registry.
+.SS Corporate TLS and proxies
+An internal registry almost always presents a certificate issued by a private
+CA.  Name that CA; there is deliberately no option to disable verification.
+.TP
+.B PACKMULE_CA_BUNDLE
+A CA bundle file, or a
+.BR c_rehash (1)-style
+directory, to verify servers against.
+.B CURL_CA_BUNDLE
+and
+.B SSL_CERT_FILE
+are honoured as fallbacks, so a machine already configured for a corporate CA
+needs no packmule-specific setup.
+A path that does not exist is reported at startup rather than as a handshake
+error on the first request.
+.TP
+.B PACKMULE_CLIENT_CERT
+.TQ
+.B PACKMULE_CLIENT_KEY
+.TQ
+.B PACKMULE_CLIENT_KEY_PASSWORD
+Client certificate, private key and key passphrase for mutual TLS.
+The key may be omitted when the certificate file carries both.
+.PP
+Proxies need no configuration: packmule never sets libcurl's proxy options, so
+.BR http_proxy ,
+.B https_proxy
+and
+.B no_proxy
+behave exactly as they do for
+.BR curl (1).
+.PP
+Redirects are followed by packmule itself rather than by libcurl, and the
+credential decision is remade at every hop from the host about to be
+contacted.  libcurl drops only the
+.I Authorization
+header when a redirect crosses hosts, which would leave a custom
+.B PACKMULE_AUTH_HEADER
+credential to follow an index's redirect to third-party storage.
+.PP
+No credential is written into a bundle.
+.I manifest.json
+records filenames, versions and digests only, and the generated
+.I install.sh
+installs from the bundled files with the index disabled.
 .\"
 .SH EXAMPLES
 Preview what would be downloaded without writing any files:
@@ -339,6 +548,24 @@ Download and produce a self-contained transport bundle (vendor.tar.gz):
 .RS 4
 .EX
 packmule \-f requirements.txt \-o ./vendor \-a x86_64 \-\-bundle
+.EE
+.RE
+.PP
+Bundle and emit both SBOM formats alongside it:
+.PP
+.RS 4
+.EX
+packmule \-f requirements.txt \-o ./vendor \-\-bundle \-\-sbom both
+.EE
+.RE
+.PP
+Build from an authenticated Artifactory PyPI repository:
+.PP
+.RS 4
+.EX
+export PACKMULE_TOKEN="$ARTIFACTORY_TOKEN"
+packmule \-f requirements.txt \-o ./vendor \-\-bundle \\
+    \-u https://artifactory.example.com/artifactory/api/pypi/pypi\-virtual/simple
 .EE
 .RE
 .PP

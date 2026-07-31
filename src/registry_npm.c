@@ -540,6 +540,30 @@ static int npm_parse_version_doc(const cJSON *doc, Package *pkg)
         return -1;
     }
 
+    /*
+     * Licence, for the SBOM.  npm's modern field is a string; the legacy
+     * "licenses" array (still present on older published versions) holds
+     * objects with a "type".
+     */
+    cJSON *lic = cJSON_GetObjectItemCaseSensitive(doc, "license");
+    if (cJSON_IsString(lic) && lic->valuestring[0]) {
+        pm_free(pkg->license);
+        pkg->license = pm_strdup(lic->valuestring);
+    } else {
+        cJSON *lics = cJSON_GetObjectItemCaseSensitive(doc, "licenses");
+        cJSON *item = NULL;
+        if (cJSON_IsArray(lics)) {
+            cJSON_ArrayForEach(item, lics) {
+                cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
+                if (cJSON_IsString(type) && type->valuestring[0]) {
+                    pm_free(pkg->license);
+                    pkg->license = pm_strdup(type->valuestring);
+                    break;
+                }
+            }
+        }
+    }
+
     /* dist object holds tarball URL and integrity hash. */
     cJSON *dist = cJSON_GetObjectItemCaseSensitive(doc, "dist");
     if (!cJSON_IsObject(dist)) {

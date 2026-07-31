@@ -1,4 +1,5 @@
 #include "network.h"
+#include "auth.h"
 #include "utils.h"
 #include "version.h"
 
@@ -80,16 +81,63 @@ static void restrict_protocols(CURL *curl)
 #endif
 }
 
+/*
+ * configure_tls — apply the machine's trust configuration.
+ *
+ * An internal registry almost always presents a certificate from a corporate
+ * CA, and a TLS-terminating proxy re-signs everything else too, so without a
+ * way to name that CA the tool is unusable in exactly the environments it is
+ * built for.  Supplying the right trust anchor is a different thing from
+ * turning verification off, which remains impossible.
+ *
+ * Applied to every request rather than only to in-scope hosts: this describes
+ * how this machine establishes a connection at all, not who it authenticates
+ * to.  (A corporate bundle is normally a full replacement trust store, which
+ * is why naming one is safe for public hosts as well.)
+ */
+static void configure_tls(CURL *curl)
+{
+    const char *ca = auth_ca_bundle();
+    if (ca) {
+        if (auth_ca_bundle_is_dir())
+            curl_easy_setopt(curl, CURLOPT_CAPATH, ca);
+        else
+            curl_easy_setopt(curl, CURLOPT_CAINFO, ca);
+    }
+
+    const char *cert = auth_client_cert();
+    if (cert) {
+        curl_easy_setopt(curl, CURLOPT_SSLCERT, cert);
+        if (auth_client_key())
+            curl_easy_setopt(curl, CURLOPT_SSLKEY, auth_client_key());
+        if (auth_client_key_password())
+            curl_easy_setopt(curl, CURLOPT_KEYPASSWD,
+                             auth_client_key_password());
+    }
+}
+
 static void configure_common(CURL *curl, char *error_buf)
 {
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER,    error_buf);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
+    /*
+     * Redirects are followed by hand (see next_redirect).  libcurl's automatic
+     * following drops the Authorization header when a redirect crosses to
+     * another host, but it does not touch a custom header — so an operator
+     * using PACKMULE_AUTH_HEADER ("X-JFrog-Art-Api: …") would have that
+     * credential follow the redirect to wherever the index pointed.  Walking
+     * the chain ourselves lets the same host-scoping rule govern every scheme,
+     * and stops the guarantee depending on which libcurl version is installed.
+     */
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  0L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  15L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
                      "packmule/" PACKMULE_VERSION " libcurl/" LIBCURL_VERSION);
     restrict_protocols(curl);
+    configure_tls(curl);
+    /* CURLOPT_PROXY is deliberately not set: leaving it unset lets libcurl
+     * honour http_proxy / https_proxy / no_proxy from the environment, which
+     * is how corporate egress is already configured on these machines. */
 }
 
 /*
@@ -114,6 +162,160 @@ static void configure_download(CURL *curl, char *error_buf)
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
     curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE,
                      (curl_off_t)NETWORK_MAX_DOWNLOAD_BYTES);
+}
+
+/* ── Authentication ───────────────────────────────────────────────────────── */
+
+/*
+ * apply_auth — attach credentials to `curl` if `url`'s host is in scope.
+ *
+ * Must be called after configure_*() and after any curl_easy_reset(), both of
+ * which clear the options set here.
+ *
+ * Returns a header list that the caller must keep alive for the duration of
+ * the transfer and then release with curl_slist_free_all(), or NULL when there
+ * is nothing to free.
+ *
+ * Redirects are the interesting case.  Artifactory and Nexus commonly answer a
+ * download with a 302 to a pre-signed S3 or CDN URL on a different host, which
+ * must NOT receive the credential — S3 rejects a request carrying both a
+ * pre-signed query and an Authorization header, and more importantly the token
+ * is none of that host's business.
+ *
+ * libcurl is not relied on to get that right.  It drops CURLOPT_USERPWD and
+ * (since 7.58.0) a caller-supplied Authorization header across a cross-host
+ * redirect, but it does nothing about a custom header, which is exactly what
+ * PACKMULE_AUTH_HEADER produces.  So redirects are followed by hand and this
+ * function is called afresh for each hop with that hop's URL; every scheme is
+ * then governed by the same host-scoping rule.  See next_redirect().
+ */
+static struct curl_slist *apply_auth(CURL *curl, const char *url)
+{
+    switch (auth_scheme_for_url(url)) {
+    case AUTH_BASIC:
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERPWD,  auth_userpwd());
+        return NULL;
+
+    case AUTH_BEARER:
+    case AUTH_HEADER: {
+        /*
+         * Set by hand rather than with CURLOPT_XOAUTH2_BEARER: that option
+         * only emits the header for schemes negotiated via CURLAUTH_BEARER,
+         * which needs libcurl 7.61 *and* a server that advertises it.  A
+         * literal header is what registries actually expect.
+         *
+         * AUTH_HEADER takes the same path with an operator-supplied line
+         * ("X-JFrog-Art-Api: …", "PRIVATE-TOKEN: …"), which is what lets this
+         * work against a product whose convention we do not know.  Note that
+         * libcurl only strips *Authorization* across a cross-host redirect, so
+         * a custom-named header would otherwise follow the redirect — see the
+         * explicit check in apply_auth's caller contract: we only ever attach
+         * it to an in-scope URL, and re-evaluate scope after each transfer
+         * begins rather than reusing a handle across hosts.
+         */
+        struct curl_slist *hdrs = curl_slist_append(NULL, auth_bearer_header());
+        if (hdrs)
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        return hdrs;
+    }
+
+    case AUTH_NONE:
+    default:
+        return NULL;
+    }
+}
+
+/* ── Redirects ────────────────────────────────────────────────────────────── */
+
+#define MAX_REDIRECTS 5
+
+static int is_redirect(long http_code)
+{
+    return http_code == 301 || http_code == 302 || http_code == 303 ||
+           http_code == 307 || http_code == 308;
+}
+
+/*
+ * next_redirect — the URL a 3xx points at, or NULL to stop.
+ *
+ * libcurl resolves the Location header against the request URL for us even
+ * with CURLOPT_FOLLOWLOCATION off, so this does not re-implement RFC 3986.
+ * What it must do itself is enforce the scheme restriction that
+ * CURLOPT_REDIR_PROTOCOLS would have applied: an index that answers a
+ * download with a redirect to file:///etc/shadow gets refused here.
+ *
+ * Returns a heap copy the caller frees with pm_free().
+ */
+static char *next_redirect(CURL *curl, long http_code, int hop)
+{
+    if (!is_redirect(http_code))
+        return NULL;
+
+    if (hop >= MAX_REDIRECTS) {
+        fprintf(stderr, "packmule: too many redirects (limit %d)\n",
+                MAX_REDIRECTS);
+        return NULL;
+    }
+
+    char *location = NULL;
+    curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &location);
+    if (!location || !*location) {
+        fprintf(stderr, "packmule: HTTP %ld with no usable Location header\n",
+                http_code);
+        return NULL;
+    }
+
+    /* auth_url_host() returns NULL for anything that is not absolute http(s),
+     * which is exactly the test needed here. */
+    char *host = auth_url_host(location);
+    if (!host) {
+        fprintf(stderr,
+                "packmule: refusing a redirect to a non-http(s) location\n");
+        return NULL;
+    }
+    pm_free(host);
+
+    return pm_strdup(location);
+}
+
+/*
+ * report_auth_failure — explain a 401/403.
+ *
+ * The three causes need three different fixes, and the bare status code sends
+ * people looking at the wrong one: no credentials at all, credentials that
+ * exist but are scoped to a different host than the one that refused us, and
+ * credentials the server rejected.
+ */
+static void report_auth_failure(const char *url, long http_code)
+{
+    fprintf(stderr, "packmule: HTTP %ld (unauthorised) for %s\n",
+            http_code, url);
+
+    if (!auth_configured()) {
+        fprintf(stderr,
+                "          This index requires authentication.  Set "
+                "PACKMULE_USERNAME and\n"
+                "          PACKMULE_PASSWORD, or PACKMULE_TOKEN for a bearer "
+                "token.\n");
+        return;
+    }
+
+    if (auth_scheme_for_url(url) == AUTH_NONE) {
+        fprintf(stderr,
+                "          Credentials were NOT sent: this URL's host is "
+                "outside the authenticated\n"
+                "          scope (%s).  If the index serves files from another "
+                "host, add it to\n"
+                "          PACKMULE_AUTH_HOSTS.\n",
+                auth_scope_description());
+        return;
+    }
+
+    fprintf(stderr,
+            "          Credentials were sent and rejected.  Check the token or "
+            "password, and that\n"
+            "          the account may read this repository.\n");
 }
 
 /* ── Retry policy ─────────────────────────────────────────────────────────── */
@@ -196,34 +398,71 @@ char *fetch_json(const char *url)
     buf.data[0] = '\0';
 
     configure_metadata(curl, curl_error);
-    curl_easy_setopt(curl, CURLOPT_URL,            url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,   write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,       &buf);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 
+    struct curl_slist *auth_hdrs = NULL;
+    char *current = pm_strdup(url);   /* the URL of the hop in flight */
+
     long http_code = 0;
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        /* Discard any partial body from a failed previous attempt. */
-        buf.size     = 0;
-        buf.data[0]  = '\0';
-        buf.overflow = 0;
-        http_code    = 0;
+        /* Each attempt restarts the redirect chain from the original URL. */
+        pm_free(current);
+        current = pm_strdup(url);
 
-        res = curl_easy_perform(curl);
-        if (res == CURLE_OK)
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        for (int hop = 0; ; hop++) {
+            /* Discard any partial body from the previous hop or attempt. */
+            buf.size     = 0;
+            buf.data[0]  = '\0';
+            buf.overflow = 0;
+            http_code    = 0;
 
-        if (res == CURLE_OK && http_code == 200)
+            /* Credentials are decided per hop, from the host actually about to
+             * be contacted — that is what keeps a redirect from carrying them
+             * somewhere they do not belong. */
+            curl_slist_free_all(auth_hdrs);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+            curl_easy_setopt(curl, CURLOPT_USERPWD,    NULL);
+            curl_easy_setopt(curl, CURLOPT_URL,        current);
+            auth_hdrs = apply_auth(curl, current);
+
+            res = curl_easy_perform(curl);
+            if (res == CURLE_OK)
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+            char *next = (res == CURLE_OK)
+                       ? next_redirect(curl, http_code, hop) : NULL;
+            if (!next)
+                break;                  /* final response, or a refused hop */
+            pm_free(current);
+            current = next;
+        }
+
+        if (res == CURLE_OK && http_code == 200) {
+            curl_slist_free_all(auth_hdrs);
+            pm_free(current);
             return buf.data;
+        }
 
         if (buf.overflow)
             break;   /* a too-large body will be too large next time too */
+        /* 401/403 will not become 200 on a second identical request. */
+        if (http_code == 401 || http_code == 403)
+            break;
         if (!attempt_should_retry(res, http_code, attempt))
             break;
         fprintf(stderr, "packmule: retrying %s ...\n", url);
     }
 
-    if (buf.overflow)
+    /*
+     * Diagnose before releasing anything: an unauthorised response is
+     * reported against `current`, the hop that actually refused us, which is
+     * not the original URL once a redirect has been followed.
+     */
+    if (http_code == 401 || http_code == 403)
+        report_auth_failure(current, http_code);
+    else if (buf.overflow)
         fprintf(stderr,
                 "packmule: response from %s exceeds %zu MB; refusing it\n",
                 url, NETWORK_MAX_RESPONSE_BYTES / ((size_t)1024 * 1024));
@@ -235,6 +474,8 @@ char *fetch_json(const char *url)
     else
         fprintf(stderr, "packmule: HTTP %ld for %s\n", http_code, url);
 
+    curl_slist_free_all(auth_hdrs);
+    pm_free(current);
     pm_free(buf.data);
     return NULL;
 }
@@ -354,8 +595,10 @@ int download_file(const char *url, const char *dest_path,
     }
 
     configure_download(curl, curl_error);
-    curl_easy_setopt(curl, CURLOPT_URL,           url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file_callback);
+
+    struct curl_slist *auth_hdrs = NULL;
+    char *current = pm_strdup(url);
 
     ProgressState ps;
     if (show_progress) {
@@ -372,35 +615,62 @@ int download_file(const char *url, const char *dest_path,
     int  io_error  = 0;
 
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        /* (Re)open with "wb" so a retry truncates the failed attempt's bytes. */
-        FILE *fp = fopen(dest_path, "wb");
-        if (!fp) {
-            fprintf(stderr, "packmule: cannot open %s for writing\n", dest_path);
-            curl_easy_cleanup(curl);
-            return -1;
+        pm_free(current);
+        current = pm_strdup(url);
+
+        for (int hop = 0; ; hop++) {
+            /* (Re)open with "wb" so a retry, or a redirect's discarded 3xx
+             * body, does not accumulate in the destination file. */
+            FILE *fp = fopen(dest_path, "wb");
+            if (!fp) {
+                fprintf(stderr, "packmule: cannot open %s for writing\n",
+                        dest_path);
+                curl_slist_free_all(auth_hdrs);
+                pm_free(current);
+                curl_easy_cleanup(curl);
+                return -1;
+            }
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+
+            if (show_progress) {
+                ps.last_draw = 0.0;
+                ps.last_pct  = -1;
+                clock_gettime(CLOCK_MONOTONIC, &ps.start);
+            }
+
+            /* Re-decide credentials from the host of this hop. */
+            curl_slist_free_all(auth_hdrs);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+            curl_easy_setopt(curl, CURLOPT_USERPWD,    NULL);
+            curl_easy_setopt(curl, CURLOPT_URL,        current);
+            auth_hdrs = apply_auth(curl, current);
+
+            http_code = 0;
+            res = curl_easy_perform(curl);
+
+            /* fclose is where buffered bytes actually reach the disk; a full
+             * disk surfaces here and nowhere else. */
+            io_error = (fclose(fp) != 0);
+            if (res == CURLE_OK)
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+            char *next = (res == CURLE_OK && !io_error)
+                       ? next_redirect(curl, http_code, hop) : NULL;
+            if (!next)
+                break;                  /* final response, or a refused hop */
+            pm_free(current);
+            current = next;
         }
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-
-        if (show_progress) {
-            ps.last_draw = 0.0;
-            ps.last_pct  = -1;
-            clock_gettime(CLOCK_MONOTONIC, &ps.start);
-        }
-
-        http_code = 0;
-        res = curl_easy_perform(curl);
-
-        /* fclose is where buffered bytes actually reach the disk; a full disk
-         * surfaces here and nowhere else. */
-        io_error = (fclose(fp) != 0);
-        if (res == CURLE_OK)
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
         if (res == CURLE_OK && http_code == 200 && !io_error) {
+            curl_slist_free_all(auth_hdrs);
+            pm_free(current);
             curl_easy_cleanup(curl);
             return 0;
         }
         if (io_error)
+            break;
+        if (http_code == 401 || http_code == 403)
             break;
         if (!attempt_should_retry(res, http_code, attempt))
             break;
@@ -411,12 +681,17 @@ int download_file(const char *url, const char *dest_path,
         fprintf(stderr, "packmule: write error saving %s\n", dest_path);
     else if (res != CURLE_OK)
         fprintf(stderr, "packmule: download error for %s: %s\n",
-                url, curl_error[0] ? curl_error : curl_easy_strerror(res));
+                current, curl_error[0] ? curl_error : curl_easy_strerror(res));
+    else if (http_code == 401 || http_code == 403)
+        report_auth_failure(current, http_code);
     else
-        fprintf(stderr, "packmule: HTTP %ld downloading %s\n", http_code, url);
+        fprintf(stderr, "packmule: HTTP %ld downloading %s\n",
+                http_code, current);
 
     /* Do not leave a partial/garbage file (e.g. an HTML error body) behind. */
     remove(dest_path);
+    curl_slist_free_all(auth_hdrs);
+    pm_free(current);
     curl_easy_cleanup(curl);
     return -1;
 }
@@ -424,11 +699,15 @@ int download_file(const char *url, const char *dest_path,
 /* ── Parallel downloads ───────────────────────────────────────────────────── */
 
 typedef struct {
-    DownloadJob *job;
-    FILE        *fp;
-    CURL        *easy;
-    int          attempt;      /* 0-based */
-    char         error[CURL_ERROR_SIZE];
+    DownloadJob       *job;
+    FILE              *fp;
+    CURL              *easy;
+    struct curl_slist *auth_hdrs;  /* owned; freed when the slot is re-armed */
+    char              *cur_url;    /* owned; the hop in flight, != job->url
+                                    * once a redirect has been followed */
+    int                attempt;    /* 0-based */
+    int                hop;        /* redirects followed for this attempt */
+    char               error[CURL_ERROR_SIZE];
 } Transfer;
 
 /* start_transfer — open the destination and hand the easy handle to `multi`. */
@@ -450,19 +729,43 @@ static int start_transfer(CURLM *multi, Transfer *t)
         return -1;
     }
 
+    if (!t->cur_url)
+        t->cur_url = pm_strdup(t->job->url);
+
     curl_easy_reset(t->easy);
     configure_download(t->easy, t->error);
-    curl_easy_setopt(t->easy, CURLOPT_URL,           t->job->url);
+    curl_easy_setopt(t->easy, CURLOPT_URL,           t->cur_url);
     curl_easy_setopt(t->easy, CURLOPT_WRITEFUNCTION, write_file_callback);
     curl_easy_setopt(t->easy, CURLOPT_WRITEDATA,     t->fp);
     curl_easy_setopt(t->easy, CURLOPT_NOPROGRESS,    1L);
     curl_easy_setopt(t->easy, CURLOPT_PRIVATE,       t);
 
+    /* A slot is reused for retries, redirect hops and later jobs, and each of
+     * those may target a different host: drop the previous header list before
+     * building the one this URL calls for, and derive credentials from the
+     * host actually about to be contacted.  curl_easy_reset() above has
+     * already cleared the handle's pointer to it, so freeing cannot dangle. */
+    curl_slist_free_all(t->auth_hdrs);
+    t->auth_hdrs = apply_auth(t->easy, t->cur_url);
+
     curl_multi_add_handle(multi, t->easy);
     return 0;
 }
 
-/* finish_transfer — close the file and decide success, failure, or retry. */
+/* Release a slot's per-job state before it takes on a different job. */
+static void transfer_reset_url(Transfer *t, const char *url)
+{
+    pm_free(t->cur_url);
+    t->cur_url = url ? pm_strdup(url) : NULL;
+    t->hop     = 0;
+}
+
+/*
+ * finish_transfer — close the file and decide what happens next.
+ *
+ * Returns 0 done/succeeded, -1 done/failed, 1 retry, 2 follow a redirect
+ * (t->cur_url has been advanced to the next hop).
+ */
 static int finish_transfer(Transfer *t, CURLcode res)
 {
     long http_code = 0;
@@ -475,6 +778,16 @@ static int finish_transfer(Transfer *t, CURLcode res)
     if (res == CURLE_OK && http_code == 200 && !io_error)
         return 0;                       /* done, succeeded */
 
+    if (res == CURLE_OK && !io_error) {
+        char *next = next_redirect(t->easy, http_code, t->hop);
+        if (next) {
+            pm_free(t->cur_url);
+            t->cur_url = next;
+            t->hop++;
+            return 2;                   /* follow it, re-deciding auth */
+        }
+    }
+
     if (!io_error && is_transient(res, http_code) &&
         t->attempt + 1 < MAX_ATTEMPTS)
         return 1;                       /* retry */
@@ -485,9 +798,11 @@ static int finish_transfer(Transfer *t, CURLcode res)
         fprintf(stderr, "packmule: download error for %s: %s\n",
                 t->job->url,
                 t->error[0] ? t->error : curl_easy_strerror(res));
+    else if (http_code == 401 || http_code == 403)
+        report_auth_failure(t->cur_url, http_code);
     else
         fprintf(stderr, "packmule: HTTP %ld downloading %s\n",
-                http_code, t->job->url);
+                http_code, t->cur_url);
 
     remove(t->job->dest_path);
     return -1;                          /* done, failed */
@@ -577,9 +892,19 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
 
             int verdict = finish_transfer(t, msg->data.result);
 
+            if (verdict == 2) {
+                /* Redirect: re-arm the same slot on the next hop.  Not a
+                 * retry, so the attempt counter is untouched. */
+                if (start_transfer(multi, t) == 0)
+                    continue;
+                verdict = -1;
+            }
+
             if (verdict == 1) {
-                /* Transient: back off briefly and re-arm the same slot. */
+                /* Transient: back off briefly and re-arm the same slot, from
+                 * the original URL rather than wherever the chain ended. */
                 t->attempt++;
+                transfer_reset_url(t, t->job->url);
                 sleep(t->attempt == 1 ? 1 : 3);
                 fprintf(stderr, "packmule: retrying %s ...\n", t->job->url);
                 if (start_transfer(multi, t) == 0)
@@ -598,6 +923,7 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
             if (next < n) {
                 t->job     = &jobs[next++];
                 t->attempt = 0;
+                transfer_reset_url(t, t->job->url);
                 if (start_transfer(multi, t) != 0) {
                     t->job->rc = -1;
                     failures++;
@@ -612,9 +938,12 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
         }
     } while (running > 0 || next < n);
 
-    for (int i = 0; i < concurrency; i++)
+    for (int i = 0; i < concurrency; i++) {
         if (slots[i].easy)
             curl_easy_cleanup(slots[i].easy);
+        curl_slist_free_all(slots[i].auth_hdrs);
+        pm_free(slots[i].cur_url);
+    }
     pm_free(slots);
     curl_multi_cleanup(multi);
 

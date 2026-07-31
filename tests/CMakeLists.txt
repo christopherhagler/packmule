@@ -62,6 +62,22 @@ target_link_libraries(test_bundle PRIVATE packmule_core)
 add_test(NAME test_bundle COMMAND test_bundle
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(test_auth test_auth.c)
+target_link_libraries(test_auth PRIVATE packmule_core)
+add_test(NAME test_auth COMMAND test_auth)
+
+add_executable(test_simple_index test_simple_index.c)
+target_link_libraries(test_simple_index PRIVATE packmule_core)
+add_test(NAME test_simple_index COMMAND test_simple_index)
+
+add_executable(test_pypi_metadata test_pypi_metadata.c)
+target_link_libraries(test_pypi_metadata PRIVATE packmule_core)
+add_test(NAME test_pypi_metadata COMMAND test_pypi_metadata)
+
+add_executable(test_sbom test_sbom.c)
+target_link_libraries(test_sbom PRIVATE packmule_core)
+add_test(NAME test_sbom COMMAND test_sbom)
+
 # ── End-to-end tests (network-dependent, opt-in) ─────────────────────────────
 #
 # Full pipeline against the real registries: resolve → download → bundle →

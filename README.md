@@ -129,10 +129,12 @@ packmule -h | --help
 | `-s <os>`, `--os` | *(pypi only)* Target OS for wheel selection: `linux`, `macos`, `windows`, or `any` (default: the host OS) |
 | `-p <ver>`, `--python` | *(pypi only)* Target CPython version for wheel selection and environment markers, e.g. `3.12` (default: the local `python3`) |
 | `-u <url>`, `--repo-url` | Repository base URL — required for `rpm`; optional for `pypi`/`npm` (overrides public endpoint) |
+| `--index <mode>` | *(pypi only)* Which index API to speak: `auto` (default), `simple`, or `json`. `auto` uses the PEP 503 simple API whenever `-u` is set, and pypi.org's JSON API otherwise |
 | `-b`, `--bundle` | Write `manifest.json`, `SHA256SUMS` and `install.sh`, then compress output to `<dir>.tar.gz` |
 | `-n`, `--dry-run` | Resolve and print what would be downloaded — no files written |
 | `-j <n>`, `--jobs` | Parallel downloads, 1–16 (default 4). `-j 1` restores the per-file progress bar |
 | `--no-verify` | Skip the post-bundle offline install check |
+| `--sbom <fmt>` | Also emit an SBOM: `cyclonedx`, `spdx`, or `both` |
 | `--rpm-deps <mode>` | *(rpm only)* `resolve` (default) follows transitive dependencies; `none` bundles only what the manifest names |
 | `-V`, `--version` | Print version and exit |
 | `-h`, `--help` | Print usage and exit |
@@ -278,13 +280,13 @@ without the check.
 ### Private registries
 
 All three backends accept a custom base URL via `-u`. Use this to point
-packmule at a JFrog Artifactory or Sonatype Nexus instance instead of the
-public endpoints:
+packmule at a JFrog Artifactory, Sonatype Nexus, devpi or GitLab instance
+instead of the public endpoints:
 
 ```bash
-# Artifactory PyPI proxy
+# Artifactory PyPI repository (note: the /simple endpoint)
 packmule -f requirements.txt -o ./vendor \
-  -u https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/pypi
+  -u https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/simple
 
 # Nexus npm proxy
 packmule -f package.json -o ./vendor -t npm \
@@ -295,8 +297,211 @@ packmule -f packages.txt -o ./vendor -t rpm -a x86_64 \
   -u https://repo.example.com/fedora/40/x86_64/os
 ```
 
-Artifactory and Nexus both expose the same JSON API as their respective public
-registries, so no response parsing changes are needed.
+#### Authentication
+
+Credentials are read **from the environment only** — never from the command
+line, where they would be visible in `ps` output to every user on the machine
+and recorded in shell history. They apply to all three backends.
+
+| Variable | Effect |
+|---|---|
+| `PACKMULE_USERNAME` + `PACKMULE_PASSWORD` | HTTP Basic |
+| `PACKMULE_USERNAME` + `PACKMULE_TOKEN` | HTTP Basic — the "username + API key / identity token" form |
+| `PACKMULE_TOKEN` alone | `Authorization: Bearer <token>` |
+| `PACKMULE_AUTH_HEADER` | A literal header line, for any scheme not covered above |
+| `PACKMULE_AUTH_HOSTS` | Extra hosts to authenticate to, comma-separated (see below) |
+| `PACKMULE_AUTH_INSECURE=1` | Permit credentials over plain `http://` |
+
+`PACKMULE_AUTH_HEADER` is the escape hatch that keeps packmule working against
+a registry it has never seen. If your product wants something other than Basic
+or Bearer, spell the header out:
+
+```bash
+export PACKMULE_AUTH_HEADER='X-JFrog-Art-Api: <api-key>'   # older Artifactory
+export PACKMULE_AUTH_HEADER='PRIVATE-TOKEN: <token>'       # GitLab
+export PACKMULE_AUTH_HEADER='X-Api-Key: <key>'             # others
+```
+
+It is host-scoped like every other scheme. That matters more here than
+elsewhere: libcurl only strips `Authorization` across a cross-host redirect, so
+a custom header is protected by packmule's own scoping and nothing else.
+
+```bash
+export PACKMULE_TOKEN="$ARTIFACTORY_TOKEN"
+packmule -f requirements.txt -o ./vendor -b \
+  -u https://artifactory.example.com/artifactory/api/pypi/pypi-virtual/simple
+```
+
+**Credentials are scoped to the host named by `-u`, and to nothing else.** An
+index decides the download URLs it hands back, so a repository that returns a
+file URL on another host — or an attacker who can make it do so — would
+otherwise be handed your token. Requests to any other host are sent
+unauthenticated. If your index legitimately serves artifacts from a separate
+CDN or storage hostname, name it explicitly:
+
+```bash
+export PACKMULE_AUTH_HOSTS="artifactory-cdn.example.com"
+```
+
+A 401 or 403 is reported with the reason it happened — no credentials
+configured, credentials scoped to a different host, or credentials the server
+rejected — because the fix differs in each case.
+
+Two things are refused outright rather than handled quietly, because both leak
+secrets: credentials embedded in the `-u` URL (`https://user:pass@host/…`,
+which would be echoed into progress and error output), and credentials bound
+for a plain-`http://` endpoint unless `PACKMULE_AUTH_INSECURE=1` says the link
+is trusted. Credentials set with no `-u` at all are an error too — packmule
+will not silently fall back to building your bundle from the public registry.
+
+Nothing secret is written into a bundle: `manifest.json` records filenames,
+versions and digests, and the generated `install.sh` installs from the bundled
+files with the index disabled.
+
+#### Corporate TLS and proxies
+
+Internal registries almost always present a certificate from a private CA, and
+a TLS-terminating proxy re-signs everything else too. Name the trust anchor —
+there is deliberately no option to disable certificate verification:
+
+| Variable | Effect |
+|---|---|
+| `PACKMULE_CA_BUNDLE` | CA bundle file, or a `c_rehash`-style directory, to verify servers against |
+| `PACKMULE_CLIENT_CERT` / `_KEY` / `_KEY_PASSWORD` | Client certificate for mutual TLS |
+
+`CURL_CA_BUNDLE` and `SSL_CERT_FILE` are honoured as fallbacks, so a machine
+already configured for a corporate CA needs no packmule-specific setup. A
+mistyped path fails at startup rather than as a confusing handshake error on
+the first request.
+
+Proxies need no configuration: packmule never sets libcurl's proxy options, so
+the standard `http_proxy`, `https_proxy` and `no_proxy` variables (including a
+`user:pass@` in them) work as they do for `curl`.
+
+#### Known index URL shapes
+
+packmule takes the index URL verbatim — it never guesses a vendor's layout, so
+any product works as long as you point `-u` at the right endpoint. Some common
+ones, for reference:
+
+| Product | `-u` value |
+|---|---|
+| JFrog Artifactory (PyPI) | `https://<host>/artifactory/api/pypi/<repo>/simple` |
+| JFrog Artifactory (npm) | `https://<host>/artifactory/api/npm/<repo>/` |
+| JFrog Artifactory (RPM) | `https://<host>/artifactory/<repo>` |
+| Sonatype Nexus (PyPI) | `https://<host>/repository/<repo>/simple` |
+| Sonatype Nexus (npm) | `https://<host>/repository/<repo>/` |
+| Sonatype Nexus (RPM/yum) | `https://<host>/repository/<repo>` |
+| devpi | `https://<host>/<user>/<index>/+simple/` |
+| GitLab (PyPI) | `https://<host>/api/v4/projects/<id>/packages/pypi/simple` |
+| Azure Artifacts (PyPI) | `https://pkgs.dev.azure.com/<org>/_packaging/<feed>/pypi/simple` |
+| Plain directory / mirror | whatever URL serves the index |
+
+These are a starting point, not a supported list — if a product is not here,
+pass its index URL and packmule will treat it the same way. If resolution
+fails with a 404 on the index page, the URL is the first thing to check
+(for PyPI, it usually needs to end in the index's `simple` endpoint).
+
+#### PyPI index formats
+
+packmule speaks two PyPI index APIs, and `--index auto` (the default) picks
+the better one for the endpoint: the JSON API when talking to pypi.org, the
+[PEP 503](https://peps.python.org/pep-0503/) *simple* API whenever `-u` is
+given. Override with `--index simple` or `--index json` when your index is an
+exception — a private index that does implement the JSON API, or pypi.org
+itself when you want to exercise the simple path.
+
+Neither is a legacy of the other. The JSON API (`/pypi/<name>/json`) is a
+pypi.org extension that private indexes generally do not implement, so a
+private index needs the simple API. Against pypi.org, though, JSON is the
+better source: it answers in one request per package instead of two, and it
+reports dependencies for **source distributions**, which the simple API cannot
+(see below).
+
+The simple API carries no dependency metadata, so packmule recovers it in one
+of two ways:
+
+1. **[PEP 658](https://peps.python.org/pep-0658/)/[714](https://peps.python.org/pep-0714/)**
+   — if the index advertises `data-core-metadata`, the `METADATA` file is
+   fetched on its own. One small request per package; this is the fast path and
+   current Artifactory versions support it.
+2. **Otherwise** — the wheel itself is downloaded during resolution and its
+   `METADATA` read out of the archive. Those downloads are reused by the
+   download phase rather than repeated, so nothing is fetched twice.
+
+If neither yields metadata, packmule warns that dependencies were not followed
+and the bundle may be incomplete — it does not silently ship one.
+
+**Source distributions are the weak spot of the simple API.** pypi.org
+advertises PEP 658 metadata for wheels but not for sdists, and most private
+indexes advertise none at all, so an sdist falls through to route 2 — and an
+sdist's `PKG-INFO` frequently declares no dependencies even when the package
+has them. If a manifest resolves to sdists on a private index, check the
+warnings and pin the missing transitive dependencies explicitly. Against
+pypi.org this does not arise, because `--index auto` uses the JSON API, which
+reports `requires_dist` for sdists too.
+
+### SBOM output
+
+A bundle is often the last point at which anyone can see what is about to
+enter an air-gapped network, so it is the natural place to record an
+inventory. `--sbom` emits one from the resolved package set — no extra network
+requests, since resolution already established every name, exact version,
+digest, source URL and dependency edge.
+
+```bash
+packmule -f requirements.txt -o ./vendor --bundle --sbom both
+```
+
+| Value | Output file | Format |
+|---|---|---|
+| `cyclonedx` | `sbom.cdx.json` | CycloneDX 1.5 JSON |
+| `spdx` | `sbom.spdx.json` | SPDX 2.3 JSON |
+| `both` | both of the above | — |
+
+Both are generated from the same data, so asking for both costs only the
+second file. CycloneDX is what vulnerability tooling ingests (Dependency-Track,
+Grype, Trivy); SPDX is what licence-compliance and procurement processes
+usually ask for.
+
+Each component carries:
+
+- a **package URL (purl)** — `pkg:pypi/requests@2.31.0`,
+  `pkg:npm/%40babel/core@7.24.0`,
+  `pkg:rpm/docker-ce@29.6.1-1.el9?arch=x86_64&epoch=3`. This is the identifier
+  scanners match on; PyPI names are PEP 503-normalised and RPM epochs become a
+  qualifier, both as the purl spec requires.
+- the **SHA-256 of the file as it sits in the bundle** — the same hash
+  `SHA256SUMS` and `packmule verify` check.
+- the **source URL** it was fetched from, and the filename (CycloneDX
+  `properties`; SPDX `downloadLocation` / `packageFileName`).
+- the **declared licence**, where the registry publishes one.
+- **dependency edges** (CycloneDX `dependencies`, SPDX `DEPENDS_ON`
+  relationships) for pypi and npm, so the document is a graph rather than a
+  flat list. RPM is excluded on purpose: its dependencies are capabilities
+  (`libc.so.6`, `/bin/sh`) that do not map one-to-one onto package names, and
+  guessing would produce edges that are wrong rather than merely absent.
+
+With `--bundle`, the SBOM is written before `SHA256SUMS`, so it is covered by
+it and travels inside the `.tar.gz` — an inventory that could be swapped out
+undetected would not be worth much. Without `--bundle`, it is written into the
+output directory alongside the packages.
+
+Both documents are validated in development against the official CycloneDX
+1.5 JSON schema and the SPDX reference validator (`spdx-tools`).
+
+**On licences.** Registries publish free text — `BSD-3-Clause`, but also
+`MIT License` and `Apache 2.0`. CycloneDX records whatever was published
+verbatim (as a licence `name`, not an `id`, since an `id` must come from the
+SPDX list). SPDX's `licenseDeclared` takes a licence *expression* and a
+validator rejects anything else, so a value that is not plausibly one becomes
+`NOASSERTION` rather than producing an invalid document. `licenseConcluded` is
+always `NOASSERTION`: concluding a licence would mean packmule had audited the
+source, which it has not.
+
+`SOURCE_DATE_EPOCH` is honoured for the document timestamp. The document
+identifier (CycloneDX `serialNumber`, SPDX `documentNamespace`) is a fresh
+UUID per run, as both specifications require.
 
 ### Exit codes
 
@@ -356,7 +561,10 @@ is preferred so the wheel installs on older targets. When only an sdist
 exists, packmule warns and bundles `setuptools` + `wheel` alongside it so the
 target machine can build it offline.
 
-Integrity: SHA-256 hex digest from the PyPI JSON API (`urls[].digests.sha256`).
+Integrity: SHA-256 hex digest, from the JSON API (`urls[].digests.sha256`) or,
+on a simple index, from the `#sha256=` fragment on the file's link. An index
+that publishes no digest for a file is a hard failure — packmule will not
+bundle a file it cannot verify.
 
 ### npm — Node.js packages
 
@@ -481,6 +689,10 @@ The unit suites are fully offline — no network access required:
 | `test_registry_rpm` | RPM manifest parsing: name-only, name-version, hyphenated names; EVR pins and selection |
 | `test_hash` | Digest typing, sha1/sha256/sha512 hex and SHA-512 SRI, unset-digest refusal |
 | `test_bundle` | Bundle creation for all three backends; skips packages missing from disk |
+| `test_auth` | Credential scheme selection and host scoping: default-port equivalence, userinfo and IPv6 authorities, out-of-scope hosts, and every misconfiguration that must be fatal |
+| `test_simple_index` | PEP 503 page parsing (hash fragments, yanking, PEP 658 attributes, entity decoding), RFC 3986 URL resolution, and version extraction from wheel/sdist filenames |
+| `test_sbom` | purl construction per registry (PEP 503 normalisation, npm scopes, RPM epoch/arch qualifiers, encoding) and `--sbom` value parsing |
+| `test_pypi_metadata` | `Requires-Dist` extraction: header/description boundary, CRLF, folded continuations, and reading METADATA out of a wheel or sdist |
 
 ### End-to-end tests
 
@@ -546,11 +758,21 @@ src/
   verify.c            SHA256SUMS verification and the post-bundle offline
                       install checks
   network.c           libcurl wrappers — fetch_json() with connection reuse,
-                      download_file(), download_many() (curl_multi)
+                      download_file(), download_many() (curl_multi); the single
+                      point where credentials are attached to a request
+  auth.c              Credentials from the environment, scoped to the
+                      --repo-url host; no libcurl dependency, so the scoping
+                      rules are unit-testable
   hash.c              Typed digests (algorithm + encoding) over OpenSSL EVP
   registry.c          Registry dispatch table and name lookup
   registry_pypi.c     PyPI backend — requirements.txt parser, distribution
-                      selection, constraint-aware resolver, get_deps
+                      selection, constraint-aware resolver, get_deps; speaks
+                      either the JSON API or the PEP 503 simple API
+  simple_index.c      PEP 503 index page parsing: anchors, digest fragments,
+                      PEP 592 yanking, PEP 658 metadata attributes, and RFC
+                      3986 URL resolution
+  pypi_metadata.c     Requires-Dist extraction from a METADATA document or
+                      from inside a wheel/sdist (libarchive)
   registry_npm.c      npm backend — package.json / package-lock.json parser,
                       tarball resolution
   registry_rpm.c      RPM backend — packages.txt parser, repomd/primary.xml
@@ -565,13 +787,19 @@ src/
   package.c           Package and PackageList data structures
   bundle.c            manifest.json + requirements.txt + install.sh + .tar.gz;
                       install.sh is an embedded scripts/install_<name>.sh
+  sbom.c              CycloneDX 1.5 and SPDX 2.3 output: purl construction per
+                      registry, file hashes, licences, dependency edges
   utils.c             Abort-on-OOM allocators (pm_malloc, pm_free, …) and string
                       helpers (pm_strtrim, pm_asprintf, pm_human_size)
 include/
   network.h
+  auth.h              AuthScheme, credential lookup, host-scope query
   hash.h              Digest type, algorithms, and file verification
   registry.h          Registry vtable (name, manifest_name, name_equal,
                       parse_manifest, resolve, get_deps, ctx, repo_url)
+  simple_index.h      SimpleFile / SimpleFileList and the PEP 503 parser
+  sbom.h              SbomFormat flags, sbom_write(), sbom_purl()
+  pypi_metadata.h     METADATA parsing and archive extraction
   registry_internal.h Backend internals exposed to the test suite only
   resolve.h / verify.h
   rpm_repo.h          primary.xml index API
@@ -614,6 +842,9 @@ struct Registry {
                                    const PackageList *seen, PackageList *out);
     void        *ctx;            /* backend-specific config, injected by main.c */
     const char  *repo_url;       /* base URL, set from -u flag by main.c */
+    int          py_minor;       /* target CPython minor (pypi) */
+    const char  *target_os;      /* target OS family (pypi) */
+    PypiIndexMode index_mode;    /* --index: auto / simple / json (pypi) */
 };
 ```
 
@@ -653,17 +884,23 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 
 ## Roadmap
 
+### Recently landed
+
+- [x] Registry authentication — environment-supplied credentials (Basic,
+      Bearer, or any custom header), scoped to the `--repo-url` host, plus a
+      custom CA bundle and client certificates for corporate PKI. `~/.netrc`
+      is deliberately not read: the environment is the single source
+- [x] PEP 503 simple-index support — works against Artifactory, Nexus, devpi,
+      GitLab and any other private PyPI index
+- [x] SBOM output — CycloneDX 1.5 and SPDX 2.3 from the resolved package set
+
 ### Next up
 
 - [ ] PyPI lockfile mode — exact-tree bundling from `uv.lock`, `poetry.lock`,
       and PEP 751 `pylock.toml`, mirroring the npm lockfile mode
-- [ ] Registry authentication — `~/.netrc`, token via flag/environment
-      variable, and a custom CA bundle (`--cacert`) for TLS-intercepting
-      corporate proxies
 
 ### Planned
 
-- [ ] SBOM output — emit CycloneDX/SPDX from the resolved package set
 - [ ] HTTP Range resume for interrupted downloads
 - [ ] Debian/apt backend
 
@@ -680,15 +917,268 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the checks CI
-runs (tests, ASan/UBSan, clang-tidy, shellcheck), and the resolver invariants
-reviewers enforce.
+### Development setup
+
+Install the [dependencies](#requirements), then build with assertions live:
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+### The checks CI runs
+
+Run these before opening a pull request. Every one of them gates merge.
+
+**1. Build and test** — the Debug build above. Warnings are errors
+(`PACKMULE_WERROR`, on by default).
+
+**2. Sanitizers.** Most of this codebase is hand-rolled parsing of untrusted
+input, which is exactly the shape of code that breaks in ways a passing test
+suite does not reveal.
+
+```sh
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DPACKMULE_WERROR=OFF \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer \
+                     -fno-sanitize-recover=undefined -g"
+cmake --build build-asan --parallel
+ctest --test-dir build-asan --output-on-failure
+```
+
+LeakSanitizer does not work on Apple silicon. On macOS add
+`ASAN_OPTIONS=detect_leaks=0` and check for leaks with the platform tool
+instead — `leaks --atExit -- ./build/packmule -n -f
+tests/fixtures/requirements.txt`. CI runs LeakSanitizer on Ubuntu, so leaks are
+caught there regardless.
+
+**3. Static analysis.** The generated header must exist first.
+
+```sh
+cmake --build build --target bundle_scripts
+clang-tidy -p build --warnings-as-errors='*' src/*.c
+```
+
+On macOS, add `-extra-arg="-isysroot$(xcrun --show-sdk-path)"`. Fix what
+clang-tidy reports rather than adding suppressions. If a report is a genuine
+false positive, scope the suppression as narrowly as possible — a
+`NOLINTBEGIN`/`NOLINTEND` pair around the one function — and write down why. Do
+not disable a check globally in `.clang-tidy` to silence a single site.
+
+**4. Shell.** The install scripts ship inside every bundle; the e2e scripts are
+the only thing exercising the pipeline end to end. Both are held to the same
+standard as the C.
+
+```sh
+shellcheck -s sh scripts/*.sh tests/e2e/*.sh
+```
+
+**5. End-to-end** (optional, needs network) — see [End-to-end
+tests](#end-to-end-tests). These hit real registries, so they are opt-in and run
+nightly rather than per-push. They exit 77 (ctest's skip code) when a
+prerequisite such as `npm` or `python3` is missing, rather than failing.
+
+### Platform differences that bite
+
+Most contributors develop on macOS; CI is mostly Linux. Several classes of bug
+are invisible locally and fail only in CI. If CI disagrees with your machine,
+**CI is authoritative** — do not assume it is flaky.
+
+- **Missing POSIX headers.** macOS's `<string.h>` pulls in `<strings.h>`
+  transitively; glibc under this project's strict `-std=c11` does not. Code
+  calling `strcasecmp` without including `<strings.h>` builds cleanly on macOS
+  and fails on every Linux job.
+- **Library versions.** Homebrew is current; EL8 is not. An API introduced
+  after the floor needs a `LIBCURL_VERSION_NUM` guard and a fallback — see
+  `multi_wait()` in `src/network.c`.
+- **clang-tidy findings can be platform-specific.** macOS's `<stdio.h>`
+  macro-replaces some libc functions with `__builtin_*_chk` variants, and
+  analyzer checks that match on the original name never engage. `pm_asprintf`
+  in `src/utils.c` carries a suppression for a report that no clang-tidy
+  version can reproduce on macOS.
+
+### Writing tests
+
+Tests link `packmule_core`, a CMake `OBJECT` library, so they reach internal
+functions without a second `main()`. They are compiled with `-UNDEBUG` so
+`assert()` stays live — which means **no side effects inside `assert()`**.
+
+Add tests in `tests/`, register them in `tests/CMakeLists.txt`. End-to-end
+tests go under `tests/e2e/` and must carry the `e2e` label.
+
+### Code style
+
+- C11. Four-space indent, no tabs. Lines around 80 columns.
+- `snake_case` for functions and variables; `PascalCase` for types.
+- Static by default; non-static only when a test or another module needs it.
+- The `pm_*` allocators abort on out-of-memory, so **do not write
+  allocation-failure branches** — they are unreachable by construction.
+- Errors propagate as return values. Library code does not call `exit()`;
+  only `main.c` decides the process exit status.
+- Comments explain *why*. The code already says what.
+
+### Invariants reviewers will check
+
+These are properties the compiler cannot enforce and the tests only sample.
+Changes that touch resolution or credentials should be read against them:
+
+- **The resolver contract** under [Adding a new registry
+  backend](#adding-a-new-registry-backend) — `resolve` idempotent, `version`
+  holding one concrete version, `user_pinned` never overridden, merging that
+  narrows rather than overwrites. The fixpoint loop re-invokes `get_deps` for
+  every dirty package, so anything with a side effect there runs more than
+  once; see the one-shot warning set in `src/registry_rpm.c`.
+- **Name comparison is per-registry.** Each backend supplies `name_equal`;
+  there is deliberately no default, because PyPI, npm and RPM disagree about
+  what makes two names the same.
+- **An unset digest is a failure, not a pass.** `digest_verify_file()` refuses
+  a file it has nothing to check against.
+- **Credentials go only to the `--repo-url` host**, and **redirects are
+  followed by packmule, not by libcurl** — `CURLOPT_FOLLOWLOCATION` is
+  deliberately off and the credential decision is remade at every hop from the
+  host actually about to be contacted. See [Threat model](#threat-model) for
+  why turning either of those around reintroduces a credential leak.
+- **Nothing secret reaches the output directory.** `manifest.json`, the SBOM
+  and `install.sh` are handed to whoever receives the bundle; a credential in
+  any of them travels with it.
+
+### Commits and pull requests
+
+Write commit messages that explain the reasoning, not just the change. State
+what was wrong, why the fix is right, and anything you verified or could not
+verify. Keep the subject line short and in the imperative mood.
+
+Pull requests should say how you tested the change, and call out anything you
+could not check on your own platform.
+
+---
 
 ## Security
 
-Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md), which
-also documents what packmule's digest and metadata verification does and does
-not protect against.
+### Reporting a vulnerability
+
+Please report vulnerabilities **privately**, not as a public issue. Use
+GitHub's private reporting: go to the repository's **Security** tab and choose
+**Report a vulnerability**. That opens a draft advisory visible only to you and
+the maintainers.
+
+Please include what you are reporting, how to reproduce it, and what an
+attacker gains. A proof-of-concept manifest or a captured registry response is
+worth more than a description.
+
+You should get an initial response within a week. If a fix is warranted, the
+advisory will be published alongside it with credit, unless you prefer
+otherwise.
+
+packmule is pre-1.0: only the latest release receives fixes, and there are no
+backports.
+
+### Threat model
+
+packmule fetches metadata and packages from a registry over the network,
+verifies them, and writes a bundle intended to be carried into an air-gapped
+environment and installed there.
+
+**Everything that arrives over the network is untrusted.** Registry JSON, PEP
+503 index HTML, `repomd.xml`, `primary.xml`, `METADATA` documents (including
+those read out of a downloaded wheel), version strings, PEP 508 specifiers,
+wheel filenames, and package names are all parsed by hand, in C, before
+anything has been verified. **Memory-safety bugs in that parsing are the
+highest-severity findings in this project, and they are in scope even when they
+require a hostile or compromised mirror to trigger.** A crash, an out-of-bounds
+read, or anything worse reached from a malformed registry response is a
+vulnerability, not a robustness issue.
+
+What packmule enforces — verified against the code, not aspirational:
+
+- **TLS** at libcurl's defaults for every request. There is no flag to disable
+  certificate or hostname verification, and none will be added. A private CA
+  can be named (`PACKMULE_CA_BUNDLE`, or the conventional `CURL_CA_BUNDLE` /
+  `SSL_CERT_FILE`) and mutual TLS configured, because supplying the correct
+  trust anchor is a decision packmule can act on. Disabling verification is not.
+- **`http` and `https` only**, for the request itself and for anything a
+  redirect points at, with redirects capped at 5. An index cannot redirect a
+  download to `file://` or `scp://`.
+- **Typed digest verification.** The algorithm comes from the metadata; there
+  is no length-sniffing. **A file with no digest to check against is refused**
+  — an absent digest is a hard failure, never a silent pass.
+- **npm requires SHA-512 SRI.** `dist.integrity` must carry a `sha512-` value;
+  packages offering only the legacy SHA-1 `dist.shasum` are rejected rather
+  than accepted with a weaker hash.
+- **RPM chain of trust.** `primary.xml` is verified against the digest
+  published in `repomd.xml` before any package digest inside it is trusted.
+- **Bundle integrity.** `SHA256SUMS` records every bundled file; `install.sh`
+  and `packmule verify` check it. Entry names containing `/` are rejected.
+- **Credentials are host-scoped.** Index credentials are sent only to the host
+  named by `--repo-url` (plus any host explicitly listed in
+  `PACKMULE_AUTH_HOSTS`). An index chooses the download URLs it returns, so a
+  repository that points a file at another host — or an attacker able to make
+  it do so — receives an unauthenticated request, not your token.
+- **Redirects are followed by packmule, not by libcurl**, and the credential
+  decision is remade at each hop from the host actually about to be contacted.
+  This is what makes an index's redirect to pre-signed S3 or CDN storage safe
+  to follow. It is not merely defence in depth: libcurl drops only the
+  `Authorization` header across a cross-host redirect, so a custom
+  `PACKMULE_AUTH_HEADER` credential would otherwise follow the redirect to a
+  third party.
+- **A custom auth header is validated, not trusted.** `PACKMULE_AUTH_HEADER`
+  is the one place the environment dictates raw protocol bytes; a CR or LF in
+  it is rejected rather than sent, since it would let the value inject further
+  headers or a second request.
+- **Credentials come only from the environment.** They are never read from
+  argv, where they would be visible in `ps` output to every user on the
+  machine, and a `--repo-url` embedding `user:pass@` is rejected rather than
+  honoured, because that URL is echoed in progress and error output.
+  Credentials bound for a plain-`http://` endpoint are refused unless
+  `PACKMULE_AUTH_INSECURE=1` is set explicitly. Credentials set without a
+  `--repo-url` are an error, never a silent anonymous fetch of the public
+  registry.
+- **No credential reaches a bundle.** `manifest.json` records filenames,
+  versions and digests; `install.sh` installs from the bundled files with the
+  index disabled. A bundle can be handed on without leaking the token that
+  built it.
+- **Resource limits**, so a hostile response cannot exhaust memory or disk:
+  256 MB per metadata response, 256 MB per npm manifest, 1 GB decompressed
+  `primary.xml`, 8 GB per download; a 60 s metadata timeout, and an abort after
+  30 s below 1 KB/s.
+
+### What packmule does *not* do
+
+Please read this before relying on it:
+
+- **It trusts the registry.** There is no TUF (PEP 458/480), no npm signature
+  verification, and no check of package *provenance*. Digests confirm you
+  received what the index advertised — not that the index is honest. A
+  compromised registry, or a successful account takeover of a package you
+  depend on, is not something packmule detects.
+- **It does not verify RPM GPG signatures.** `install_rpm.sh` deliberately
+  leaves dnf's `gpgcheck` setting alone so the target's own policy applies.
+  **Leave `gpgcheck` enabled on the target.**
+- **`SHA256SUMS` is unsigned.** It gives you integrity, not authenticity: it
+  proves the bundle was not corrupted, not that it came from you. Anyone who
+  can modify the bundle can regenerate it. Sign the `.tar.gz` out of band and
+  verify that signature before installing.
+- **It does not inspect package contents.** A package that is malicious but
+  correctly published will be bundled and installed faithfully. packmule is a
+  transport, not a scanner.
+- **Installation runs with the operator's privileges.** `install.sh` executes
+  pip, npm, or dnf on the target. Read it before running it as root.
+- **Local input is trusted.** Manifests, lockfiles, and existing bundle
+  directories are treated as coming from the operator.
+
+### Recommended practice
+
+For an air-gapped deployment:
+
+1. Bundle from a **private mirror** you control rather than the public index.
+2. **Sign the resulting `.tar.gz`** and verify the signature on the target.
+   This is the gap `SHA256SUMS` does not close.
+3. Run `packmule verify <dir>` after extracting, before installing.
+4. Keep **`gpgcheck` enabled** for RPM installs.
+5. Read `install.sh` before running it with elevated privileges.
+
+---
 
 ## License
 

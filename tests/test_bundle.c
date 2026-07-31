@@ -7,6 +7,7 @@
  * and .tar.gz archive.  No network access is required.
  */
 #include "bundle.h"
+#include "sbom.h"
 #include "package.h"
 #include "utils.h"
 
@@ -114,7 +115,7 @@ static void test_pypi_bundle(void)
         "certifi-2024.2.2-py3-none-any.whl",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 
-    BundleOptions opts = { dir, "pypi", list, NULL, NULL };
+    BundleOptions opts = { dir, "pypi", list, NULL, NULL, SBOM_NONE, NULL };
     assert(bundle_create(&opts) == 0);
 
     /* manifest.json — cJSON uses tab separators between key and value. */
@@ -170,7 +171,7 @@ static void test_npm_bundle(void)
         "axios-1.6.8.tgz",
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"));
 
-    BundleOptions opts = { dir, "npm", list, NULL, NULL };
+    BundleOptions opts = { dir, "npm", list, NULL, NULL, SBOM_NONE, NULL };
     assert(bundle_create(&opts) == 0);
 
     char mpath[4096];
@@ -217,7 +218,7 @@ static void test_rpm_bundle(void)
         "curl-8.6.0-1.fc40.x86_64.rpm",
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
 
-    BundleOptions opts = { dir, "rpm", list, NULL, NULL };
+    BundleOptions opts = { dir, "rpm", list, NULL, NULL, SBOM_NONE, NULL };
     assert(bundle_create(&opts) == 0);
 
     char mpath[4096];
@@ -272,7 +273,7 @@ static void test_bundle_skips_missing_files(void)
     Package *unresolved = package_create("itsdangerous", NULL);
     package_list_add(list, unresolved);
 
-    BundleOptions opts = { dir, "pypi", list, NULL, NULL };
+    BundleOptions opts = { dir, "pypi", list, NULL, NULL, SBOM_NONE, NULL };
     assert(bundle_create(&opts) == 0);
 
     /* manifest.json must include flask but not werkzeug or itsdangerous. */

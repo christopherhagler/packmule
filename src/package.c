@@ -133,6 +133,7 @@ void package_destroy(Package *pkg)
     pm_free(pkg->extras);
     pm_free(pkg->url);
     pm_free(pkg->filename);
+    pm_free(pkg->license);
     digest_clear(&pkg->digest);
     free_dep_specs(pkg->dep_specs);
     pm_free(pkg);

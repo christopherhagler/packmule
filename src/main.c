@@ -1,3 +1,4 @@
+#include "auth.h"
 #include "bundle.h"
 #include "hash.h"
 #include "network.h"
@@ -5,6 +6,7 @@
 #include "registry.h"
 #include "registry_internal.h"
 #include "resolve.h"
+#include "sbom.h"
 #include "utils.h"
 #include "verify.h"
 #include "version.h"
@@ -165,11 +167,17 @@ static void usage(const char *prog)
             "                             e.g. 3.12 (default: the local python3)\n"
             "  -u, --repo-url <url>       Repository base URL\n"
             "                             Required for rpm; optional override for pypi/npm\n"
+            "      --index <mode>         PyPI index API: auto (default), simple, or json.\n"
+            "                             'auto' picks the better one: pypi.org's JSON API\n"
+            "                             normally, the PEP 503 simple API when --repo-url is\n"
+            "                             set (private indexes rarely implement JSON)\n"
             "  -b, --bundle               Write manifest.json + install.sh + SHA256SUMS,\n"
             "                             then create <dir>.tar.gz\n"
             "  -n, --dry-run              Resolve and print what would be downloaded; no files written\n"
             "  -j, --jobs <n>             Parallel downloads (1-%d, default %d)\n"
             "      --no-verify            Skip the post-bundle offline install check\n"
+            "      --sbom <format>        Also write an SBOM: cyclonedx, spdx, or both.\n"
+            "                             Lands inside the bundle, covered by SHA256SUMS\n"
             "      --rpm-deps <mode>      rpm transitive deps: resolve (default) or none.\n"
             "                             'resolve' bundles the full closure from the repo,\n"
             "                             including base packages the target may already have\n"
@@ -178,6 +186,24 @@ static void usage(const char *prog)
             "\n"
             "Commands:\n"
             "  verify <dir>               Re-check an extracted bundle against its SHA256SUMS\n"
+            "\n"
+            "Authentication (private indexes: JFrog Artifactory, Nexus, devpi, ...):\n"
+            "  Credentials come from the environment, never from the command line, and are\n"
+            "  sent only to the host named by --repo-url.  Works for pypi, npm and rpm.\n"
+            "    PACKMULE_USERNAME + PACKMULE_PASSWORD   HTTP Basic\n"
+            "    PACKMULE_USERNAME + PACKMULE_TOKEN      HTTP Basic (API key / identity token)\n"
+            "    PACKMULE_TOKEN                          Bearer token\n"
+            "    PACKMULE_AUTH_HEADER                    literal header for any other scheme,\n"
+            "                                            e.g. 'X-JFrog-Art-Api: <key>'\n"
+            "    PACKMULE_AUTH_HOSTS                     extra hosts, comma-separated, for\n"
+            "                                            indexes that serve files elsewhere\n"
+            "    PACKMULE_AUTH_INSECURE=1                allow credentials over plain http\n"
+            "\n"
+            "Corporate TLS (no option to disable verification; name the CA instead):\n"
+            "    PACKMULE_CA_BUNDLE                      CA file or directory\n"
+            "                                            (CURL_CA_BUNDLE, SSL_CERT_FILE honoured)\n"
+            "    PACKMULE_CLIENT_CERT / _KEY / _KEY_PASSWORD    client cert for mutual TLS\n"
+            "  Proxies need no setup: http_proxy / https_proxy / no_proxy are honoured.\n"
             "\n"
             "Available registry types:\n",
             prog, prog, NETWORK_MAX_JOBS, NETWORK_DEFAULT_JOBS);
@@ -190,8 +216,12 @@ static void usage(const char *prog)
             "  %s -f package.json     -o ./vendor -t npm\n"
             "  %s -f packages.txt     -o ./vendor -t rpm -a x86_64 \\\n"
             "      -u https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Everything/x86_64/os\n"
-            "  %s verify ./vendor\n",
-            prog, prog, prog, prog, prog, prog);
+            "  %s verify ./vendor\n"
+            "\n"
+            "  export PACKMULE_TOKEN=...   # private Artifactory PyPI repository\n"
+            "  %s -f requirements.txt -o ./vendor \\\n"
+            "      -u https://art.corp/artifactory/api/pypi/pypi-virtual/simple\n",
+            prog, prog, prog, prog, prog, prog, prog);
 }
 
 /* ── Resolution progress ─────────────────────────────────────────────────── */
@@ -296,6 +326,17 @@ static int download_all(const PackageList *reqs, const char *output_dir,
          * expected digest, skip the download — re-runs become resumable and
          * idempotent.  A missing, truncated, or stale file falls through to a
          * fresh download that overwrites it. */
+        /*
+         * On an index without PEP 658, resolution had to download this very
+         * artifact to read its dependency metadata.  Move it into place rather
+         * than fetching it a second time — for a large wheel that is the
+         * difference between one transfer and two.  A cross-filesystem rename
+         * fails harmlessly and the normal download takes over.
+         */
+        const char *staged = pypi_cached_artifact(pkg->filename);
+        if (staged && digest_matches_file(staged, &pkg->digest))
+            rename(staged, dests[i]);
+
         struct stat cst;
         if (stat(dests[i], &cst) == 0 &&
             digest_matches_file(dests[i], &pkg->digest)) {
@@ -423,7 +464,10 @@ int main(int argc, char *argv[])
      * resolved below to --python (if given) or the local python3. */
     int py_minor = -1;
 
-    enum { OPT_NO_VERIFY = 1000, OPT_RPM_DEPS };
+    PypiIndexMode index_mode   = PYPI_INDEX_AUTO;
+    int           sbom_formats = SBOM_NONE;
+
+    enum { OPT_NO_VERIFY = 1000, OPT_RPM_DEPS, OPT_INDEX, OPT_SBOM };
     static const struct option LONG_OPTS[] = {
         { "help",      no_argument,       NULL, 'h' },
         { "manifest",  required_argument, NULL, 'f' },
@@ -438,6 +482,8 @@ int main(int argc, char *argv[])
         { "jobs",      required_argument, NULL, 'j' },
         { "no-verify", no_argument,       NULL, OPT_NO_VERIFY },
         { "rpm-deps",  required_argument, NULL, OPT_RPM_DEPS  },
+        { "index",     required_argument, NULL, OPT_INDEX     },
+        { "sbom",      required_argument, NULL, OPT_SBOM      },
         { NULL,        0,                 NULL,  0  },
     };
 
@@ -455,6 +501,26 @@ int main(int argc, char *argv[])
         case 'b': do_bundle     = 1;      break;
         case 'n': dry_run       = 1;      break;
         case OPT_NO_VERIFY: no_verify = 1; break;
+        case OPT_SBOM:
+            sbom_formats = sbom_parse_format(optarg);
+            if (sbom_formats == SBOM_NONE) {
+                fprintf(stderr,
+                        "packmule: invalid --sbom value '%s'"
+                        " (expected 'cyclonedx', 'spdx', or 'both')\n", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
+        case OPT_INDEX:
+            if      (strcmp(optarg, "auto")   == 0) index_mode = PYPI_INDEX_AUTO;
+            else if (strcmp(optarg, "simple") == 0) index_mode = PYPI_INDEX_SIMPLE;
+            else if (strcmp(optarg, "json")   == 0) index_mode = PYPI_INDEX_JSON;
+            else {
+                fprintf(stderr,
+                        "packmule: invalid --index value '%s'"
+                        " (expected 'auto', 'simple', or 'json')\n", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
         case OPT_RPM_DEPS:
             if      (strcmp(optarg, "resolve") == 0) rpm_deps = 1;
             else if (strcmp(optarg, "none")    == 0) rpm_deps = 0;
@@ -565,7 +631,25 @@ int main(int argc, char *argv[])
     reg_inst.repo_url   = repo_url;
     reg_inst.py_minor   = py_minor;
     reg_inst.target_os  = target_os;
+    reg_inst.index_mode = index_mode;
     const Registry *reg = &reg_inst;
+
+    /*
+     * Credentials must be settled before the first request goes out, and a
+     * misconfiguration is fatal rather than a silent fall back to an anonymous
+     * fetch — that would quietly build a bundle from the wrong index.
+     */
+    if (auth_init(repo_url) != 0)
+        return EXIT_FAILURE;
+
+    /*
+     * Registered rather than called at each return: the pypi backend may leave
+     * a temporary directory of downloaded artifacts behind, and every early
+     * exit below (resolution failure, dry run, bad output dir) must still
+     * clean it up.  auth_cleanup() wipes the secrets from memory.
+     */
+    atexit(pypi_backend_cleanup);
+    atexit(auth_cleanup);
 
     if (network_init() != 0) {
         fprintf(stderr, "packmule: failed to initialise libcurl\n");
@@ -589,7 +673,18 @@ int main(int argc, char *argv[])
         else
             printf("packmule: python    : any (no python3 found; "
                    "arch-only wheel matching)\n");
+        /* Which API we chose is not obvious from --index auto, and it decides
+         * what a failure means: say it up front. */
+        printf("packmule: index     : %s\n",
+               (index_mode == PYPI_INDEX_AUTO && repo_url) ? "simple (PEP 503)"
+             : (index_mode == PYPI_INDEX_SIMPLE)           ? "simple (PEP 503)"
+                                                           : "json");
     }
+    if (repo_url)
+        printf("packmule: repo url  : %s\n", repo_url);
+    if (auth_configured())
+        printf("packmule: auth      : %s credentials for %s\n",
+               auth_scheme_name(), auth_scope_description());
     printf("packmule: manifest  : %s (%zu package(s))\n",
            manifest_file, reqs->count);
     if (dry_run)
@@ -670,6 +765,17 @@ int main(int argc, char *argv[])
 
     int exit_code = (dl_rc == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 
+    /*
+     * An SBOM without --bundle still belongs next to the packages it
+     * describes.  With --bundle, bundle_create emits it instead, so that it is
+     * written before SHA256SUMS and ends up covered by it and inside the
+     * archive.
+     */
+    if (sbom_formats != SBOM_NONE && !do_bundle &&
+        exit_code == EXIT_SUCCESS &&
+        sbom_write(output_dir, reg, reqs, sbom_formats) != 0)
+        exit_code = EXIT_FAILURE;
+
     /* ── Phase 3: bundle ─────────────────────────────────────────────────── */
 
     if (do_bundle) {
@@ -683,6 +789,8 @@ int main(int argc, char *argv[])
             bopts.packages      = reqs;
             bopts.aux_file      = NULL;
             bopts.aux_name      = NULL;
+            bopts.sbom_formats  = sbom_formats;
+            bopts.registry      = reg;
 
             /* An npm bundle built from a lockfile must carry that lock:
              * install.sh replays its exact tree with `npm ci --offline`. */

@@ -50,6 +50,11 @@ typedef struct {
     char *filename;    /* Basename the artifact is stored under. */
     char **dep_specs;  /* NULL-terminated array of registry dep specifiers, or
                           NULL.  Populated by resolve(); read by get_deps(). */
+    char *license;     /* Licence as the registry declares it, or NULL when it
+                          publishes none.  Free text, not a validated SPDX
+                          identifier — registries emit everything from
+                          "BSD-3-Clause" to "Apache 2.0".  Consumed only by the
+                          SBOM writer, which is why nothing here interprets it. */
 
     PackageState state;
     int  user_pinned;  /* 1 when `version` came from the manifest rather than

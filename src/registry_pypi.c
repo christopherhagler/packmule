@@ -4,14 +4,19 @@
 #include "package.h"
 #include "pep440.h"
 #include "pep508.h"
+#include "pypi_metadata.h"
+#include "simple_index.h"
 #include "utils.h"
 #include "wheeltag.h"
 
 #include <cjson/cJSON.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ── requirements.txt line parser ────────────────────────────────────────── */
 
@@ -348,6 +353,59 @@ int pypi_parse_response(const char *json, Package *pkg, const char *arch,
 
     cJSON *info = cJSON_GetObjectItemCaseSensitive(root, "info");
 
+    /*
+     * Licence, for the SBOM.  Preference order matters: license_expression is
+     * PEP 639 and is already an SPDX expression; the Trove classifier is a
+     * controlled vocabulary; info.license is free text and, for a sizeable
+     * minority of projects, the entire licence *body* rather than its name —
+     * so it is only accepted when short enough to plausibly be a name.
+     */
+    if (info) {
+        cJSON *expr = cJSON_GetObjectItemCaseSensitive(info,
+                                                       "license_expression");
+        if (cJSON_IsString(expr) && expr->valuestring[0]) {
+            pm_free(pkg->license);
+            pkg->license = pm_strdup(expr->valuestring);
+        } else {
+            cJSON *classifiers = cJSON_GetObjectItemCaseSensitive(info,
+                                                              "classifiers");
+            char  *from_class  = NULL;
+            cJSON *item        = NULL;
+            if (cJSON_IsArray(classifiers)) {
+                cJSON_ArrayForEach(item, classifiers) {
+                    if (!cJSON_IsString(item))
+                        continue;
+                    if (strncmp(item->valuestring, "License ::", 10) != 0)
+                        continue;
+                    const char *last = strrchr(item->valuestring, ':');
+                    if (!last || !last[1])
+                        continue;
+                    const char *val = last + 1;
+                    while (*val == ' ')
+                        val++;
+                    /* "OSI Approved" alone names no licence. */
+                    if (strcmp(val, "OSI Approved") == 0 || !*val)
+                        continue;
+                    pm_free(from_class);
+                    from_class = pm_strdup(val);
+                }
+            }
+
+            if (from_class) {
+                pm_free(pkg->license);
+                pkg->license = from_class;
+            } else {
+                cJSON *lic = cJSON_GetObjectItemCaseSensitive(info, "license");
+                if (cJSON_IsString(lic) && lic->valuestring[0] &&
+                    strlen(lic->valuestring) <= 64 &&
+                    !strchr(lic->valuestring, '\n')) {
+                    pm_free(pkg->license);
+                    pkg->license = pm_strdup(lic->valuestring);
+                }
+            }
+        }
+    }
+
     /* If version was unspecified, fill it in from info.version. */
     if (!pkg->version && info) {
         cJSON *ver_item = cJSON_GetObjectItemCaseSensitive(info, "version");
@@ -599,8 +657,489 @@ static char *pick_constrained_version(const char *json, const char *constraint)
     return best;
 }
 
+/* ── Simple repository API (PEP 503) ─────────────────────────────────────── */
+
+/*
+ * The JSON API is a pypi.org extension.  Artifactory, Nexus, devpi and the
+ * rest serve only the simple API, so a --repo-url pointing at one of those
+ * needs an entirely different resolution path: an HTML page listing files,
+ * versions recovered from filenames, and dependency metadata that has to be
+ * fetched separately because the page does not carry it.
+ */
+
+/* True when this run should talk to the simple API rather than the JSON one. */
+static int pypi_use_simple(const Registry *self)
+{
+    switch (self->index_mode) {
+    case PYPI_INDEX_SIMPLE: return 1;
+    case PYPI_INDEX_JSON:   return 0;
+    case PYPI_INDEX_AUTO:
+    default:                return self->repo_url != NULL;
+    }
+}
+
+/*
+ * Artifacts downloaded during resolution so their METADATA can be read.
+ *
+ * Needed only for indexes that do not implement PEP 658.  The files are the
+ * very ones the download phase will want, so they are kept for main.c to claim
+ * (pypi_cached_artifact) instead of being fetched twice — a wheel can be
+ * hundreds of megabytes.
+ */
+static char *g_meta_cache_dir;
+
+static const char *meta_cache_dir(void)
+{
+    if (g_meta_cache_dir)
+        return g_meta_cache_dir;
+
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp)
+        tmp = "/tmp";
+
+    char *template = pm_asprintf("%s/packmule-meta-XXXXXX", tmp);
+    if (!mkdtemp(template)) {
+        fprintf(stderr, "packmule: cannot create a temporary directory: %s\n",
+                template);
+        pm_free(template);
+        return NULL;
+    }
+    g_meta_cache_dir = template;
+    return g_meta_cache_dir;
+}
+
+const char *pypi_cached_artifact(const char *filename)
+{
+    static char path[4096];
+
+    if (!g_meta_cache_dir || !filename)
+        return NULL;
+
+    snprintf(path, sizeof(path), "%s/%s", g_meta_cache_dir,
+             pm_basename(filename));
+
+    struct stat st;
+    return (stat(path, &st) == 0 && S_ISREG(st.st_mode)) ? path : NULL;
+}
+
+void pypi_backend_cleanup(void)
+{
+    if (!g_meta_cache_dir)
+        return;
+
+    /* Only ever our own mkdtemp directory, one level deep. */
+    DIR *d = opendir(g_meta_cache_dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            char *p = pm_asprintf("%s/%s", g_meta_cache_dir, e->d_name);
+            remove(p);
+            pm_free(p);
+        }
+        closedir(d);
+    }
+    rmdir(g_meta_cache_dir);
+    pm_free(g_meta_cache_dir);
+    g_meta_cache_dir = NULL;
+}
+
+/*
+ * fetch_dep_specs — get `file`'s dependency list, by whichever route the index
+ * supports, and record it on `pkg`.
+ *
+ * Returns 0 when the dependencies are known (including "known to be none"),
+ * and -1 when they could not be determined — the caller warns, because a
+ * bundle missing a transitive dependency only fails on the air-gapped machine
+ * where it cannot be fixed.
+ */
+static int fetch_dep_specs(const SimpleFile *file, Package *pkg)
+{
+    char *text = NULL;
+
+    /* PEP 658/714: the index serves the metadata on its own, no artifact
+     * download needed.  This is the fast path and modern Artifactory has it. */
+    if (file->metadata_url)
+        text = fetch_json(file->metadata_url);
+
+    if (!text) {
+        /* Fall back to reading the artifact.  Cached so that a package the
+         * resolver revisits is not downloaded again, and so the download phase
+         * can claim the file rather than refetching it. */
+        const char *dir = meta_cache_dir();
+        if (!dir)
+            return -1;
+
+        char *path = pm_asprintf("%s/%s", dir, pm_basename(file->filename));
+
+        struct stat st;
+        if (stat(path, &st) != 0 &&
+            download_file(file->url, path, file->filename, 0) != 0) {
+            pm_free(path);
+            return -1;
+        }
+
+        text = pypi_metadata_from_archive(path);
+        pm_free(path);
+    }
+
+    if (!text)
+        return -1;
+
+    char **specs = pypi_metadata_requires(text);
+    int    known = pypi_metadata_has_requires_header(text) ||
+                   dist_is_wheel(file->filename);
+
+    /* The same document carries the licence, so the SBOM gets it for free. */
+    char *license = pypi_metadata_license(text);
+    if (license) {
+        pm_free(pkg->license);
+        pkg->license = license;
+    }
+    pm_free(text);
+
+    /*
+     * A wheel with no Requires-Dist genuinely has no dependencies — the
+     * metadata is generated at build time and is complete.  An sdist's
+     * PKG-INFO frequently predates dependency declaration entirely, so its
+     * silence means "unknown", not "none".
+     */
+    package_set_dep_specs(pkg, specs);   /* takes ownership of the array */
+    return known ? 0 : -1;
+}
+
+/*
+ * requires_python_ok — evaluate a data-requires-python attribute against the
+ * target interpreter.
+ *
+ * pip refuses a file whose Requires-Python excludes the running interpreter,
+ * so selecting one here would produce a bundle that cannot be installed.
+ */
+static int requires_python_ok(const char *spec, int py_minor)
+{
+    if (!spec || !*spec || py_minor <= 0)
+        return 1;                       /* nothing to check against */
+
+    char version[16];
+    snprintf(version, sizeof(version), "3.%d", py_minor);
+
+    /* An unparseable specifier is not a reason to reject a file. */
+    return pep440_satisfies(version, spec) != 0;
+}
+
+/*
+ * simple_pick_version — the version to resolve to, out of everything the index
+ * lists.
+ *
+ * Mirrors the JSON path's policy: a user pin is absolute, a constraint selects
+ * the highest satisfying release, and pre-releases are skipped unless the
+ * constraint itself names one.
+ */
+static char *simple_pick_version(const SimpleFileList *files, const Package *pkg)
+{
+    if (pkg->version && pkg->user_pinned)
+        return pm_strdup(pkg->version);
+
+    int   admit_pre = pkg->constraint
+                    ? pep440_spec_admits_prerelease(pkg->constraint) : 0;
+    char *best      = NULL;
+
+    for (size_t i = 0; i < files->count; i++) {
+        const SimpleFile *f = &files->items[i];
+        if (f->yanked)
+            continue;
+
+        char *ver = simple_file_version(f->filename, pkg->name);
+        if (!ver)
+            continue;
+
+        if (!pep440_valid(ver) ||
+            (!admit_pre && pep440_is_prerelease(ver)) ||
+            (pkg->constraint && pep440_satisfies(ver, pkg->constraint) != 1)) {
+            pm_free(ver);
+            continue;
+        }
+
+        if (!best || pep440_cmp(ver, best) > 0) {
+            pm_free(best);
+            best = ver;
+        } else {
+            pm_free(ver);
+        }
+    }
+
+    /*
+     * Nothing but pre-releases satisfy: take one rather than fail.  pip does
+     * the same when a version can only be met by a pre-release, and failing
+     * here would block packages that have never had a final release.
+     */
+    if (!best && !admit_pre) {
+        for (size_t i = 0; i < files->count; i++) {
+            const SimpleFile *f = &files->items[i];
+            if (f->yanked)
+                continue;
+            char *ver = simple_file_version(f->filename, pkg->name);
+            if (!ver)
+                continue;
+            if (!pep440_valid(ver) ||
+                (pkg->constraint &&
+                 pep440_satisfies(ver, pkg->constraint) != 1)) {
+                pm_free(ver);
+                continue;
+            }
+            if (!best || pep440_cmp(ver, best) > 0) {
+                pm_free(best);
+                best = ver;
+            } else {
+                pm_free(ver);
+            }
+        }
+    }
+
+    return best;
+}
+
+/*
+ * simple_pick_file — choose the best distribution for `version`.
+ *
+ * Same preference order as the JSON path: an arch-specific wheel beats a
+ * universal wheel beats an sdist, and among arch wheels the lowest manylinux
+ * glibc floor wins because it installs on the widest range of targets.
+ */
+static const SimpleFile *simple_pick_file(const SimpleFileList *files,
+                                          const Package *pkg,
+                                          const char *version,
+                                          const char *arch,
+                                          const char *target_os,
+                                          int py_minor,
+                                          int *out_saw_yanked)
+{
+    const SimpleFile *chosen   = NULL;
+    int               priority = 0;
+    int               glibc    = 0;
+
+    *out_saw_yanked = 0;
+
+    for (size_t i = 0; i < files->count; i++) {
+        const SimpleFile *f = &files->items[i];
+
+        char *ver = simple_file_version(f->filename, pkg->name);
+        if (!ver)
+            continue;
+        int same = (pep440_valid(ver) && pep440_cmp(ver, version) == 0);
+        pm_free(ver);
+        if (!same)
+            continue;
+
+        if (f->yanked) {
+            *out_saw_yanked = 1;
+            continue;
+        }
+        if (!requires_python_ok(f->requires_python, py_minor))
+            continue;
+
+        WheelTags tags;
+        if (dist_is_wheel(f->filename) &&
+            wheel_parse_tags(f->filename, &tags) == 0) {
+            if (strcmp(tags.platform, "any") == 0) {
+                if (wheel_python_matches(f->filename, py_minor) && priority < 2) {
+                    chosen   = f;
+                    priority = 2;
+                }
+            } else if (arch &&
+                       wheel_platform_matches(tags.platform, target_os, arch) &&
+                       wheel_python_matches(f->filename, py_minor)) {
+                int gmaj = 0, gmin = 0;
+                int gl = wheel_manylinux_glibc(tags.platform, &gmaj, &gmin)
+                       ? gmaj * 1000 + gmin : 0;
+                if (priority < 3 || (priority == 3 && gl < glibc)) {
+                    chosen   = f;
+                    priority = 3;
+                    glibc    = gl;
+                }
+            }
+        } else if (dist_is_sdist(f->filename) && priority < 1) {
+            chosen   = f;
+            priority = 1;
+        }
+    }
+
+    if (chosen && priority == 1)
+        fprintf(stderr,
+                "packmule: warning: no compatible wheel for %s==%s; bundling "
+                "source distribution %s\n"
+                "          (the target machine must be able to build it: "
+                "python3 headers, and a compiler if it has C extensions)\n",
+                pkg->name, version, chosen->filename);
+
+    return chosen;
+}
+
+static int pypi_resolve_simple(const Registry *self, Package *pkg)
+{
+    const char *arch      = self->ctx ? (const char *)self->ctx : NULL;
+    const char *target_os = self->target_os;
+    const int   py_minor  = self->py_minor;
+    const char *base      = self->repo_url ? self->repo_url
+                                           : "https://pypi.org/simple";
+
+    size_t blen = strlen(base);
+    char  *base_trimmed = pm_strndup(base, blen);
+    while (blen > 0 && base_trimmed[blen - 1] == '/')
+        base_trimmed[--blen] = '\0';
+
+    /* Same reasoning as the JSON path: a version we picked ourselves is a
+     * hypothesis, and a narrowed constraint invalidates it. */
+    if (pkg->version && !pkg->user_pinned && pkg->constraint) {
+        pm_free(pkg->version);
+        pkg->version = NULL;
+    }
+
+    /*
+     * PEP 503 requires the normalised name in the URL and mandates a redirect
+     * from other spellings, but not every index implements the redirect —
+     * asking for the normalised form directly avoids depending on it.  The
+     * trailing slash matters: it makes the page a directory, which is what
+     * relative hrefs on it are resolved against.
+     */
+    char *norm = simple_normalize_name(pkg->name);
+    char *url  = pm_asprintf("%s/%s/", base_trimmed, norm);
+    pm_free(norm);
+    pm_free(base_trimmed);
+
+    char *html = fetch_json(url);
+    if (!html) {
+        fprintf(stderr,
+                "packmule: cannot read the index page for %s (%s)\n"
+                "          If this index serves the PyPI JSON API rather than "
+                "the PEP 503 simple\n"
+                "          API, re-run with --index json.\n", pkg->name, url);
+        pm_free(url);
+        return -1;
+    }
+
+    SimpleFileList *files = simple_index_parse(html, url);
+    pm_free(html);
+
+    if (!files || files->count == 0) {
+        fprintf(stderr,
+                "packmule: no distribution files listed for %s at %s\n",
+                pkg->name, url);
+        simple_index_free(files);
+        pm_free(url);
+        return -1;
+    }
+    pm_free(url);
+
+    int ret = -1;
+
+    /* A user pin that contradicts what its dependents need cannot be papered
+     * over — the same check the JSON path makes. */
+    if (pkg->version && pkg->user_pinned && pkg->constraint &&
+        pep440_satisfies(pkg->version, pkg->constraint) == 0) {
+        fprintf(stderr,
+                "packmule: %s is pinned to %s but other packages require "
+                "'%s'.\n"
+                "          These cannot both hold; adjust the pin in your "
+                "manifest.\n",
+                pkg->name, pkg->version, pkg->constraint);
+        goto done;
+    }
+
+    char *version = simple_pick_version(files, pkg);
+    if (!version) {
+        if (pkg->constraint)
+            fprintf(stderr, "packmule: no release of %s satisfies '%s'\n",
+                    pkg->name, pkg->constraint);
+        else
+            fprintf(stderr,
+                    "packmule: no usable release found for %s on this index\n",
+                    pkg->name);
+        goto done;
+    }
+
+    int saw_yanked = 0;
+    const SimpleFile *chosen = simple_pick_file(files, pkg, version, arch,
+                                                target_os, py_minor,
+                                                &saw_yanked);
+    if (!chosen) {
+        char py_buf[16];
+        if (py_minor > 0)
+            snprintf(py_buf, sizeof(py_buf), "3.%d", py_minor);
+        else
+            snprintf(py_buf, sizeof(py_buf), "any");
+
+        if (saw_yanked)
+            fprintf(stderr,
+                    "packmule: every file for %s==%s has been yanked.\n"
+                    "          Pin a different version.\n",
+                    pkg->name, version);
+        else
+            fprintf(stderr,
+                    "packmule: no suitable package found for %s==%s"
+                    " (os: %s, arch: %s, python: %s)\n",
+                    pkg->name, version,
+                    target_os ? target_os : "any",
+                    arch ? arch : "any", py_buf);
+        pm_free(version);
+        goto done;
+    }
+
+    /*
+     * No digest is a hard failure, and it belongs here rather than at download
+     * time: the download would refuse the file anyway (see digest_verify_file)
+     * and "no digest to verify it against" arriving after a 200 MB transfer
+     * reads like a corrupted download rather than an index that publishes no
+     * checksums.  Simple-index pages put the digest in the link fragment, and
+     * an index omitting it is a real configuration problem worth naming.
+     */
+    if (!digest_is_set(&chosen->digest)) {
+        fprintf(stderr,
+                "packmule: the index publishes no checksum for %s\n"
+                "          (PEP 503 puts it in the link fragment, e.g. "
+                "\"...whl#sha256=...\").\n"
+                "          packmule will not bundle a file it cannot verify.\n",
+                chosen->filename);
+        pm_free(version);
+        goto done;
+    }
+
+    pm_free(pkg->url);
+    pm_free(pkg->filename);
+    pm_free(pkg->version);
+    pkg->url      = pm_strdup(chosen->url);
+    /* The filename came off the wire: basename it so a hostile or broken index
+     * serving "a/../../etc/x.whl" cannot escape the output directory. */
+    pkg->filename = pm_strdup(pm_basename(chosen->filename));
+    pkg->version  = version;
+    digest_clear(&pkg->digest);
+    if (digest_is_set(&chosen->digest))
+        digest_set(&pkg->digest, chosen->digest.algo, chosen->digest.enc,
+                   chosen->digest.value);
+
+    if (fetch_dep_specs(chosen, pkg) != 0)
+        fprintf(stderr,
+                "packmule: warning: could not read dependency metadata for "
+                "%s==%s.\n"
+                "          Its dependencies were NOT followed and may be "
+                "missing from the bundle.\n"
+                "          Add them to your manifest explicitly if the "
+                "offline install fails.\n",
+                pkg->name, pkg->version);
+
+    ret = 0;
+
+done:
+    simple_index_free(files);
+    return ret;
+}
+
 static int pypi_resolve(const Registry *self, Package *pkg)
 {
+    if (pypi_use_simple(self))
+        return pypi_resolve_simple(self, pkg);
+
     const char *arch = self->ctx ? (const char *)self->ctx : NULL;
     const char *target_os = self->target_os;
     const int   py_minor = self->py_minor;
