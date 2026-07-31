@@ -82,18 +82,24 @@ char *pm_strtrim(char *s)
     return s;
 }
 
+/*
+ * clang-analyzer's valist.Uninitialized reports the vsnprintf() calls below as
+ * receiving an uninitialized va_list.  They do not: each is preceded directly
+ * by va_start(ap, fmt) and followed by va_end(ap), which is the textbook form.
+ * The report is a false positive, and it is scoped to this function only.
+ *
+ * It cannot be reproduced on macOS at any clang-tidy version: the platform's
+ * <stdio.h> macro-replaces vsnprintf with __builtin___vsnprintf_chk, and the
+ * checker matches on the name vsnprintf, so it never engages.  Only the Linux
+ * CI job sees it — which is also why it must be silenced here rather than
+ * left for a contributor to rediscover.
+ */
+/* NOLINTBEGIN(clang-analyzer-valist.Uninitialized) */
 char *pm_asprintf(const char *fmt, ...)
 {
     va_list ap;
 
-    /*
-     * Measure, then format, using a fresh va_start for each pass rather than
-     * va_copy.  Both are correct C, but clang-analyzer's valist.Uninitialized
-     * check reports a copied list as uninitialized (a false positive fixed
-     * after clang 18, and CI runs 18).  Restarting avoids the diagnostic on
-     * every analyser version instead of suppressing a check that is worth
-     * keeping everywhere else.
-     */
+    /* Measure with one pass over the arguments, then format with a second. */
     va_start(ap, fmt);
     int len = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
@@ -112,6 +118,7 @@ char *pm_asprintf(const char *fmt, ...)
 
     return out;
 }
+/* NOLINTEND(clang-analyzer-valist.Uninitialized) */
 
 void pm_human_size(double bytes, char *buf, size_t bufsz)
 {
