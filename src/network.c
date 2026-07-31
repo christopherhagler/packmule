@@ -493,6 +493,35 @@ static int finish_transfer(Transfer *t, CURLcode res)
     return -1;                          /* done, failed */
 }
 
+/*
+ * multi_wait — block until a transfer needs attention, or until timeout_ms.
+ *
+ * curl_multi_poll() is the call we want: unlike curl_multi_wait() it also
+ * waits when there is no file descriptor to wait on yet — during name
+ * resolution, or while a retry backs off.  It arrived in libcurl 7.66.0 and
+ * RHEL/EPEL 8 ships 7.61, so fall back there and do the waiting by hand.
+ *
+ * The manual sleep is the whole point of the fallback: curl_multi_wait()
+ * returns immediately with numfds == 0 in exactly those cases, so without it
+ * the loop below spins on the CPU instead of waiting.
+ */
+static CURLMcode multi_wait(CURLM *multi, int timeout_ms)
+{
+#if LIBCURL_VERSION_NUM >= 0x074200   /* 7.66.0 */
+    return curl_multi_poll(multi, NULL, 0, timeout_ms, NULL);
+#else
+    int       numfds = 0;
+    CURLMcode mc     = curl_multi_wait(multi, NULL, 0, timeout_ms, &numfds);
+
+    if (mc == CURLM_OK && numfds == 0) {
+        struct timespec ts = { .tv_sec  =  timeout_ms / 1000,
+                               .tv_nsec = (timeout_ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return mc;
+#endif
+}
+
 int download_many(DownloadJob *jobs, size_t n, int concurrency,
                   void (*on_done)(const DownloadJob *job, size_t completed,
                                   size_t total))
@@ -529,7 +558,7 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
     do {
         CURLMcode mc = curl_multi_perform(multi, &running);
         if (mc == CURLM_OK && running)
-            mc = curl_multi_poll(multi, NULL, 0, 200, NULL);
+            mc = multi_wait(multi, 200);
         if (mc != CURLM_OK) {
             fprintf(stderr, "packmule: curl_multi error: %s\n",
                     curl_multi_strerror(mc));

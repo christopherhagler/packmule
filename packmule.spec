@@ -57,5 +57,5 @@ Supported registries:
 - pypi: PEP 440 range constraints, extras, sdist build tooling, offline pip check
 - Opt-in end-to-end test suite (PACKMULE_E2E_TESTS)
 
-* Wed Jun 18 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.1.0-1
+* Thu Jun 18 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.1.0-1
 - Initial package

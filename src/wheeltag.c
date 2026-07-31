@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp: POSIX, and not pulled in by string.h */
 
 /* ── Filename classification ─────────────────────────────────────────────── */
 
