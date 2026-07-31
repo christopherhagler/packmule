@@ -5,15 +5,75 @@
 
 An air-gapped package bundler written in C.
 
-packmule reads a package manifest, queries the appropriate registry to resolve
-each entry to a concrete version and download URL, downloads every required
-file, verifies each one against its published digest, and optionally compresses
-everything into a single `.tar.gz` with a manifest and install script ready for
-transport to a network-isolated machine.
+packmule turns a package manifest into a **sealed, verifiable transfer
+artifact**: one `.tar.gz` holding every file needed to install with no network,
+a hash manifest, an SBOM, and an install script — proven to install offline
+before it ever leaves the build host.
 
-Supported registries: **PyPI**, **npm**, **RPM** — with SHA-256/SHA-512
-integrity verification. PyPI and npm follow transitive dependencies
-automatically; RPM requires an explicit manifest.
+Supported registries: **PyPI**, **npm**, **RPM**. All three resolve transitive
+dependencies. Every file is checked against its registry-published
+SHA-256/SHA-512 at download time, the whole bundle against `SHA256SUMS` on
+arrival, and the closure itself is test-installed offline at build time.
+
+---
+
+## Why not `pip download`, `dnf download`, or an npm cache?
+
+If you just need a directory of wheels on your own laptop, use `pip download`.
+It is the reference implementation, it tracks PEP changes for free, and it is
+one line:
+
+```bash
+pip download -r requirements.txt --platform manylinux_2_17_x86_64 \
+  --python-version 3.12 --only-binary=:all: -d ./wheels
+```
+
+packmule is for the case where the download is not the deliverable — where the
+files have to cross a boundary and someone has to account for what crossed it.
+Four things it gives you that the per-ecosystem tools do not:
+
+**One artifact, one procedure, three ecosystems.** `pip download`,
+`dnf download --resolve`, and npm's assorted offline workarounds produce three
+different shapes of output with three different install incantations. packmule
+produces the same bundle layout, the same `manifest.json`, the same
+`install.sh` contract and the same `packmule verify` for all of them. That is
+worth little to one developer and quite a lot to an organisation with a written
+transfer procedure and a review step.
+
+**An inventory that survives the trip.** `manifest.json` records name,
+version, filename, upstream digest and computed SHA-256 for every package;
+`SHA256SUMS` covers every file; `--sbom` emits CycloneDX 1.5 and/or SPDX 2.3
+with a real dependency graph and per-package licences. The native tools hand
+you a directory and no provenance record. When the question is "what exactly
+is in this transfer, and did it arrive intact," a directory is not an answer.
+
+**Proof that it installs offline, before it ships.** This is the one that
+earns the tool. After bundling, packmule installs the bundle *for real* with
+the network taken away — pip with `--dry-run --no-index` against only the
+bundled files, npm by running the generated `install.sh` in a scratch project
+against an unroutable registry with an **empty** cache. The empty cache is the
+whole point: a warm npm cache on the build host will happily "verify" a bundle
+that is missing tarballs, and you find out three weeks later behind the wire,
+where it cannot be fixed. A failed check is a build failure, not a warning.
+
+**Private registries without a config file.** Credentials come from the
+environment only (never written to disk, never read from `.npmrc`/`.netrc`),
+are scoped to the index host so a token cannot leak to a CDN on redirect, and
+cover custom auth headers, private CAs and mTLS — with one mechanism shared by
+all three backends. See [Private registries](#private-registries).
+
+### What you give up
+
+packmule reimplements PEP 440, PEP 503, PEP 508 markers and wheel-tag matching
+in C rather than shelling out to pip, and its resolver intersects constraints
+and takes the highest satisfying version — it does **not** backtrack. A
+requirement set that needs backtracking will resolve differently from pip, or
+fail outright. That is a deliberate trade for a dependency-free static binary,
+and it is exactly why the post-bundle check runs the real package manager
+against the finished bundle and treats failure as fatal: pip and npm are the
+oracle, packmule is the transport.
+
+If you are not crossing an air gap, you do not need this. Use the native tool.
 
 ---
 
