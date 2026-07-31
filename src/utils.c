@@ -86,22 +86,30 @@ char *pm_asprintf(const char *fmt, ...)
 {
     va_list ap;
 
+    /*
+     * Measure, then format, using a fresh va_start for each pass rather than
+     * va_copy.  Both are correct C, but clang-analyzer's valist.Uninitialized
+     * check reports a copied list as uninitialized (a false positive fixed
+     * after clang 18, and CI runs 18).  Restarting avoids the diagnostic on
+     * every analyser version instead of suppressing a check that is worth
+     * keeping everywhere else.
+     */
     va_start(ap, fmt);
-    va_list ap2;
-    va_copy(ap2, ap);
     int len = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
 
     if (len < 0) {
-        va_end(ap2);
         const char msg[] = "packmule: fatal: string formatting error\n";
         fwrite(msg, 1, sizeof(msg) - 1, stderr);
         abort();
     }
 
     char *out = pm_malloc((size_t)len + 1);
-    vsnprintf(out, (size_t)len + 1, fmt, ap2);
-    va_end(ap2);
+
+    va_start(ap, fmt);
+    vsnprintf(out, (size_t)len + 1, fmt, ap);
+    va_end(ap);
+
     return out;
 }
 

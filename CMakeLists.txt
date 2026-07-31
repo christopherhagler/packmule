@@ -70,9 +70,13 @@ endif()
 # a supported target through 2029 — see the pre-7.66 curl_multi_wait fallback in
 # src/network.c.  The oldest API this code actually calls is from 7.32, so 7.61
 # is a "what we test" floor rather than a hard technical one.
-find_package(CURL 7.61      REQUIRED)   # → CURL::libcurl
-find_package(OpenSSL 1.1    REQUIRED)   # → OpenSSL::Crypto
-find_package(LibArchive 3.4 REQUIRED)   # → LibArchive::LibArchive
+#
+# The libarchive floor is 3.3.3 for the same reason: it is what EL8 ships, and
+# it is also exactly the release that added archive_read_support_filter_zstd(),
+# the newest libarchive entry point this code calls.
+find_package(CURL 7.61        REQUIRED)   # → CURL::libcurl
+find_package(OpenSSL 1.1      REQUIRED)   # → OpenSSL::Crypto
+find_package(LibArchive 3.3.3 REQUIRED)   # → LibArchive::LibArchive
 
 # cJSON: require the system-installed package.
 # Install with: dnf install cjson-devel  /  apt-get install libcjson-dev  /  brew install cjson

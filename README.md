@@ -60,15 +60,15 @@ are removed and reported on standard error.
 |---|---|---|
 | libcurl | ≥ 7.61 | Registry API queries and file downloads |
 | OpenSSL | ≥ 1.1 | SHA-256 and SHA-512 file verification |
-| libarchive | ≥ 3.4 | RPM repository metadata decompression; bundle `.tar.gz` creation |
+| libarchive | ≥ 3.3.3 | RPM repository metadata decompression; bundle `.tar.gz` creation |
 | cJSON | ≥ 1.7 | JSON registry response parsing |
 | CMake | ≥ 3.15 | Build system |
 | C compiler | C11 | GCC ≥ 7, Clang ≥ 6, Apple Clang |
 
 These floors are enforced by CMake, so a too-old dependency fails at configure
-time rather than at link time. The libcurl floor is set by RHEL/CentOS 8, which
-ships 7.61 and is a supported build target; newer libcurl is used where it helps
-but nothing requires it.
+time rather than at link time. The libcurl and libarchive floors are both set by
+RHEL/CentOS 8 — a supported build target, which ships 7.61 and 3.3.3. Newer
+versions are used where they help, but nothing requires them.
 
 cJSON must be installed as a system package; the build does **not** fetch it
 from the internet.
