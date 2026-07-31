@@ -46,11 +46,11 @@ jobs:
             experimental: false
           - root: centos-stream+epel-9-x86_64
             experimental: false
-          # CentOS Stream 8 is EOL, so build EPEL 8 against Rocky Linux 8.  Kept
-          # non-blocking: RHEL 8's older toolchain is the most likely to need a
-          # spec conditional, and we don't want that to gate the workflow.
+          # CentOS Stream 8 is EOL, so build EPEL 8 against Rocky Linux 8.
+          # Blocking: EL8 is a supported target (it sets the libcurl 7.61 floor),
+          # and a permanently-red advisory job just teaches people to ignore it.
           - root: rocky+epel-8-x86_64
-            experimental: true
+            experimental: false
 
     steps:
       - name: Install packaging tooling

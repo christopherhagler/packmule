@@ -61,12 +61,25 @@ if(APPLE)
     endif()
 endif()
 
-find_package(CURL       REQUIRED)   # → CURL::libcurl
-find_package(OpenSSL    REQUIRED)   # → OpenSSL::Crypto
-find_package(LibArchive REQUIRED)   # → LibArchive::LibArchive
+# Minimum versions are declared here, not just in the README, so that a too-old
+# dependency fails at configure time with a readable message.  Left unversioned,
+# an old libcurl gets all the way to `undefined reference to curl_multi_poll` at
+# link time, which is a much worse way to learn the same thing.
+#
+# The libcurl floor is 7.61 because that is what RHEL/CentOS 8 ships, and EL8 is
+# a supported target through 2029 — see the pre-7.66 curl_multi_wait fallback in
+# src/network.c.  The oldest API this code actually calls is from 7.32, so 7.61
+# is a "what we test" floor rather than a hard technical one.
+find_package(CURL 7.61      REQUIRED)   # → CURL::libcurl
+find_package(OpenSSL 1.1    REQUIRED)   # → OpenSSL::Crypto
+find_package(LibArchive 3.4 REQUIRED)   # → LibArchive::LibArchive
 
 # cJSON: require the system-installed package.
 # Install with: dnf install cjson-devel  /  apt-get install libcjson-dev  /  brew install cjson
+#
+# Deliberately unversioned: not every distribution ships a cJSONConfigVersion
+# file, and CMake treats a version request against a config package that has no
+# version file as "not found" — which would break builds that are actually fine.
 find_package(cJSON REQUIRED)
 
 # Normalize the cJSON target across package providers:

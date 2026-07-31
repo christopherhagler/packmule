@@ -10,7 +10,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 BuildRequires:  gcc
 BuildRequires:  cmake
 BuildRequires:  make
-BuildRequires:  libcurl-devel
+BuildRequires:  libcurl-devel >= 7.61
 BuildRequires:  openssl-devel
 BuildRequires:  libarchive-devel
 BuildRequires:  cjson-devel
