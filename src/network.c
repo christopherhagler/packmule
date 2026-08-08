@@ -760,6 +760,51 @@ static void transfer_reset_url(Transfer *t, const char *url)
     t->hop     = 0;
 }
 
+/* Bookkeeping shared by the priming loop and the re-arm path. */
+typedef struct {
+    DownloadJob *jobs;
+    size_t       n;
+    size_t       next;       /* index of the first job not yet handed out */
+    size_t       completed;
+    int          failures;
+    void       (*on_done)(const DownloadJob *job, size_t completed,
+                          size_t total);
+} Queue;
+
+/*
+ * arm_slot — give `t` the next job that can actually be started.
+ *
+ * start_transfer fails before any network activity when the destination
+ * cannot be opened (a full disk, a read-only mount, too many open files).
+ * That is a property of this job's destination, not of the queue, so the
+ * failure is recorded and the slot moves on to the next job.  Retiring the
+ * slot instead — as this once did — could idle every slot while jobs
+ * remained, leaving the event loop with nothing in flight and nothing able
+ * to advance it.
+ *
+ * On return the slot is either armed, or t->job is NULL because the queue is
+ * empty.  Those are the only two states, which is what lets the loop below
+ * treat "no transfers running" as "the queue is drained".
+ */
+static void arm_slot(CURLM *multi, Transfer *t, Queue *q)
+{
+    while (q->next < q->n) {
+        t->job     = &q->jobs[q->next++];
+        t->attempt = 0;
+        transfer_reset_url(t, t->job->url);
+
+        if (start_transfer(multi, t) == 0)
+            return;
+
+        t->job->rc = -1;
+        q->failures++;
+        q->completed++;
+        if (q->on_done)
+            q->on_done(t->job, q->completed, q->n);
+    }
+    t->job = NULL;
+}
+
 /*
  * finish_transfer — close the file and decide what happens next.
  *
@@ -854,20 +899,11 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
     }
 
     Transfer *slots = pm_calloc((size_t)concurrency, sizeof(Transfer));
-    size_t next = 0, completed = 0;
-    int    failures = 0;
+    Queue     q     = { jobs, n, 0, 0, 0, on_done };
 
     /* Prime the pipeline. */
-    for (int i = 0; i < concurrency && next < n; i++) {
-        slots[i].job     = &jobs[next++];
-        slots[i].attempt = 0;
-        if (start_transfer(multi, &slots[i]) != 0) {
-            slots[i].job->rc = -1;
-            failures++;
-            completed++;
-            slots[i].job = NULL;
-        }
-    }
+    for (int i = 0; i < concurrency; i++)
+        arm_slot(multi, &slots[i], &q);
 
     int running = 0;
     do {
@@ -877,6 +913,24 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
         if (mc != CURLM_OK) {
             fprintf(stderr, "packmule: curl_multi error: %s\n",
                     curl_multi_strerror(mc));
+            break;
+        }
+
+        /*
+         * Nothing in flight while jobs remain would mean no message can
+         * arrive and nothing can re-arm a slot: the loop condition below
+         * would then spin on the CPU forever.  arm_slot() makes this
+         * unreachable, but a busy loop is far too bad a failure mode to
+         * leave one refactor away, so fail the remaining jobs and stop.
+         */
+        if (running == 0 && q.next < n) {
+            fprintf(stderr,
+                    "packmule: internal error: %zu download(s) left "
+                    "unattempted\n", n - q.next);
+            while (q.next < n) {
+                jobs[q.next++].rc = -1;
+                q.failures++;
+            }
             break;
         }
 
@@ -914,29 +968,15 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
 
             t->job->rc = (verdict == 0) ? 0 : -1;
             if (verdict != 0)
-                failures++;
-            completed++;
+                q.failures++;
+            q.completed++;
             if (on_done)
-                on_done(t->job, completed, n);
+                on_done(t->job, q.completed, n);
 
             /* Feed the slot its next job. */
-            if (next < n) {
-                t->job     = &jobs[next++];
-                t->attempt = 0;
-                transfer_reset_url(t, t->job->url);
-                if (start_transfer(multi, t) != 0) {
-                    t->job->rc = -1;
-                    failures++;
-                    completed++;
-                    if (on_done)
-                        on_done(t->job, completed, n);
-                    t->job = NULL;
-                }
-            } else {
-                t->job = NULL;
-            }
+            arm_slot(multi, t, &q);
         }
-    } while (running > 0 || next < n);
+    } while (running > 0 || q.next < n);
 
     for (int i = 0; i < concurrency; i++) {
         if (slots[i].easy)
@@ -947,5 +987,5 @@ int download_many(DownloadJob *jobs, size_t n, int concurrency,
     pm_free(slots);
     curl_multi_cleanup(multi);
 
-    return failures == 0 ? 0 : -1;
+    return q.failures == 0 ? 0 : -1;
 }

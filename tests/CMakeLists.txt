@@ -78,6 +78,19 @@ add_executable(test_sbom test_sbom.c)
 target_link_libraries(test_sbom PRIVATE packmule_core)
 add_test(NAME test_sbom COMMAND test_sbom)
 
+# A scheduler that cannot make progress used to spin instead of returning, so
+# the timeout is part of the assertion rather than a convenience.
+add_executable(test_network test_network.c)
+target_link_libraries(test_network PRIVATE packmule_core)
+add_test(NAME test_network COMMAND test_network)
+set_tests_properties(test_network PROPERTIES TIMEOUT 60)
+
+# Runs the real pip, in a temp directory under the build tree.
+add_executable(test_verify test_verify.c)
+target_link_libraries(test_verify PRIVATE packmule_core)
+add_test(NAME test_verify COMMAND test_verify)
+set_tests_properties(test_verify PROPERTIES TIMEOUT 120)
+
 # ── End-to-end tests (network-dependent, opt-in) ─────────────────────────────
 #
 # Full pipeline against the real registries: resolve → download → bundle →

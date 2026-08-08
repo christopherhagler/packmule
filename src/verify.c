@@ -188,9 +188,24 @@ BundleCheckResult bundle_check_pypi(const char *output_dir, const char *arch,
     BundleCheckResult result = BUNDLE_CHECK_FAILED;
     pid_t pid = fork();
     if (pid == 0) {
+        /*
+         * --ignore-installed is what makes this a check of the bundle rather
+         * than of this machine.  pip satisfies a requirement from an already
+         * installed distribution before it ever consults --find-links, so
+         * without it every package that happens to be installed here is
+         * reported "already satisfied" and never looked for in the bundle —
+         * and building from inside the project's own virtualenv, which is the
+         * obvious thing to do, makes the check pass on an empty directory.
+         * The target machine has none of those packages, which is precisely
+         * the situation this is supposed to be reproducing.
+         *
+         * It does not affect the build environment: --no-build-isolation
+         * still lets an sdist's metadata be prepared with the setuptools
+         * installed here.
+         */
         execlp("python3", "python3", "-m", "pip", "install", "--dry-run",
-               "--no-index", "--quiet", links, "--no-build-isolation",
-               "-r", req, (char *)NULL);
+               "--no-index", "--quiet", "--ignore-installed", links,
+               "--no-build-isolation", "-r", req, (char *)NULL);
         _exit(127);
     } else if (pid > 0) {
         int st;

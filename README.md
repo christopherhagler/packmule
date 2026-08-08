@@ -49,9 +49,14 @@ is in this transfer, and did it arrive intact," a directory is not an answer.
 
 **Proof that it installs offline, before it ships.** This is the one that
 earns the tool. After bundling, packmule installs the bundle *for real* with
-the network taken away — pip with `--dry-run --no-index` against only the
-bundled files, npm by running the generated `install.sh` in a scratch project
-against an unroutable registry with an **empty** cache. The empty cache is the
+the network taken away — pip with `--dry-run --no-index --ignore-installed`
+against only the bundled files, npm by running the generated `install.sh` in a
+scratch project against an unroutable registry with an **empty** cache. Both
+halves of that are load-bearing. `--ignore-installed` is pip's equivalent of
+the empty cache: without it pip satisfies a requirement from an already
+installed distribution before it ever looks at the bundle, so building from
+inside the project's own virtualenv — the obvious thing to do — makes the
+check pass on a directory with no wheels in it at all. The empty cache is the
 whole point: a warm npm cache on the build host will happily "verify" a bundle
 that is missing tarballs, and you find out three weeks later behind the wire,
 where it cannot be fixed. A failed check is a build failure, not a warning.
@@ -323,9 +328,10 @@ is always left intact alongside the archive.
 After a bundle is created, packmule verifies it end-to-end so a bundle that
 cannot install offline fails **here**, not on the air-gapped machine:
 
-- **pypi** — `pip install --dry-run --no-index` against only the bundled
-  files (when this machine matches the bundle's target os/arch/python and
-  pip is ≥ 22.2).
+- **pypi** — `pip install --dry-run --no-index --ignore-installed` against
+  only the bundled files (when this machine matches the bundle's target
+  os/arch/python and pip is ≥ 22.2). `--ignore-installed` is what keeps this
+  a check of the bundle rather than of the build machine's site-packages.
 - **npm** — runs the generated `install.sh` in a scratch project with the
   registry pointed at an unroutable address and an empty npm cache, with
   scripts disabled.
