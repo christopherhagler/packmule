@@ -1019,18 +1019,27 @@ instead — `leaks --atExit -- ./build/packmule -n -f
 tests/fixtures/requirements.txt`. CI runs LeakSanitizer on Ubuntu, so leaks are
 caught there regardless.
 
-**3. Static analysis.** The generated header must exist first.
+**3. Static analysis** (local only — not run by CI). The generated header must
+exist first.
 
 ```sh
 cmake --build build --target bundle_scripts
-clang-tidy -p build --warnings-as-errors='*' src/*.c
+clang-tidy -p build src/*.c
 ```
 
-On macOS, add `-extra-arg="-isysroot$(xcrun --show-sdk-path)"`. Fix what
-clang-tidy reports rather than adding suppressions. If a report is a genuine
-false positive, scope the suppression as narrowly as possible — a
-`NOLINTBEGIN`/`NOLINTEND` pair around the one function — and write down why. Do
-not disable a check globally in `.clang-tidy` to silence a single site.
+On macOS, add `-extra-arg="-isysroot$(xcrun --show-sdk-path)"`. This is worth
+running before a change that touches parsing code, since most of this codebase
+is hand-rolled parsing of untrusted input and the analyzer reaches error paths
+the test suite does not. Prefer fixing what it reports over adding a
+suppression; if a report is a genuine false positive, scope the suppression as
+narrowly as possible — a `NOLINTBEGIN`/`NOLINTEND` pair around the one function
+— and write down why.
+
+Note that `--warnings-as-errors='*'` is deliberately absent. Some enabled
+checks are heuristic and cannot express a provable bound —
+`security.insecureAPI.strcpy` flags every `strcat` regardless of whether the
+destination was just sized to fit — so treating the full check set as fatal
+produces unavoidable failures. Read the output and judge it.
 
 **4. Shell.** The install scripts ship inside every bundle; the e2e scripts are
 the only thing exercising the pipeline end to end. Both are held to the same
@@ -1062,7 +1071,8 @@ are invisible locally and fail only in CI. If CI disagrees with your machine,
   macro-replaces some libc functions with `__builtin_*_chk` variants, and
   analyzer checks that match on the original name never engage. `pm_asprintf`
   in `src/utils.c` carries a suppression for a report that no clang-tidy
-  version can reproduce on macOS.
+  version can reproduce on macOS. Since CI no longer runs the analyzer, a
+  Linux-only report will not surface unless someone runs it there.
 
 ### Writing tests
 

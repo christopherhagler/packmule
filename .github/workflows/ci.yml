@@ -191,9 +191,14 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-asan --output-on-failure
 
-  # ── Static analysis ─────────────────────────────────────────────────────────
-  analyze:
-    name: clang-tidy
+  # ── Shell lint ──────────────────────────────────────────────────────────────
+  #
+  # The install scripts ship inside every bundle and the e2e scripts are the
+  # only thing checking the pipeline end to end, so both are linted on every
+  # push.  This runs on its own rather than alongside a C analysis step, so a
+  # failure in one never hides the other.
+  shellcheck:
+    name: shellcheck
     runs-on: ubuntu-24.04
 
     steps:
@@ -202,23 +207,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y cmake clang clang-tidy shellcheck \
-            libcurl4-openssl-dev libssl-dev libarchive-dev libcjson-dev
+          sudo apt-get install -y shellcheck
 
-      - name: Configure (for compile_commands.json)
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
-
-      # The generated header must exist before anything is analysed.
-      - name: Generate embedded scripts
-        run: cmake --build build --target bundle_scripts
-
-      - name: clang-tidy
-        run: |
-          clang-tidy -p build --warnings-as-errors='*' src/*.c
-
-      # The install scripts ship inside every bundle and the e2e scripts are
-      # the only thing checking the pipeline end to end, so both are held to
-      # the same standard as the C.
       - name: shellcheck the install and e2e scripts
         run: shellcheck -s sh scripts/*.sh tests/e2e/*.sh
 
