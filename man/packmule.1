@@ -91,15 +91,27 @@ This option is \fBrequired\fP.
 The expected format depends on the registry backend selected with
 .BR \-t :
 a
-.I requirements.txt
-for the
+.IR requirements.txt ,
+a lockfile
+.RI ( uv.lock
+or a PEP 751
+.IR pylock.toml ),
+or a
+.I pyproject.toml
+with one of those beside it, for the
 .B pypi
-backend, a
+backend; a
 .I package.json
+or
+.I package-lock.json
 for
-.BR npm ,
+.BR npm ;
 and a plain package-per-line text file for
 .BR rpm .
+.IP
+Given a lockfile, packmule ships exactly what the lock records and resolves
+nothing: the versions, URLs and hashes are already decided, and only the
+artifacts installable on the selected target are bundled.
 .TP
 .BI \-o " output_dir"
 Directory in which to write the downloaded package files.
@@ -113,7 +125,10 @@ is given.
 .BR \-t " type" ", " \-\-type " type"
 Select the registry backend.
 When omitted, the backend is auto-detected from the manifest filename
-.RB ( requirements*.txt
+.RB ( requirements*.txt ,
+.BR uv.lock ,
+.BR pylock.toml ,
+.B pyproject.toml
 \(rA
 .BR pypi ,
 .B package.json
@@ -274,6 +289,24 @@ carries the same SHA\-256 digests in
 format, covering the package files and the generated metadata;
 .I install.sh
 verifies it before installing anything.
+.PP
+A bundle built from a lockfile also carries that lock
+.RI ( uv.lock ,
+.IR pylock.toml ,
+or
+.IR package-lock.json ).
+For
+.B npm
+it is what
+.B npm ci
+replays; for
+.B pypi
+it travels purely as provenance, covered by
+.I SHA256SUMS
+like everything else, since
+.I install.sh
+installs from the generated
+.IR requirements.txt .
 .PP
 The install script is pre-configured for the active registry backend:
 .B pip install \-\-no\-index \-\-find\-links
@@ -540,6 +573,16 @@ Download all transitive dependencies for a Linux x86_64 target:
 .RS 4
 .EX
 packmule \-f requirements.txt \-o ./vendor \-a x86_64
+.EE
+.RE
+.PP
+Bundle the exact tree a lockfile records, for a Linux x86_64 / Python 3.12
+target.
+Packages whose markers exclude that target are pruned rather than shipped:
+.PP
+.RS 4
+.EX
+packmule \-f uv.lock \-o ./vendor \-a x86_64 \-s linux \-p 3.12 \-\-bundle
 .EE
 .RE
 .PP

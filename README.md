@@ -78,6 +78,11 @@ and it is exactly why the post-bundle check runs the real package manager
 against the finished bundle and treats failure as fatal: pip and npm are the
 oracle, packmule is the transport.
 
+The way out of that trade is to not resolve at all. Point packmule at a
+lockfile — `uv.lock` or `pylock.toml` for Python, `package-lock.json` for
+Node — and it ships exactly what a real resolver already decided, hashes and
+all. If your project has a lock, use it; this caveat then does not apply.
+
 If you are not crossing an air gap, you do not need this. Use the native tool.
 
 ---
@@ -187,9 +192,9 @@ packmule -h | --help
 
 | Flag | Description |
 |---|---|
-| `-f <file>`, `--manifest` | Path to the package manifest (**required**) |
+| `-f <file>`, `--manifest` | Path to the package manifest (**required**). For `pypi` this may be a `requirements.txt`, a lockfile (`uv.lock`, `pylock.toml`), or a `pyproject.toml` with one beside it |
 | `-o <dir>` | Output directory (default: `.`); created if absent |
-| `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` → `pypi`, `package.json` / `package-lock.json` / `npm-shrinkwrap.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
+| `-t <type>`, `--type` | Registry backend: `pypi`, `npm`, `rpm`. Auto-detected from the manifest filename when omitted (`requirements*.txt` / `uv.lock` / `pylock.toml` / `pyproject.toml` → `pypi`, `package.json` / `package-lock.json` / `npm-shrinkwrap.json` → `npm`, `packages.txt` → `rpm`); falls back to `pypi` for unrecognised names |
 | `-a <arch>`, `--arch` | Target CPU architecture (default: current machine). Use `any` for universal/source only |
 | `-s <os>`, `--os` | *(pypi only)* Target OS for wheel selection: `linux`, `macos`, `windows`, or `any` (default: the host OS) |
 | `-p <ver>`, `--python` | *(pypi only)* Target CPython version for wheel selection and environment markers, e.g. `3.12` (default: the local `python3`) |
@@ -290,6 +295,7 @@ packmule: bundle ready: ./vendor.tar.gz
 | `install.sh` | Pre-configured install script for the active backend |
 | `requirements.txt` | *(pypi only)* pip-compatible requirements file used by `install.sh` |
 | `package-lock.json` | *(npm lockfile bundles only)* the tree `npm ci` replays |
+| `uv.lock` / `pylock.toml` | *(pypi lockfile bundles only)* the lock the bundle was built from, as provenance — `install.sh` does not need it |
 
 On the air-gapped machine:
 
@@ -587,7 +593,65 @@ rather than starting over.
 
 ### pypi — Python Package Index
 
-Reads a `requirements.txt` file. Supported syntax:
+**Lockfile mode (preferred).** When the manifest is a `uv.lock` or a PEP 751
+`pylock.toml` — or one sits next to the `pyproject.toml` you point at —
+packmule ships exactly what the lock records and resolves nothing:
+
+```sh
+packmule -f uv.lock       -o ./vendor -a x86_64 -s linux -p 3.12
+packmule -f pylock.toml   -o ./vendor
+packmule -f pyproject.toml -o ./vendor   # uses the lock beside it
+```
+
+A lock is the output of a real backtracking resolver, with the URL and hash of
+every artifact already decided. That removes the one caveat this backend
+otherwise carries (see [What you give up](#what-you-give-up)): there is no
+resolution left for packmule to do differently from pip, and no metadata to
+fetch, so a lock-mode bundle needs only the downloads themselves.
+
+The two formats differ in how they represent platforms, and packmule handles
+each on its own terms:
+
+- **`uv.lock`** locks for *every* platform at once and carries a dependency
+  graph whose edges hold PEP 508 markers. The bundle is what is reachable from
+  the workspace root once those markers are evaluated against your target, so a
+  Windows-only package is pruned from a Linux bundle rather than shipped
+  uselessly — or, worse, failing the build because it has no Linux wheel.
+  Extras are followed through the graph: a root edge of `uvicorn[standard]`
+  pulls in that extra's dependencies and nothing else. `dev-dependencies` are
+  excluded, as `--omit=dev` excludes them for npm.
+- **`pylock.toml`** is already flattened, so each package carries its own
+  marker and selection is a filter rather than a walk.
+
+Wheel selection is the same as everywhere else in this backend: among the
+artifacts the lock records for a package, the best one for your `--arch`,
+`--os` and `--python` wins. One lock therefore produces a correct bundle for
+any target it covers.
+
+The lock is copied into the bundle and covered by `SHA256SUMS`, as the record
+of what was resolved. Nothing at the destination needs `uv`: `install.sh`
+installs from the generated `requirements.txt` with `--no-index`, so plain
+`pip` is enough.
+
+These are all hard failures, never warnings, because each one produces a
+bundle that fails on the far side of the wire:
+
+| Condition | Why |
+|---|---|
+| A `git`, `directory`, `path` or `url` source | There is no artifact to carry across an air gap |
+| A package with no hash in the lock | packmule never keeps a file it cannot verify |
+| No artifact installable on the target, and no sdist | The bundle would be missing a package |
+| One name locked at two versions that both apply | pip can install only one; guessing would ship the wrong one silently |
+| A dependency the lock does not contain | The lock is inconsistent — regenerate it |
+
+`poetry.lock` is **not** read. It records filenames and hashes but no URLs, so
+resolving it needs a per-package index lookup — a different operation from
+reading a self-contained lock. If your project uses Poetry, export a
+`pylock.toml` (PEP 751 is the interchange format precisely so tools need not
+read each other's native locks) and point packmule at that.
+
+**Requirements files.** Without a lock, packmule reads a `requirements.txt`.
+Supported syntax:
 
 ```
 requests                   # unpinned — resolved to latest
@@ -752,6 +816,8 @@ The unit suites are fully offline — no network access required:
 | `test_wheeltag` | Wheel filename classification, platform/arch/python tag matching, manylinux glibc floors |
 | `test_registry_pypi` | requirements.txt parsing (includes, extras, constraints) and `get_deps`; wheel selection via `pypi_parse_response` |
 | `test_registry_npm` | npm manifest/lockfile parsing and `get_deps`: aliases, peers, range intersection, dedup |
+| `test_toml` | TOML reading: scalars, escapes, multi-line strings, arrays, inline tables, dotted keys, array-of-tables attachment, and the malformed inputs that must be refused |
+| `test_pylock` | uv.lock / pylock.toml: marker-aware reachability and extras, per-target wheel selection, resolution-marker disambiguation, and every lock that must fail the build |
 | `test_registry_rpm` | RPM manifest parsing: name-only, name-version, hyphenated names; EVR pins and selection |
 | `test_hash` | Digest typing, sha1/sha256/sha512 hex and SHA-512 SRI, unset-digest refusal |
 | `test_bundle` | Bundle creation for all three backends; skips packages missing from disk |
@@ -771,7 +837,7 @@ ctest --test-dir build -L e2e --output-on-failure
 
 | Test | What it proves |
 |---|---|
-| `e2e_pypi` | manifest → resolve → download → bundle → extract → **offline install into a fresh venv** (`--no-index`) → import check |
+| `e2e_pypi` | two full cycles — requirements (range constraint, transitive deps, both SBOM formats) and lockfile (a generated `uv.lock` reproduced exactly, its win32-only package pruned, the lock shipped and checksummed) — each → bundle → extract → **offline install into a fresh venv** (`--no-index`) → import check |
 | `e2e_npm` | two full cycles — flat (ranges, scoped package, devDeps excluded) and lockfile (a tree needing two `debug` versions) — bundle → extract → install with the registry pointed at an **unroutable address** → `require()` and nesting checks |
 | `e2e_rpm` | repomd.xml → primary.xml decompress → package match → sha256/version extraction against a live DNF repo (dry run) |
 
@@ -837,6 +903,13 @@ src/
   simple_index.c      PEP 503 index page parsing: anchors, digest fragments,
                       PEP 592 yanking, PEP 658 metadata attributes, and RFC
                       3986 URL resolution
+  pylock.c            uv.lock and PEP 751 pylock.toml readers — marker-aware
+                      reachability over uv's graph, artifact selection, and
+                      the refusals that keep a lock from becoming an
+                      incomplete bundle
+  toml.c              A small TOML reader, sized for lockfiles.  Hand-rolled
+                      for the same reason as the PEP parsers: no TOML library
+                      is packaged widely enough to become a hard dependency
   pypi_metadata.c     Requires-Dist extraction from a METADATA document or
                       from inside a wheel/sdist (libarchive)
   registry_npm.c      npm backend — package.json / package-lock.json parser,
@@ -959,16 +1032,17 @@ document ownership; the caller is responsible for freeing via `pm_free()`.
 - [x] PEP 503 simple-index support — works against Artifactory, Nexus, devpi,
       GitLab and any other private PyPI index
 - [x] SBOM output — CycloneDX 1.5 and SPDX 2.3 from the resolved package set
+- [x] PyPI lockfile mode — exact-tree bundling from `uv.lock` and PEP 751
+      `pylock.toml`, mirroring the npm lockfile mode.  `poetry.lock` is not
+      read directly; export a `pylock.toml` instead
 
 ### Next up
 
-- [ ] PyPI lockfile mode — exact-tree bundling from `uv.lock`, `poetry.lock`,
-      and PEP 751 `pylock.toml`, mirroring the npm lockfile mode
+- [ ] Debian/apt backend
 
 ### Planned
 
 - [ ] HTTP Range resume for interrupted downloads
-- [ ] Debian/apt backend
 
 ### Later
 
@@ -1105,6 +1179,13 @@ Changes that touch resolution or credentials should be read against them:
   narrows rather than overwrites. The fixpoint loop re-invokes `get_deps` for
   every dirty package, so anything with a side effect there runs more than
   once; see the one-shot warning set in `src/registry_rpm.c`.
+- **A lockfile entry is final.** Packages built from a lock (`uv.lock`,
+  `pylock.toml`, `package-lock.json`) must leave `parse_manifest` as
+  `PKG_RESOLVED` with `user_pinned` set and `dirty` clear, which is what makes
+  `needs_work()` in `src/resolve.c` skip them entirely. Anything that lets the
+  resolver revisit them defeats the point of using a lock: the version, URL and
+  digest were decided by a real backtracking resolver, and re-deciding any of
+  them silently reintroduces the divergence the lock exists to prevent.
 - **Name comparison is per-registry.** Each backend supplies `name_equal`;
   there is deliberately no default, because PyPI, npm and RPM disagree about
   what makes two names the same.
@@ -1178,7 +1259,10 @@ What packmule enforces — verified against the code, not aspirational:
   download to `file://` or `scp://`.
 - **Typed digest verification.** The algorithm comes from the metadata; there
   is no length-sniffing. **A file with no digest to check against is refused**
-  — an absent digest is a hard failure, never a silent pass.
+  — an absent digest is a hard failure, never a silent pass. In lockfile mode
+  the digest comes from the lock rather than from the index, so a registry that
+  is compromised *after* you locked cannot substitute a file without the hash
+  failing. A package with no hash in the lock is refused for the same reason.
 - **npm requires SHA-512 SRI.** `dist.integrity` must carry a `sha512-` value;
   packages offering only the legacy SHA-1 `dist.shasum` are rejected rather
   than accepted with a weaker hash.
@@ -1227,7 +1311,10 @@ Please read this before relying on it:
   verification, and no check of package *provenance*. Digests confirm you
   received what the index advertised — not that the index is honest. A
   compromised registry, or a successful account takeover of a package you
-  depend on, is not something packmule detects.
+  depend on, is not something packmule detects. A lockfile narrows this but
+  does not close it: it pins the hashes as of the moment you locked, so
+  tampering *after* that is caught, while anything already compromised when the
+  lock was written is faithfully reproduced.
 - **It does not verify RPM GPG signatures.** `install_rpm.sh` deliberately
   leaves dnf's `gpgcheck` setting alone so the target's own policy applies.
   **Leave `gpgcheck` enabled on the target.**

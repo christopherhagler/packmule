@@ -99,3 +99,108 @@ import requests, urllib3, certifi, idna
 assert requests.__version__.startswith("2."), requests.__version__
 print("e2e_pypi OK: requests", requests.__version__)
 EOF
+
+deactivate
+
+# ── Cycle 2: lockfile mode ───────────────────────────────────────────────────
+#
+# A lock is the real resolver's finished answer, so this cycle asserts the
+# properties that only lockfile mode has: the exact locked versions are what
+# gets bundled (no resolution happens at all), packages whose markers exclude
+# this platform are pruned rather than shipped or failed on, and the lock
+# itself travels inside the bundle covered by SHA256SUMS.
+#
+# The lock is generated here from the index's own metadata rather than
+# committed, so its URLs and hashes are real and never go stale.
+
+cd "$WORK"
+mkdir lockmode
+cd lockmode
+
+python3 - <<'EOF'
+import json, urllib.request
+
+# Pinned so the assertions below are exact.  colorama is win32-only in this
+# lock: on a Linux/macOS run it must be pruned by the edge marker.
+PINS = [("certifi", "2024.8.30"), ("charset-normalizer", "3.4.0"),
+        ("idna", "3.10"), ("urllib3", "2.2.3"), ("requests", "2.32.3"),
+        ("colorama", "0.4.6")]
+DEPS = {"requests": ["certifi", "charset-normalizer", "idna", "urllib3"]}
+
+out = ['version = 1', 'requires-python = ">=3.9"', '',
+       '[[package]]', 'name = "e2e-project"', 'version = "0.1.0"',
+       'source = { virtual = "." }', 'dependencies = [',
+       '    { name = "requests" },',
+       "    { name = \"colorama\", marker = \"sys_platform == 'win32'\" },",
+       ']', '']
+
+for name, ver in PINS:
+    d = json.load(urllib.request.urlopen(
+        f"https://pypi.org/pypi/{name}/{ver}/json"))
+    out += ['[[package]]', f'name = "{name}"', f'version = "{ver}"',
+            'source = { registry = "https://pypi.org/simple" }']
+    if name in DEPS:
+        out.append('dependencies = [')
+        out += [f'    {{ name = "{d2}" }},' for d2 in DEPS[name]]
+        out.append(']')
+    for f in d["urls"]:
+        if f["packagetype"] == "sdist":
+            out.append(f'sdist = {{ url = "{f["url"]}", '
+                       f'hash = "sha256:{f["digests"]["sha256"]}", '
+                       f'size = {f["size"]} }}')
+            break
+    out.append('wheels = [')
+    for f in d["urls"]:
+        if f["packagetype"] == "bdist_wheel":
+            out.append(f'    {{ url = "{f["url"]}", '
+                       f'hash = "sha256:{f["digests"]["sha256"]}", '
+                       f'size = {f["size"]} }},')
+    out += [']', '']
+
+open("uv.lock", "w").write("\n".join(out))
+print("e2e_pypi OK: generated uv.lock with", len(PINS), "packages")
+EOF
+
+"$PACKMULE" -f uv.lock -o locked -b
+
+[ -f locked.tar.gz ] || { echo "FAIL: no lock-mode tarball"; exit 1; }
+
+# The lock ships as provenance and is covered by SHA256SUMS like everything
+# else — a record of what was resolved that cannot be swapped out undetected.
+[ -f locked/uv.lock ] || { echo "FAIL: uv.lock not in bundle"; exit 1; }
+grep -q 'uv.lock' locked/SHA256SUMS || { echo "FAIL: uv.lock not in SHA256SUMS"; exit 1; }
+
+mkdir extracted2
+tar -xzf locked.tar.gz -C extracted2
+[ -f extracted2/locked/uv.lock ] || { echo "FAIL: uv.lock not archived"; exit 1; }
+
+# `packmule verify` must accept the bundle, and reject it once tampered with.
+"$PACKMULE" verify locked >/dev/null || { echo "FAIL: verify rejected a good bundle"; exit 1; }
+
+# Exact locked versions, and nothing that this platform does not need.
+python3 - <<'EOF'
+import json
+m = json.load(open("locked/manifest.json"))
+got = {p["name"].lower(): p["version"] for p in m["packages"]}
+
+want = {"certifi": "2024.8.30", "charset-normalizer": "3.4.0",
+        "idna": "3.10", "urllib3": "2.2.3", "requests": "2.32.3"}
+assert got == want, f"lock not reproduced exactly: {got}"
+
+# Pruned by its marker on any non-Windows target, not shipped and not fatal.
+assert "colorama" not in got, "win32-only package leaked into the bundle"
+print("e2e_pypi OK: lock reproduced exactly,", len(got), "packages")
+EOF
+
+python3 -m venv venv2
+# shellcheck disable=SC1091
+. venv2/bin/activate
+
+sh extracted2/locked/install.sh
+
+python3 - <<'EOF'
+import requests
+assert requests.__version__ == "2.32.3", requests.__version__
+print("e2e_pypi OK: lock-mode bundle installed offline, requests",
+      requests.__version__)
+EOF

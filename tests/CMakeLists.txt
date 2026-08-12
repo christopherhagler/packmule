@@ -74,6 +74,16 @@ add_executable(test_pypi_metadata test_pypi_metadata.c)
 target_link_libraries(test_pypi_metadata PRIVATE packmule_core)
 add_test(NAME test_pypi_metadata COMMAND test_pypi_metadata)
 
+add_executable(test_toml test_toml.c)
+target_link_libraries(test_toml PRIVATE packmule_core)
+add_test(NAME test_toml COMMAND test_toml)
+
+# Reads lockfile fixtures, and writes throwaway locks, from tests/.
+add_executable(test_pylock test_pylock.c)
+target_link_libraries(test_pylock PRIVATE packmule_core)
+add_test(NAME test_pylock COMMAND test_pylock
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 add_executable(test_sbom test_sbom.c)
 target_link_libraries(test_sbom PRIVATE packmule_core)
 add_test(NAME test_sbom COMMAND test_sbom)

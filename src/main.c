@@ -3,6 +3,7 @@
 #include "hash.h"
 #include "network.h"
 #include "package.h"
+#include "pylock.h"
 #include "registry.h"
 #include "registry_internal.h"
 #include "resolve.h"
@@ -156,6 +157,9 @@ static void usage(const char *prog)
             "\n"
             "Options:\n"
             "  -f, --manifest <file>      Path to the package manifest (required)\n"
+            "                             pypi: requirements.txt, or a lockfile\n"
+            "                             (uv.lock, pylock.toml, pyproject.toml\n"
+            "                             with one beside it) for the exact tree\n"
             "  -o <dir>                   Output directory for downloads (default: .)\n"
             "  -t, --type <type>          Registry backend (default: auto-detect\n"
             "                             from the manifest filename, else pypi)\n"
@@ -211,7 +215,7 @@ static void usage(const char *prog)
     fprintf(stderr,
             "\nExamples:\n"
             "  %s -f requirements.txt -o ./vendor\n"
-            "  %s -f requirements.txt -o ./vendor -a x86_64\n"
+            "  %s -f uv.lock          -o ./vendor -a x86_64 -p 3.12\n"
             "  %s -f requirements.txt -n\n"
             "  %s -f package.json     -o ./vendor -t npm\n"
             "  %s -f packages.txt     -o ./vendor -t rpm -a x86_64 \\\n"
@@ -801,6 +805,20 @@ int main(int argc, char *argv[])
                 bopts.aux_name = "package-lock.json";
             }
 
+            /*
+             * A pypi bundle built from uv.lock / pylock.toml carries the lock
+             * too, though for a different reason: install.sh installs from the
+             * generated requirements.txt, so nothing at the destination needs
+             * uv.  The lock travels as provenance — the record of what was
+             * resolved, checksummed by SHA256SUMS like everything else.
+             */
+            char *py_lock = NULL;
+            if (strcmp(reg->name, "pypi") == 0 &&
+                (py_lock = pylock_effective(manifest_file)) != NULL) {
+                bopts.aux_file = py_lock;
+                bopts.aux_name = pm_basename(py_lock);
+            }
+
             if (bundle_create(&bopts) != 0) {
                 exit_code = EXIT_FAILURE;
             } else if (!no_verify) {
@@ -832,6 +850,7 @@ int main(int argc, char *argv[])
                 }
             }
             pm_free(npm_lock);
+            pm_free(py_lock);
         }
     }
 

@@ -130,6 +130,8 @@ add_library(packmule_core OBJECT
     src/network.c
     src/auth.c
     src/simple_index.c
+    src/toml.c
+    src/pylock.c
     src/pypi_metadata.c
     src/sbom.c
     src/hash.c

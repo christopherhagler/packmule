@@ -4,6 +4,7 @@
 #include "package.h"
 #include "pep440.h"
 #include "pep508.h"
+#include "pylock.h"
 #include "pypi_metadata.h"
 #include "simple_index.h"
 #include "utils.h"
@@ -315,8 +316,38 @@ static int parse_requirements_file(const Registry *self, const char *path,
     return 0;
 }
 
+/*
+ * pypi_parse_manifest — build the download list for a Python project.
+ *
+ * A lockfile wins whenever there is one, exactly as it does for npm: uv and
+ * pip have already done a backtracking resolution and recorded the URL and
+ * hash of every artifact, so there is nothing left for this backend's
+ * non-backtracking resolver to get differently.  Otherwise the requirements
+ * file is parsed and resolved against the index.
+ */
 static PackageList *pypi_parse_manifest(const Registry *self, const char *path)
 {
+    char *lock = pylock_effective(path);
+    if (lock) {
+        if (strcmp(lock, path) != 0)
+            printf("packmule: using %s for the exact dependency tree\n", lock);
+        PackageList *list = pylock_parse(lock, (const char *)self->ctx,
+                                         self->target_os, self->py_minor);
+        pm_free(lock);
+        return list;
+    }
+
+    /* pyproject.toml is only ever a pointer to the lock beside it: packmule
+     * does not resolve PEP 621 dependencies itself, and pretending to would
+     * reintroduce exactly the non-backtracking resolution a lock avoids. */
+    if (strcmp(pm_basename(path), "pyproject.toml") == 0) {
+        fprintf(stderr,
+                "packmule: %s has no uv.lock or pylock.toml beside it.\n"
+                "          Generate a lock with your project's tool, or point "
+                "-f at a requirements.txt.\n", path);
+        return NULL;
+    }
+
     PackageList *list = package_list_create();
     if (parse_requirements_file(self, path, list, 0) != 0) {
         package_list_destroy(list);
@@ -1348,15 +1379,24 @@ static int pypi_get_deps(const Registry *self, const Package *pkg,
 /* ── Filename detection ──────────────────────────────────────────────────── */
 
 /*
- * pypi_detect — recognise pip requirements files.
+ * pypi_detect — recognise pip requirements files, Python lockfiles, and the
+ * project file a lockfile sits next to.
  *
- * Matches any ".txt" basename containing "requirement", so that the common
- * variants are all auto-detected:
- *   requirements.txt, requirements-dev.txt, dev-requirements.txt,
- *   requirements.in is intentionally excluded (".in" is pip-tools input).
+ * Requirements: any ".txt" basename containing "requirement", so the common
+ * variants are all auto-detected — requirements.txt, requirements-dev.txt,
+ * dev-requirements.txt.  requirements.in is intentionally excluded (".in" is
+ * pip-tools input, not a resolved list).
+ *
+ * pyproject.toml is claimed even though nothing here parses it: the lock beside
+ * it is what gets read, and failing with "no lockfile next to pyproject.toml"
+ * is far more useful than "unrecognised manifest".
  */
 static int pypi_detect(const char *basename)
 {
+    if (pylock_kind_for_name(basename) != PYLOCK_KIND_NONE ||
+        strcmp(basename, "pyproject.toml") == 0)
+        return 1;
+
     size_t len = strlen(basename);
     if (len < 4 || strcmp(basename + len - 4, ".txt") != 0)
         return 0;

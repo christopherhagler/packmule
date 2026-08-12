@@ -1,0 +1,6 @@
+# Fixture: exists so pylock_effective() can find the uv.lock beside it.
+[project]
+name = "demo-project"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.32", "uvicorn[standard]"]
