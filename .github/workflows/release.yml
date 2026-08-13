@@ -1,0 +1,227 @@
+name: Release artifacts
+
+# Builds the distributable packages for a tag and attaches them to the GitHub
+# release.  CI (ci.yml) and the packaging rebuild (rpm.yml) prove the code is
+# sound on every push; this workflow exists only to put the results somewhere a
+# user can actually download them.  Workflow artifacts are not that place: they
+# expire after 90 days and need a GitHub login.
+#
+# Runs on a v* tag, or on demand against an existing tag (`tag` input) so a
+# release whose assets need rebuilding can be repaired without a new version.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach assets to (e.g. v0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Version consistency ─────────────────────────────────────────────────────
+  #
+  # The version is recorded in three places that nothing keeps in sync:
+  # CMakeLists.txt, include/version.h (hand-maintained, not generated) and
+  # packmule.spec.  A bump that misses one ships a package whose contents
+  # disagree with its name, which is exactly the kind of thing an air-gapped
+  # user cannot debug.  Fail before anything is built or published.
+  verify:
+    name: version matches the tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - id: check
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+
+          cmake_v=$(sed -n 's/^project(packmule VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          header_v=$(sed -n 's/^#define PACKMULE_VERSION "\(.*\)"/\1/p' include/version.h)
+          spec_v=$(sed -n 's/^Version:[[:space:]]*\(.*\)/\1/p' packmule.spec)
+
+          echo "tag=$version  cmake=$cmake_v  version.h=$header_v  spec=$spec_v"
+
+          fail=0
+          for pair in "CMakeLists.txt:$cmake_v" "include/version.h:$header_v" \
+                      "packmule.spec:$spec_v"; do
+            if [ "${pair#*:}" != "$version" ]; then
+              echo "::error::${pair%%:*} says ${pair#*:}, tag says $version"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ]
+
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # ── RPMs, rebuilt in a clean chroot ─────────────────────────────────────────
+  #
+  # Same mock mechanism as rpm.yml: the package that ships is one that was
+  # rebuilt from its own SRPM in a pristine root, not one built against
+  # whatever happened to be on a CI runner.
+  rpm:
+    name: rpm / ${{ matrix.root }}
+    needs: verify
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+      options: --privileged
+
+    strategy:
+      fail-fast: false
+      matrix:
+        root:
+          - fedora-rawhide-x86_64
+          - epel-10-x86_64
+          - centos-stream+epel-9-x86_64
+          - rocky+epel-8-x86_64
+
+    steps:
+      - name: Install packaging tooling
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            git-core rpm-build rpmdevtools mock mock-core-configs
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Allow git to read the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Create unprivileged builder user
+        run: |
+          useradd -m builder
+          usermod -a -G mock builder
+
+      - name: Build SRPM
+        run: |
+          set -euxo pipefail
+          version="${{ needs.verify.outputs.version }}"
+
+          install -d -o builder -g builder \
+            /home/builder/rpmbuild/SOURCES /home/builder/rpmbuild/SPECS
+
+          git archive --format=tar.gz \
+            --prefix="packmule-${version}/" \
+            -o "/home/builder/rpmbuild/SOURCES/packmule-${version}.tar.gz" HEAD
+
+          cp packmule.spec /home/builder/rpmbuild/SPECS/
+          chown -R builder:builder /home/builder/rpmbuild
+
+          su -l builder -c "rpmbuild -bs \
+            --define '_topdir /home/builder/rpmbuild' \
+            /home/builder/rpmbuild/SPECS/packmule.spec"
+
+      - name: Rebuild in a clean ${{ matrix.root }} chroot (mock)
+        run: |
+          su -l builder -c "mock --root=${{ matrix.root }} --isolation=simple \
+            --resultdir=/home/builder/mock-result \
+            --rebuild /home/builder/rpmbuild/SRPMS/*.src.rpm"
+
+      # debuginfo/debugsource are build by-products, not something a user
+      # downloading a release wants; the SRPM is kept because it is what a
+      # distro packager reviews.
+      - name: Collect the shipping packages
+        run: |
+          set -eux
+          mkdir -p dist
+          find /home/builder/mock-result -name '*.rpm' \
+            ! -name '*debuginfo*' ! -name '*debugsource*' \
+            -exec cp {} dist/ \;
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-rpm-${{ matrix.root }}
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  # ── Debian package ──────────────────────────────────────────────────────────
+  #
+  # cpack -G DEB is documented in the README but was never exercised anywhere,
+  # so building it here is both the deliverable and the only test it has.
+  deb:
+    name: deb / ubuntu
+    needs: verify
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake gcc libcurl4-openssl-dev libssl-dev libarchive-dev libcjson-dev
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: |
+          set -eux
+          cd build
+          cpack -G DEB
+          ls -l ./*.deb
+
+      - name: Smoke test the package
+        run: |
+          set -eux
+          sudo dpkg -i build/*.deb
+          packmule --version
+          packmule --help > /dev/null
+          man -w packmule
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-deb
+          path: build/*.deb
+          if-no-files-found: error
+
+  # ── Publish ─────────────────────────────────────────────────────────────────
+  publish:
+    name: attach to the release
+    needs: [verify, rpm, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      # A checksum file for a tool whose entire premise is that you verify what
+      # crossed the boundary.  Covers every asset attached below; the release
+      # page itself is the only thing vouching for SHA256SUMS.
+      - name: Checksum the assets
+        run: |
+          set -eux
+          cd dist
+          sha256sum ./* | sed 's|\./||' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.verify.outputs.tag }}" dist/* \
+            --clobber --repo "$GITHUB_REPOSITORY"

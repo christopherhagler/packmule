@@ -922,6 +922,18 @@ so the suite is safe in minimal CI images.
 
 ## Installing
 
+Every tagged release carries prebuilt packages — a `.deb` and `.rpm`s for
+Fedora and EPEL 8/9/10, each rebuilt in a clean `mock` chroot from its own
+SRPM — plus a `SHA256SUMS` covering them:
+
+```bash
+# from https://github.com/christopherhagler/packmule/releases
+sudo dnf install ./packmule-<version>-1.<dist>.x86_64.rpm
+sudo dpkg -i  ./packmule_<version>_amd64.deb
+```
+
+Or install what you built:
+
 ```bash
 cmake --install build --prefix /usr/local
 # binary   → /usr/local/bin/packmule
@@ -929,6 +941,10 @@ cmake --install build --prefix /usr/local
 ```
 
 ### Building a .deb or .rpm
+
+Needs the matching host tooling: `dpkg-deb` for `-G DEB`, `rpmbuild` for
+`-G RPM`. Neither is present on macOS by default, where `cpack` reports
+`Could not create CPack generator`.
 
 ```bash
 cd build
