@@ -1,6 +1,6 @@
 Name:           packmule
-Version:        0.2.0
-Release:        2%{?dist}
+Version:        0.3.0
+Release:        1%{?dist}
 Summary:        Air-gapped multi-registry package bundler
 
 License:        MIT
@@ -50,6 +50,15 @@ Supported registries:
 %{_mandir}/man1/packmule.1*
 
 %changelog
+* Wed Aug 12 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.3.0-1
+- pypi: lockfile mode -- exact-tree bundling from uv.lock and PEP 751
+  pylock.toml, mirroring the npm lockfile mode; the lock ships in the bundle as
+  provenance and nothing at the destination needs uv
+- Bundled TOML parser, so lockfile support adds no runtime dependency
+- network: redirect and credential-scoping fixes, with regression tests
+- Documented why the npm install.sh runs from the project root rather than from
+  the bundle directory
+
 * Fri Jul 31 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.2.0-2
 - Authentication for private registries (pypi, npm, rpm): Basic, Bearer, or any
   custom header, supplied through the environment and scoped to the --repo-url host

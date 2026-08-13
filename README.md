@@ -932,8 +932,8 @@ cmake --install build --prefix /usr/local
 
 ```bash
 cd build
-cpack -G DEB   # → packmule_0.1.0_<arch>.deb
-cpack -G RPM   # → packmule-0.1.0-<arch>.rpm
+cpack -G DEB   # → packmule_0.3.0_<arch>.deb
+cpack -G RPM   # → packmule-0.3.0-<arch>.rpm
 cpack          # all three: DEB, RPM, TGZ
 ```
 
