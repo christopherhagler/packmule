@@ -1,5 +1,5 @@
 Name:           packmule
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        Air-gapped multi-registry package bundler
 
@@ -50,6 +50,12 @@ Supported registries:
 %{_mandir}/man1/packmule.1*
 
 %changelog
+* Wed Aug 12 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.3.1-1
+- Fix the build with optimisation enabled: a discarded system() result tripped
+  -Werror=unused-result under _FORTIFY_SOURCE, which is on only when optimising
+- Releases now carry prebuilt packages: .deb and .rpm for Fedora and EPEL 8/9/10,
+  each rebuilt in a clean mock chroot, with a SHA256SUMS over every asset
+
 * Wed Aug 12 2026 Christopher Hagler <haglerchristopher@gmail.com> - 0.3.0-1
 - pypi: lockfile mode -- exact-tree bundling from uv.lock and PEP 751
   pylock.toml, mirroring the npm lockfile mode; the lock ships in the bundle as

@@ -948,8 +948,8 @@ Needs the matching host tooling: `dpkg-deb` for `-G DEB`, `rpmbuild` for
 
 ```bash
 cd build
-cpack -G DEB   # → packmule_0.3.0_<arch>.deb
-cpack -G RPM   # → packmule-0.3.0-<arch>.rpm
+cpack -G DEB   # → packmule_0.3.1_<arch>.deb
+cpack -G RPM   # → packmule-0.3.1-<arch>.rpm
 cpack          # all three: DEB, RPM, TGZ
 ```
 

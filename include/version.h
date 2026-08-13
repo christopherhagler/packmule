@@ -1,6 +1,6 @@
 #ifndef PACKMULE_VERSION_H
 #define PACKMULE_VERSION_H
 
-#define PACKMULE_VERSION "0.3.0"
+#define PACKMULE_VERSION "0.3.1"
 
 #endif /* PACKMULE_VERSION_H */

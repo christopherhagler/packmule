@@ -219,9 +219,22 @@ jobs:
           sha256sum ./* | sed 's|\./||' > SHA256SUMS
           cat SHA256SUMS
 
+      # On a tag push there is no release object yet -- `gh release upload`
+      # would fail on a tag that has one only because someone happened to make
+      # it by hand first.  Create it when missing so pushing a tag is the whole
+      # release procedure.
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          gh release upload "${{ needs.verify.outputs.tag }}" dist/* \
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "packmule $VERSION" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" dist/* \
             --clobber --repo "$GITHUB_REPOSITORY"
