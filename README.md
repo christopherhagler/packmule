@@ -301,9 +301,30 @@ On the air-gapped machine:
 
 ```bash
 tar -xzf vendor.tar.gz
-cd vendor
-./install.sh
+./vendor/install.sh
 ```
+
+`install.sh` locates the bundle from its own path, so it can be invoked from
+anywhere. For `pypi` and `rpm` that is the whole story: the working directory
+is irrelevant, and `cd vendor && ./install.sh` works just as well.
+
+**For `npm` the working directory is part of the input — run `install.sh` from
+your project root**, the directory holding `package.json`:
+
+```bash
+cd /path/to/project
+tar -xzf vendor.tar.gz      # → ./vendor
+./vendor/install.sh         # not: cd vendor && ./install.sh
+```
+
+Running it from inside the bundle directory stops with
+
+```
+install.sh: run this from your project directory (no package.json here)
+```
+
+before anything is installed or modified. See
+[why npm is different](#why-the-npm-install-runs-from-the-project-root).
 
 `install.sh` verifies `SHA256SUMS` before installing anything and refuses to
 continue if a file does not match. The digests packmule checked at download
@@ -325,7 +346,7 @@ Install scripts by backend:
 | Backend | Command |
 |---|---|
 | `pypi` | `python3 -m pip install --no-index --find-links="$DIR" --no-build-isolation -r "$DIR/requirements.txt"` (installs bundled setuptools/wheel first when the bundle contains an sdist) |
-| `npm` | lockfile bundle: `npm ci --offline --omit=dev` replaying the bundled `package-lock.json` against the bundled tarballs; flat bundle: one `npm install --offline --omit=dev --no-save` over every `.tgz` (devDependencies hidden from npm for the duration and the manifest restored afterwards) |
+| `npm` | **run from the project root.** Lockfile bundle: `npm ci --offline --omit=dev` replaying the bundled `package-lock.json` against the bundled tarballs; flat bundle: one `npm install --offline --omit=dev --no-save` over every `.tgz` (devDependencies hidden from npm for the duration and the manifest restored afterwards) |
 | `rpm` | `dnf install -y --disablerepo='*' *.rpm`, falling back to `rpm -Uvh` |
 
 Bundling is skipped if any package failed to download. The output directory
@@ -723,6 +744,59 @@ lockfile mode instead of shipping a bundle that cannot install.
 In both modes, `git:`/`github:`/`file:`/`link:`/URL dependencies are a hard
 build-time error — they have no registry tarball, and a bundle silently
 missing them would only fail later, on the air-gapped machine.
+
+#### Why the npm install runs from the project root
+
+The npm bundle is the one case where the working directory at install time
+matters. `pypi` and `rpm` are told everything explicitly — pip is handed
+`--find-links="$DIR"` and `-r "$DIR/requirements.txt"` and installs into
+whichever interpreter's environment is active; dnf is handed absolute `.rpm`
+paths and installs into the system. Neither reads anything from the current
+directory, so unpacking the bundle and running `install.sh` from inside it is
+fine.
+
+npm has no equivalent knob, because npm does not install *into a directory you
+name* — it installs into a **project**. It finds that project by walking up
+from the working directory to the closest `package.json`, reads the dependency
+tree from that file and the `package-lock.json` beside it, and writes
+`node_modules/` there. The bundle can supply the tarballs; it cannot supply
+the project.
+
+That matters more than it looks, because the lockfile install is not a single
+npm command. `install.sh` has to:
+
+1. back up the project's own `package-lock.json`,
+2. write a rewritten copy in its place — same tree, but every `resolved` URL
+   repointed at a bundled `.tgz` — under a trap that covers `INT`/`TERM`/`HUP`
+   as well as `EXIT`,
+3. run `npm ci --offline --omit=dev`,
+4. restore the original lock, so later online npm use is unaffected.
+
+Steps 1, 2 and 4 are ordinary file operations on the *project's* lockfile,
+which is to say they are relative to the working directory. Step 3 is npm
+finding the project by its own upward walk. Both have to land on the same
+directory or the install is incoherent.
+
+Run from inside the bundle directory, they don't. The bundle also contains a
+`package-lock.json` (its copy of yours), so the backup and the rewrite land on
+the *bundle's* file, while npm walks up past the bundle to your real project
+and reads your original lock — still full of `https://registry.npmjs.org/`
+URLs, none of them cached, with the network gone. You would get an obscure npm
+error about uncached requests, having modified a file that `SHA256SUMS`
+covers.
+
+So the lockfile path checks for a `package.json` in the working directory
+before it touches anything, and stops with a message if there is none. That
+check runs ahead of the backup and the rewrite, so a run from the wrong
+directory changes nothing — not your lockfile, not the bundle's.
+
+The flat (no-lockfile) bundle wants the same working directory for the same
+reason — `npm install --offline --no-save` installs into whatever project npm
+walks up to, and the script temporarily strips `devDependencies` from the
+project's `package.json` so npm does not try to resolve them from a registry
+that isn't there — but it carries no such guard. Run from the bundle
+directory it will appear to succeed and leave a `node_modules/` in the bundle
+instead of in your project.
 
 After `--bundle`, packmule verifies the result by running the generated
 `install.sh` in a scratch project with the npm registry pointed at an

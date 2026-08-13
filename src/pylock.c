@@ -270,9 +270,9 @@ static int select_artifact(const TomlValue *entry, const char *name,
     int              saw_wheel = 0;
 
     for (size_t i = 0; i < n; i++) {
-        const TomlValue *w = toml_array_at(wheels, i);
-        const char      *url;
-        char            *fn = file_name_of(w, &url);
+        const TomlValue *w   = toml_array_at(wheels, i);
+        const char      *url = NULL;
+        char            *fn  = file_name_of(w, &url);
         if (!fn || !url) {
             pm_free(fn);
             continue;
@@ -295,8 +295,11 @@ static int select_artifact(const TomlValue *entry, const char *name,
 
     if (!best) {
         const TomlValue *sdist = toml_get(entry, "sdist");
-        const char      *url;
-        char            *fn = sdist ? file_name_of(sdist, &url) : NULL;
+        /* NULL-initialised because file_name_of() is not called at all when
+         * there is no sdist: the short-circuit below would otherwise be the
+         * only thing keeping this from being read uninitialised. */
+        const char      *url = NULL;
+        char            *fn  = sdist ? file_name_of(sdist, &url) : NULL;
         if (fn && url) {
             fprintf(stderr,
                     "packmule: warning: no compatible wheel for %s==%s in the "
