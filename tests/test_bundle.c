@@ -77,7 +77,14 @@ static void cleanup(const char *dir)
 {
     char cmd[4096];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
-    (void)system(cmd);
+    /* Cleanup is best-effort -- the assertions have already run, so a failure
+     * here cannot invalidate the test.  The result still has to be consumed:
+     * glibc declares system() warn_unused_result under _FORTIFY_SOURCE (which
+     * Ubuntu enables when optimising), and a (void) cast does not satisfy
+     * that attribute.  Report it rather than hiding it in a dummy variable. */
+    int rc = system(cmd);
+    if (rc != 0)
+        fprintf(stderr, "test_bundle: could not remove %s (rc=%d)\n", dir, rc);
 
     char tarball[4096];
     snprintf(tarball, sizeof(tarball), "%s.tar.gz", dir);
