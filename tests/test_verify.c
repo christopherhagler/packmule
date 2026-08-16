@@ -52,7 +52,10 @@ int main(void)
      * python3, or with pip older than 22.2, reports SKIPPED — that is a
      * different answer from PASSED and the assertion below still holds.
      */
-    BundleCheckResult r = bundle_check_pypi(DIR, NULL, "x86_64", NULL, NULL, 0);
+    BundleCheckReport rep = {0};
+    BundleCheckResult r   = bundle_check_pypi(DIR, NULL, "x86_64", NULL, NULL,
+                                              0, &rep);
+    bundle_check_report_clear(&rep);
 
     if (r == BUNDLE_CHECK_SKIPPED) {
         printf("test_verify: skipped (no usable python3/pip on this machine)\n");

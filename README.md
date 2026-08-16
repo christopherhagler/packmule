@@ -143,6 +143,11 @@ versions are used where they help, but nothing requires them.
 cJSON must be installed as a system package; the build does **not** fetch it
 from the internet.
 
+Optional at runtime: `podman` or `docker`, used only to run the post-bundle
+offline install check on the target's platform when this machine cannot. It is
+never needed to build packmule or to build a bundle — without it, a
+cross-platform bundle is still produced and reported as unverified.
+
 ---
 
 ## Building
@@ -355,20 +360,50 @@ is always left intact alongside the archive.
 After a bundle is created, packmule verifies it end-to-end so a bundle that
 cannot install offline fails **here**, not on the air-gapped machine:
 
-- **pypi** — `pip install --dry-run --no-index --ignore-installed` against
-  only the bundled files (when this machine matches the bundle's target
-  os/arch/python and pip is ≥ 22.2). `--ignore-installed` is what keeps this
-  a check of the bundle rather than of the build machine's site-packages.
+- **pypi, on this machine** — `pip install --dry-run --no-index
+  --ignore-installed` against only the bundled files, used when this machine
+  matches the bundle's target os/arch/python and pip is ≥ 22.2.
+  `--ignore-installed` is what keeps this a check of the bundle rather than of
+  the build machine's site-packages. It stays a dry run because it runs on
+  your machine and must not install anything there.
+- **pypi, in a container** — when this machine *cannot* answer for the target,
+  which is the usual case when building for an air-gapped host, packmule runs
+  the bundle's own `install.sh` inside `python:3.<minor>-slim` on the target
+  platform with `--network none`. A throwaway container can do the real
+  install, so this is the stronger check of the two: it exercises the exact
+  script the destination will run, including the bundled setuptools/wheel step
+  that an sdist needs. Requires `podman` or `docker` on `PATH`.
 - **npm** — runs the generated `install.sh` in a scratch project with the
   registry pointed at an unroutable address and an empty npm cache, with
-  scripts disabled.
+  scripts disabled. No container is needed: npm resolves by name and version
+  rather than by platform, and a lockfile bundle already carries every
+  platform's optional dependencies.
 
 A failed check is a **build failure**: the package manager itself has said it
 cannot install this closure offline, and shipping it anyway just moves the
-failure somewhere it cannot be fixed. When the check cannot run at all —
-cross-targeting a different platform, no local pip/npm, pip older than 22.2 —
-packmule says so and does not treat it as a pass. Use `--no-verify` to build
-without the check.
+failure somewhere it cannot be fixed. Use `--no-verify` to build without the
+check.
+
+When nothing can be checked — no container engine, an architecture with no
+container platform, a non-linux target, no local pip/npm — packmule prints an
+explicit **UNVERIFIED** warning rather than a quiet skip, and records the
+verdict in `manifest.json`, so a bundle that was never checked cannot be
+mistaken for one that passed:
+
+```json
+"install_check": {
+  "result": "passed",
+  "method": "container (podman, docker.io/library/python:3.12-slim, linux/arm64)"
+}
+```
+
+`result` is `passed`, `failed`, or `unverified`; an `unverified` entry carries
+a `reason`. The field is written before `SHA256SUMS`, so it is covered by it.
+
+| Variable | Meaning |
+|---|---|
+| `PACKMULE_VERIFY_IMAGE` | Image to run the check in, for sites with no `docker.io` access (default `docker.io/library/python:3.<minor>-slim`) |
+| `PACKMULE_NO_CONTAINER_VERIFY` | Set to `1` to never use a container, even when an engine is available |
 
 ### Private registries
 

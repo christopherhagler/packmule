@@ -35,22 +35,54 @@ typedef enum {
 } BundleCheckResult;
 
 /*
+ * Where a check ran and, when it could not run, why not.
+ *
+ * The reason matters as much as the result.  A cross-platform build is the
+ * normal air-gap case, and until containers were used for it every such
+ * bundle came back SKIPPED — indistinguishable in a CI log from one that had
+ * actually been proven.  Recording this in manifest.json means the bundle
+ * itself carries whether anything was checked.
+ *
+ * Both strings are heap-owned; clear the report with
+ * bundle_check_report_clear().
+ */
+typedef struct {
+    BundleCheckResult result;
+    char             *method;   /* "host", "container (podman, …)"; NULL if none */
+    char             *reason;   /* set only when result is SKIPPED */
+} BundleCheckReport;
+
+void bundle_check_report_clear(BundleCheckReport *rep);
+
+/*
  * bundle_check_pypi — run pip's resolver against only the bundled files
- * (--dry-run --no-index).  Skipped when this machine's os/arch/python differ
- * from the bundle's target (the answer would be about the wrong platform), or
- * when the local pip predates --dry-run (22.2).
+ * (--dry-run --no-index).
+ *
+ * Runs on this machine when its os/arch/python match the bundle's target.
+ * When they do not — which is the usual case for an air-gapped target — the
+ * check runs instead inside a container matching the target platform, so the
+ * answer is about the machine the bundle is actually going to.  A missing
+ * container engine, an unmappable architecture, or a target OS that is not
+ * linux leaves the bundle SKIPPED with the reason recorded.
+ *
+ * `rep` may be NULL if the caller only wants the result.
  */
 BundleCheckResult bundle_check_pypi(const char *output_dir, const char *arch,
                                     const char *host_arch,
                                     const char *target_os, const char *host_os,
-                                    int py_minor);
+                                    int py_minor, BundleCheckReport *rep);
 
 /*
  * bundle_check_npm — run the bundle's own install.sh in a scratch project
  * with the registry pointed at an unroutable address and an empty npm cache,
  * so nothing can be satisfied from this machine's state.  Skipped when npm or
  * node is unavailable.
+ *
+ * No container is needed here: npm packages are resolved by name and version
+ * rather than by platform, and a lockfile bundle carries every platform's
+ * optional dependencies, so the local answer is the target's answer.
  */
-BundleCheckResult bundle_check_npm(const char *output_dir);
+BundleCheckResult bundle_check_npm(const char *output_dir,
+                                   BundleCheckReport *rep);
 
 #endif /* PACKMULE_VERIFY_H */

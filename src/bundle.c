@@ -74,7 +74,8 @@ static int write_text_file(const char *path, const char *data, size_t len)
 
 /* ── Manifest ─────────────────────────────────────────────────────────────── */
 
-static int write_manifest(const BundleOptions *opts)
+static int write_manifest(const BundleOptions *opts,
+                          const BundleCheckReport *check)
 {
     cJSON *root = cJSON_CreateObject();
 
@@ -86,6 +87,24 @@ static int write_manifest(const BundleOptions *opts)
     char       ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", utc);
     cJSON_AddStringToObject(root, "created", ts);
+
+    /*
+     * Whether anything was actually proven about this bundle, and how.  A
+     * consumer that only sees "unverified" here knows the closure was never
+     * put in front of a package manager — which used to be indistinguishable
+     * from a bundle that had passed.
+     */
+    if (check) {
+        cJSON *ic = cJSON_CreateObject();
+        cJSON_AddStringToObject(ic, "result",
+            check->result == BUNDLE_CHECK_PASSED ? "passed" :
+            check->result == BUNDLE_CHECK_FAILED ? "failed" : "unverified");
+        if (check->method)
+            cJSON_AddStringToObject(ic, "method", check->method);
+        if (check->reason)
+            cJSON_AddStringToObject(ic, "reason", check->reason);
+        cJSON_AddItemToObject(root, "install_check", ic);
+    }
 
     /* Attach the array up front so an early return frees it with the root. */
     cJSON *pkgs = cJSON_CreateArray();
@@ -449,10 +468,6 @@ static int create_tarball(const BundleOptions *opts, const char *archive_path,
 
 int bundle_create(const BundleOptions *opts)
 {
-    printf("packmule: writing manifest.json ...\n");
-    if (write_manifest(opts) != 0)
-        return -1;
-
     if (strcmp(opts->registry_name, "pypi") == 0) {
         printf("packmule: writing requirements.txt ...\n");
         if (write_requirements_txt(opts) != 0)
@@ -472,6 +487,23 @@ int bundle_create(const BundleOptions *opts)
 
     printf("packmule: writing install.sh ...\n");
     if (write_install_script(opts) != 0)
+        return -1;
+
+    /*
+     * The install check runs here, after the files it needs exist and before
+     * manifest.json records what it decided.
+     */
+    BundleCheckReport report = { BUNDLE_CHECK_SKIPPED, NULL, NULL };
+    if (opts->install_check)
+        opts->install_check(opts->output_dir, opts->install_check_ctx, &report);
+    else
+        report.reason = pm_strdup("the install check was disabled "
+                                  "(--no-verify)");
+
+    printf("packmule: writing manifest.json ...\n");
+    int manifest_rc = write_manifest(opts, &report);
+    bundle_check_report_clear(&report);
+    if (manifest_rc != 0)
         return -1;
 
     /*

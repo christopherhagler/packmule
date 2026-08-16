@@ -427,6 +427,42 @@ static int cmd_verify(int argc, char *argv[])
     return bundle_verify_checksums(argv[2]) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+/* ── offline install check ──────────────────────────────────────────────── */
+
+/*
+ * What the check needs to know about the target, plus somewhere to leave its
+ * verdict: bundle_create() records the report in manifest.json, but the exit
+ * code is main's business.
+ */
+typedef struct {
+    const char *registry_name;
+    const char *arch;
+    const char *host_arch;
+    const char *target_os;
+    const char *host_os;
+    int         py_minor;
+
+    BundleCheckResult result;
+} InstallCheckCtx;
+
+static void run_install_check(const char *output_dir, void *vctx,
+                              BundleCheckReport *rep)
+{
+    InstallCheckCtx *c = vctx;
+
+    if (strcmp(c->registry_name, "pypi") == 0)
+        c->result = bundle_check_pypi(output_dir, c->arch, c->host_arch,
+                                      c->target_os, c->host_os, c->py_minor,
+                                      rep);
+    else if (strcmp(c->registry_name, "npm") == 0)
+        c->result = bundle_check_npm(output_dir, rep);
+    else
+        /* rpm bundles are checked by dnf at the destination; there is no
+         * offline resolver to rehearse with here. */
+        rep->reason = pm_strdup("there is no offline install check for rpm "
+                                "bundles");
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
@@ -795,6 +831,8 @@ int main(int argc, char *argv[])
             bopts.aux_name      = NULL;
             bopts.sbom_formats  = sbom_formats;
             bopts.registry      = reg;
+            bopts.install_check     = NULL;
+            bopts.install_check_ctx = NULL;
 
             /* An npm bundle built from a lockfile must carry that lock:
              * install.sh replays its exact tree with `npm ci --offline`. */
@@ -819,26 +857,35 @@ int main(int argc, char *argv[])
                 bopts.aux_name = pm_basename(py_lock);
             }
 
+            /* The check runs inside bundle_create so its verdict reaches
+             * manifest.json before SHA256SUMS covers it. */
+            InstallCheckCtx ick = {
+                .registry_name = reg->name,
+                .arch          = arch,
+                .host_arch     = detected_arch,
+                .target_os     = target_os,
+                .host_os       = host_os,
+                .py_minor      = py_minor,
+                .result        = BUNDLE_CHECK_SKIPPED,
+            };
+            if (!no_verify) {
+                bopts.install_check     = run_install_check;
+                bopts.install_check_ctx = &ick;
+            }
+
             if (bundle_create(&bopts) != 0) {
                 exit_code = EXIT_FAILURE;
             } else if (!no_verify) {
-                BundleCheckResult cr = BUNDLE_CHECK_SKIPPED;
-                if (strcmp(reg->name, "pypi") == 0)
-                    cr = bundle_check_pypi(output_dir, arch, detected_arch,
-                                           target_os, host_os, py_minor);
-                else if (strcmp(reg->name, "npm") == 0)
-                    cr = bundle_check_npm(output_dir);
-
                 /*
                  * A failed check means the package manager itself rejected
                  * this closure.  That bundle will not install on the target,
                  * so the build fails here rather than shipping it — SKIPPED
-                 * (prerequisites missing) is a different answer and is not
+                 * (nothing could be proven) is a different answer and is not
                  * treated as a failure.
                  */
-                if (cr == BUNDLE_CHECK_PASSED) {
+                if (ick.result == BUNDLE_CHECK_PASSED) {
                     printf("packmule: offline install check PASSED\n");
-                } else if (cr == BUNDLE_CHECK_FAILED) {
+                } else if (ick.result == BUNDLE_CHECK_FAILED) {
                     fprintf(stderr,
                             "packmule: offline install check FAILED -- the "
                             "package manager could not install this bundle "
@@ -847,6 +894,20 @@ int main(int argc, char *argv[])
                             "target machine.  Re-run with --no-verify to "
                             "build it anyway.\n");
                     exit_code = EXIT_FAILURE;
+                } else if (strcmp(reg->name, "rpm") != 0) {
+                    /*
+                     * Nothing was proven.  Saying so plainly is the point: a
+                     * bundle that was never checked used to look exactly like
+                     * one that passed, and the whole reason to check before
+                     * shipping is that the destination has no network to fix
+                     * anything with.
+                     */
+                    fprintf(stderr,
+                            "packmule: WARNING -- this bundle is UNVERIFIED.\n"
+                            "          No offline install check could be run, "
+                            "so nothing has confirmed it\n"
+                            "          will install on the target machine.  "
+                            "manifest.json records why.\n");
                 }
             }
             pm_free(npm_lock);

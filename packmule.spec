@@ -15,6 +15,12 @@ BuildRequires:  openssl-devel
 BuildRequires:  libarchive-devel
 BuildRequires:  cjson-devel
 
+# The offline install check runs the bundle inside a container matching the
+# target platform when this machine cannot answer for it, which is the usual
+# case when building for an air-gapped host.  Entirely optional: without an
+# engine the bundle is still built, and reported as unverified.
+Suggests:       podman
+
 %description
 packmule reads a package manifest, queries the appropriate registry to resolve
 each entry to a concrete version and download URL, downloads every required
@@ -41,6 +47,11 @@ Supported registries:
 %cmake_install
 
 %check
+# A package build must not touch the network.  The end-to-end tests that would
+# are off by default (PACKMULE_E2E_TESTS), and this stops the offline install
+# check from reaching for a container image should an engine ever be present
+# in the buildroot.
+export PACKMULE_NO_CONTAINER_VERIFY=1
 %ctest
 
 %files

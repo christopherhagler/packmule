@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>          /* strcasecmp — not pulled in by string.h here */
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -154,31 +155,280 @@ static int detect_python_minor(void)
     return minor > 0 ? minor : 0;
 }
 
+/*
+ * run_quiet — run `cmd` under /bin/sh, discarding stdout, and return its exit
+ * status (or -1 if it could not be run or died on a signal).
+ */
+static int run_quiet(const char *cmd)
+{
+    int st = system(cmd);
+    if (st == -1 || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+/* ── Report ──────────────────────────────────────────────────────────────── */
+
+void bundle_check_report_clear(BundleCheckReport *rep)
+{
+    if (!rep)
+        return;
+    pm_free(rep->method);
+    pm_free(rep->reason);
+    rep->method = rep->reason = NULL;
+}
+
+static void report_set(BundleCheckReport *rep, BundleCheckResult result,
+                       char *method, char *reason)
+{
+    if (!rep) {
+        pm_free(method);
+        pm_free(reason);
+        return;
+    }
+    pm_free(rep->method);
+    pm_free(rep->reason);
+    rep->result = result;
+    rep->method = method;
+    rep->reason = reason;
+}
+
+/* ── Containerised checking ──────────────────────────────────────────────── */
+
+/*
+ * container_engine — podman or docker, whichever is on PATH.
+ *
+ * podman first: it is the one that tends to be present on the RHEL-family
+ * build hosts this tool is aimed at, and it needs no daemon.
+ */
+static const char *container_engine(void)
+{
+    static const char *cached;
+    static int         probed;
+
+    if (!probed) {
+        char buf[PATH_MAX];
+        probed = 1;
+
+        /*
+         * An explicit off switch, for environments where reaching a registry
+         * for an image is not allowed even though an engine is installed.
+         * Distribution builds set it in %check: a package build must never
+         * touch the network, and relying on the buildroot merely not having
+         * podman in it is a weaker guarantee than saying so.
+         */
+        const char *off = getenv("PACKMULE_NO_CONTAINER_VERIFY");
+        if (off && *off && strcmp(off, "0") != 0)
+            return NULL;
+
+        if (run_capture("command -v podman 2>/dev/null", buf, sizeof(buf)) == 0)
+            cached = "podman";
+        else if (run_capture("command -v docker 2>/dev/null", buf, sizeof(buf)) == 0)
+            cached = "docker";
+    }
+    return cached;
+}
+
+/*
+ * container_platform — the OCI platform string for a target architecture.
+ *
+ * Only the two architectures with real manylinux wheel coverage are mapped.
+ * Anything else returns NULL and the check is skipped rather than run against
+ * a platform that is not the target.
+ */
+static const char *container_platform(const char *arch)
+{
+    if (!arch)
+        return NULL;
+    if (strcasecmp(arch, "aarch64") == 0 || strcasecmp(arch, "arm64") == 0)
+        return "linux/arm64";
+    if (strcasecmp(arch, "x86_64") == 0 || strcasecmp(arch, "amd64") == 0)
+        return "linux/amd64";
+    return NULL;
+}
+
+/*
+ * verify_image — the image the check runs in.
+ *
+ * Fully qualified because podman refuses to guess a registry.  Overridable so
+ * a site with no docker.io access can point at its own mirror — the same
+ * escape-hatch approach as PACKMULE_CA_BUNDLE and friends.
+ */
+static char *verify_image(int py_minor)
+{
+    const char *env = getenv("PACKMULE_VERIFY_IMAGE");
+    if (env && *env)
+        return pm_strdup(env);
+    if (py_minor > 0)
+        return pm_asprintf("docker.io/library/python:3.%d-slim", py_minor);
+    return pm_strdup("docker.io/library/python:3-slim");
+}
+
+/*
+ * check_pypi_container — run the same pip check inside a container built for
+ * the target platform.
+ *
+ * The distinction that makes a failure trustworthy is drawn by the probe: the
+ * image is pulled and a trivial command run in it first, so "this machine
+ * cannot run linux/arm64 containers" is SKIPPED, and only a container that
+ * demonstrably works can return FAILED.  Without that, a build host lacking
+ * binfmt emulation would report every cross-architecture bundle as broken.
+ */
+static BundleCheckResult check_pypi_container(const char *output_dir,
+                                              const char *arch,
+                                              const char *target_os,
+                                              int py_minor,
+                                              const char *host_blocker,
+                                              BundleCheckReport *rep)
+{
+    if (target_os && strcmp(target_os, "linux") != 0) {
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_asprintf("%s, and a container can only check a linux "
+                               "target (this bundle targets %s)",
+                               host_blocker, target_os));
+        return BUNDLE_CHECK_SKIPPED;
+    }
+
+    const char *engine = container_engine();
+    if (!engine) {
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_asprintf("%s, and neither podman nor docker is on PATH "
+                               "to check it in a container", host_blocker));
+        return BUNDLE_CHECK_SKIPPED;
+    }
+
+    const char *platform = container_platform(arch);
+    if (!platform) {
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_asprintf("%s, and target architecture '%s' has no "
+                               "container platform to check it on",
+                               host_blocker, arch ? arch : "any"));
+        return BUNDLE_CHECK_SKIPPED;
+    }
+
+    /* The bundle is mounted by absolute path; a quote in it would break out of
+     * the shell quoting below. */
+    char abs[PATH_MAX];
+    if (!realpath(output_dir, abs) || strchr(abs, '\'')) {
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_asprintf("%s, and the bundle path cannot be passed to a "
+                               "container safely", host_blocker));
+        return BUNDLE_CHECK_SKIPPED;
+    }
+
+    char             *image  = verify_image(py_minor);
+    BundleCheckResult result = BUNDLE_CHECK_SKIPPED;
+
+    printf("packmule: fetching %s for the check (first run only) ...\n", image);
+    fflush(stdout);
+
+    char *pull = pm_asprintf("%s pull --platform %s '%s' >/dev/null 2>&1",
+                             engine, platform, image);
+    int   rc   = run_quiet(pull);
+    pm_free(pull);
+
+    if (rc != 0) {
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_asprintf("%s, and image %s could not be fetched for a "
+                               "container check (set PACKMULE_VERIFY_IMAGE to "
+                               "a reachable mirror)", host_blocker, image));
+        pm_free(image);
+        return BUNDLE_CHECK_SKIPPED;
+    }
+
+    /* Can this machine actually execute that platform at all? */
+    char *probe = pm_asprintf(
+        "%s run --rm --platform %s --network none '%s' "
+        "python3 -c 'pass' >/dev/null 2>&1", engine, platform, image);
+    rc = run_quiet(probe);
+    pm_free(probe);
+
+    if (rc != 0) {
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_asprintf("%s, and this machine cannot run %s containers "
+                               "(binfmt/qemu emulation may be missing)",
+                               host_blocker, platform));
+        pm_free(image);
+        return BUNDLE_CHECK_SKIPPED;
+    }
+
+    printf("packmule: checking the bundle installs offline "
+           "(%s, %s, %s) ...\n", engine, image, platform);
+    fflush(stdout);
+
+    /*
+     * The container runs the bundle's own install.sh, not a pip command of our
+     * own devising — the same thing the npm check does, and for the same
+     * reason: what has to work on the target is that script, so approximating
+     * it here can only test something else.  It matters concretely.  install.sh
+     * installs the bundled setuptools and wheel before anything that needs
+     * building, and a hand-written `pip install --no-build-isolation` does not:
+     * against a slim image, which ships no setuptools, every bundle containing
+     * an sdist would fail a check it should pass.
+     *
+     * The host check stays a --dry-run because it runs on the user's machine
+     * and must not install anything there.  A throwaway container has no such
+     * constraint, which is what makes it the better rehearsal.
+     *
+     * --network none is what makes this a real air-gap rehearsal rather than a
+     * hopeful one: pip cannot reach an index even if --no-index were wrong.
+     *
+     * PACKMULE_SKIP_VERIFY is set because SHA256SUMS does not exist yet — it
+     * is written after this check, so that it can cover the verdict.  What
+     * that file proves (the bytes survived the transfer) is not what is being
+     * asked here anyway, and `packmule verify` covers it at the destination.
+     */
+    char *run = pm_asprintf(
+        "%s run --rm --platform %s --network none -e PACKMULE_SKIP_VERIFY=1 "
+        "-v '%s':/bundle:ro '%s' sh /bundle/install.sh",
+        engine, platform, abs, image);
+    rc = run_quiet(run);
+    pm_free(run);
+
+    result = (rc == 0) ? BUNDLE_CHECK_PASSED : BUNDLE_CHECK_FAILED;
+    report_set(rep, result,
+               pm_asprintf("container (%s, %s, %s)", engine, image, platform),
+               NULL);
+    pm_free(image);
+    return result;
+}
+
 /* ── pypi ────────────────────────────────────────────────────────────────── */
 
-BundleCheckResult bundle_check_pypi(const char *output_dir, const char *arch,
-                                    const char *host_arch,
-                                    const char *target_os, const char *host_os,
-                                    int py_minor)
+/*
+ * host_check_blocker — why this machine cannot answer for the bundle's target,
+ * or NULL when it can.  The returned string is heap-owned.
+ */
+static char *host_check_blocker(const char *arch, const char *host_arch,
+                                const char *target_os, const char *host_os,
+                                int py_minor)
 {
-    int host_py = detect_python_minor();
-    if (host_py <= 0) {
-        printf("packmule: skipping offline install check (no local python3)\n");
-        return BUNDLE_CHECK_SKIPPED;
-    }
-    if ((py_minor > 0 && py_minor != host_py) ||
-        (target_os && (!host_os || strcmp(target_os, host_os) != 0)) ||
-        (arch && strcmp(arch, host_arch) != 0)) {
-        printf("packmule: skipping offline install check (bundle targets a "
-               "different os/arch/python than this machine)\n");
-        return BUNDLE_CHECK_SKIPPED;
-    }
-    if (!pip_supports_dry_run()) {
-        printf("packmule: skipping offline install check "
-               "(local pip is older than 22.2, which added --dry-run)\n");
-        return BUNDLE_CHECK_SKIPPED;
-    }
+    if (detect_python_minor() <= 0)
+        return pm_strdup("this machine has no python3");
 
+    int host_py = detect_python_minor();
+
+    if (py_minor > 0 && py_minor != host_py)
+        return pm_asprintf("this machine runs python 3.%d and the bundle "
+                           "targets 3.%d", host_py, py_minor);
+
+    if (target_os && (!host_os || strcmp(target_os, host_os) != 0))
+        return pm_asprintf("this machine runs %s and the bundle targets %s",
+                           host_os ? host_os : "an unknown OS", target_os);
+
+    if (arch && host_arch && strcmp(arch, host_arch) != 0)
+        return pm_asprintf("this machine is %s and the bundle targets %s",
+                           host_arch, arch);
+
+    if (!pip_supports_dry_run())
+        return pm_strdup("the local pip predates --dry-run (22.2)");
+
+    return NULL;
+}
+
+/* run_host_check — the pip dry-run, on this machine. */
+static BundleCheckResult run_host_check(const char *output_dir)
+{
     printf("packmule: checking the bundle installs offline (pip --dry-run) ...\n");
     fflush(stdout);
 
@@ -219,14 +469,43 @@ BundleCheckResult bundle_check_pypi(const char *output_dir, const char *arch,
     return result;
 }
 
+BundleCheckResult bundle_check_pypi(const char *output_dir, const char *arch,
+                                    const char *host_arch,
+                                    const char *target_os, const char *host_os,
+                                    int py_minor, BundleCheckReport *rep)
+{
+    char *blocker = host_check_blocker(arch, host_arch, target_os, host_os,
+                                       py_minor);
+    if (!blocker) {
+        BundleCheckResult r = run_host_check(output_dir);
+        report_set(rep, r, pm_strdup("host"), NULL);
+        return r;
+    }
+
+    /*
+     * The host cannot answer for this target — which is the normal case for an
+     * air-gapped build, not an edge case — so ask a container that can.
+     */
+    printf("packmule: %s\n", blocker);
+
+    BundleCheckResult r = check_pypi_container(output_dir, arch, target_os,
+                                               py_minor, blocker, rep);
+    pm_free(blocker);
+    return r;
+}
+
 /* ── npm ─────────────────────────────────────────────────────────────────── */
 
-BundleCheckResult bundle_check_npm(const char *output_dir)
+BundleCheckResult bundle_check_npm(const char *output_dir,
+                                   BundleCheckReport *rep)
 {
     char abs[PATH_MAX];
     if (!realpath(output_dir, abs) || strchr(abs, '\'')) {
         printf("packmule: skipping offline install check "
                "(cannot resolve output path)\n");
+        report_set(rep, BUNDLE_CHECK_SKIPPED, NULL,
+                   pm_strdup("the bundle path cannot be passed to a shell "
+                             "safely"));
         return BUNDLE_CHECK_SKIPPED;
     }
 
@@ -266,6 +545,10 @@ BundleCheckResult bundle_check_npm(const char *output_dir)
         /* Unroutable registry: any resolution gap fails fast instead of
          * silently succeeding via the network. */
         setenv("npm_config_registry", "http://127.0.0.1:9/", 1);
+        /* SHA256SUMS is written after this check runs, so that it can cover
+         * the verdict; there is nothing for install.sh to verify against yet,
+         * and the bytes have not been anywhere to need it. */
+        setenv("PACKMULE_SKIP_VERIFY", "1", 1);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     } else if (pid > 0) {
@@ -277,8 +560,14 @@ BundleCheckResult bundle_check_npm(const char *output_dir)
     }
     pm_free(cmd);
 
-    if (result == BUNDLE_CHECK_SKIPPED)
+    if (result == BUNDLE_CHECK_SKIPPED) {
         printf("packmule: skipping offline install check "
                "(node/npm not available)\n");
+        report_set(rep, result, NULL,
+                   pm_strdup("node and npm are needed to check an npm bundle "
+                             "and are not on PATH"));
+    } else {
+        report_set(rep, result, pm_strdup("host"), NULL);
+    }
     return result;
 }
